@@ -7,7 +7,7 @@
 #include "arena.h"
 
 typedef struct {
-    int16_t nBod;
+    int nBod;
     int16_t *parent;
     int16_t *children;
     uint8_t *jtype;

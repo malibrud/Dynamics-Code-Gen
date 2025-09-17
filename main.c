@@ -31,7 +31,9 @@ int main() {
     System sys = {};
     sys_init( &sys, 3 );
 
+    for ( int i = 0 ; i < NBOD ; i++ ) {
 
+    }
 
     return 0;
 }

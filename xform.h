@@ -2,6 +2,7 @@
 #include <math.h>
 #include <assert.h>
 #include <inttypes.h>
+#include <stdbool.h>
 
 #define XFORM_AXIS_R 0x20
 #define XFORM_AXIS_T 0x40
@@ -13,27 +14,27 @@
 #define XFORM_3DOF_TRANS 3
 
 // Transformations around the X, Y, and Z axes.
-#define XFORM_RX ( XFORM_AXIS_ROT | 4 )
-#define XFORM_RY ( XFORM_AXIS_ROT | 5 )
-#define XFORM_RZ ( XFORM_AXIS_ROT | 6 )
+#define XFORM_RX ( XFORM_AXIS_R | 4 )
+#define XFORM_RY ( XFORM_AXIS_R | 5 )
+#define XFORM_RZ ( XFORM_AXIS_R | 6 )
 
 // Transformations along the X, Y, and Z axes.
-#define XFORM_TX ( XFORM_AXIS_TRANS | 8 )
-#define XFORM_TY ( XFORM_AXIS_TRANS | 9 )
-#define XFORM_TZ ( XFORM_AXIS_TRANS | 10 )
+#define XFORM_TX ( XFORM_AXIS_T | 8 )
+#define XFORM_TY ( XFORM_AXIS_T | 9 )
+#define XFORM_TZ ( XFORM_AXIS_T | 10 )
 
 // Transformations with translation along an axis then rotation around an axis
-#define XFORM_TX_RX ( XFORM_TR | 12 )
-#define XFORM_TX_RY ( XFORM_TR | 13 )
-#define XFORM_TX_RZ ( XFORM_TR | 14 )
+#define XFORM_TX_RX ( XFORM_AXIS_TR | 12 )
+#define XFORM_TX_RY ( XFORM_AXIS_TR | 13 )
+#define XFORM_TX_RZ ( XFORM_AXIS_TR | 14 )
 
-#define XFORM_TY_RX ( XFORM_TR | 16 )
-#define XFORM_TY_RY ( XFORM_TR | 17 )
-#define XFORM_TY_RZ ( XFORM_TR | 18 )
+#define XFORM_TY_RX ( XFORM_AXIS_TR | 16 )
+#define XFORM_TY_RY ( XFORM_AXIS_TR | 17 )
+#define XFORM_TY_RZ ( XFORM_AXIS_TR | 18 )
 
-#define XFORM_TZ_RX ( XFORM_TR | 21 )
-#define XFORM_TZ_RY ( XFORM_TR | 22 )
-#define XFORM_TZ_RZ ( XFORM_TR | 23 )
+#define XFORM_TZ_RX ( XFORM_AXIS_TR | 21 )
+#define XFORM_TZ_RY ( XFORM_AXIS_TR | 22 )
+#define XFORM_TZ_RZ ( XFORM_AXIS_TR | 23 )
 
 // Transformations in the planes XY, YZ, ZX
 #define XFORM_PXY 12
@@ -81,7 +82,7 @@ void x_update( Xform *X, double *q ) {
     case XFORM_RX:
     case XFORM_RY:
     case XFORM_RZ:
-        Xform_AxisRot *Xar = X;
+        Xform_AxisRot *Xar = (Xform_AxisRot*)X;
         Xar->a =  *q;
         Xar->sina = sin( *q );
         Xar->cosa = cos( *q );
@@ -92,7 +93,7 @@ void x_update( Xform *X, double *q ) {
     }
 }
 
-void x_compose( Xform *_Xba, Xform *_Xcb, Xform *_Xca ) {
+void x_compose_tx_rz( Xform *_Xba, Xform *_Xcb, Xform *_Xca ) {
     assert( _Xba->type == XFORM_TX );
     assert( _Xcb->type == XFORM_RZ );
     assert( _Xca->type == XFORM_TX_RZ );
@@ -112,7 +113,8 @@ void x_compose( Xform *_Xba, Xform *_Xcb, Xform *_Xca ) {
 // See (Featherstone, 2008) Sec 2.8, pp 20. 
 void x_compose( Xform *Xba, Xform *Xcb, Xform *Xca ) {
     if ( Xba->type == XFORM_TX && Xcb->type == XFORM_RZ ) {
-        assert( Xca->type == XFORM_PLANE_XY );
-        return x_compose_transX_rotZ( Xba, Xcb, Xca );
+        assert( Xca->type == XFORM_TX_RZ );
+        x_compose_tx_rz( Xba, Xcb, Xca );
+        return;
     }
 }

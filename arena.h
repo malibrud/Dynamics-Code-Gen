@@ -3,8 +3,8 @@
 #include "check.h"
 
 #define ALIGNMENT ( sizeof( void* ) )
-#define ALIGN(x) ( ( ( nb + ( ALIGNMENT-1 ) ) / ALIGNMENT ) * ALIGNMENT )
-#define ALIGNTO(x,a) ( ( ( nb + ( a-1 ) ) / a ) * a )
+#define ALIGN(x) ( ( ( x + ( ALIGNMENT-1 ) ) / ALIGNMENT ) * ALIGNMENT )
+#define ALIGNTO(x,a) ( ( ( x + ( a-1 ) ) / a ) * a )
 
 typedef struct {
     char *memory;
@@ -20,6 +20,7 @@ Arena *ar_create( size_t initCapacity ) {
     check( ar->memory, "Could not allocate arena buffer." );
     ar->capacity = initCapacity;
     ar->size = 0;
+    return ar;
 }
 
 void *ar_alloc_aligned( Arena *ar, size_t size, size_t align ) {
