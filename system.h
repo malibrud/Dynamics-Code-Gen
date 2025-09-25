@@ -1,6 +1,8 @@
 #pragma once
 #include <inttypes.h>
 #include "svec.h"
+#include "vec3.h"
+#include "frame.h"
 #include "body.h"
 #include "joint.h"
 #include "xform.h"
@@ -20,10 +22,10 @@ typedef struct {
     double *q;
     double *qd;
     double *qdd;
-    Xform *xTree;
-    Xform *xJoint;
-    Xform *xFromParent;
-    Xform *xFromBase;
+    Xform **xTree;
+    Xform **xJoint;
+    Xform **xFromParent;
+    Xform **xFromBase;
     Svec *vel;
     Svec *acc;
     Svec *force;
@@ -61,14 +63,29 @@ void sys_init( System *sys, int nBod ) {
     sys->qd  = ar_alloc_array( ar, N, sizeof( double ) );
     sys->qdd = ar_alloc_array( ar, N, sizeof( double ) );
 
-    sys->xTree       = ar_alloc_array( ar, N, sizeof( Xform ) );
-    sys->xJoint      = ar_alloc_array( ar, N, sizeof( Xform ) );
-    sys->xFromParent = ar_alloc_array( ar, N, sizeof( Xform ) );
-    sys->xFromBase   = ar_alloc_array( ar, N, sizeof( Xform ) );
+    sys->xTree       = ar_alloc_array( ar, N, sizeof( Xform* ) );
+    sys->xJoint      = ar_alloc_array( ar, N, sizeof( Xform* ) );
+    sys->xFromParent = ar_alloc_array( ar, N, sizeof( Xform* ) );
+    sys->xFromBase   = ar_alloc_array( ar, N, sizeof( Xform* ) );
 
     sys->vel   = ar_alloc_array( ar, N, sizeof( Svec ) );
     sys->acc   = ar_alloc_array( ar, N, sizeof( Svec ) );
     sys->force = ar_alloc_array( ar, N, sizeof( Svec ) );
 
     sys->arena = ar;
+}
+
+Xform *sys_newXform( System *sys, int type ) {
+    Xform *X;
+    switch ( type )
+    {
+    case XFORM_IDENT:
+        X = ar_alloc_aligned( sys->arena, sizeof( Xform), sizeof( void* ) );
+        X->type = type;
+        return X;
+    
+    default:
+        break;
+    }
+
 }

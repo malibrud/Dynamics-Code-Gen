@@ -1,2 +1,5 @@
 references
 *.obj
+*.exe
+*.ilk
+*.pdb

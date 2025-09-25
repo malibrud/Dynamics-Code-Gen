@@ -29,7 +29,7 @@ void *ar_alloc_aligned( Arena *ar, size_t size, size_t align ) {
     assert( align > 0 );
 
     size_t start = ALIGNTO( ar->size, align );
-    check( start + size > ar->capacity, "Arena is out of capacity." );
+    check( start + size <= ar->capacity, "Arena is out of capacity." );
     ar->size = start + size;
     return ar->memory + start;
 }
