@@ -1,6 +1,7 @@
 {
     "files.associations": {
         "*.ixx": "cpp",
-        "svec.h": "c"
+        "svec.h": "c",
+        "ALLOCATE.C": "cpp"
     }
 }

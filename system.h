@@ -1,5 +1,6 @@
 #pragma once
 #include <inttypes.h>
+#include <assert.h>
 #include "svec.h"
 #include "vec3.h"
 #include "frame.h"
@@ -73,6 +74,54 @@ void sys_init( System *sys, int nBod ) {
     sys->force = ar_alloc_array( ar, N, sizeof( Svec ) );
 
     sys->arena = ar;
+}
+
+Xform_AxisTrans *sys_newXform_AxisTrans( System *sys, int type, double d ) {
+    assert( type & XFORM_AXIS_T );
+
+    Xform_AxisTrans *X;
+    X = ar_alloc_aligned( sys->arena, sizeof( Xform_AxisTrans ), ALIGNMENT );
+    X->X.type = type;
+    X->d = d;
+    return X;
+}
+
+Xform_AxisRot *sys_newXform_AxisRot( System *sys, int type, double a ) {
+    assert( axis & XFORM_AXIS_R );
+
+    Xform_AxisRot *X;
+    X = ar_alloc_aligned( sys->arena, sizeof( Xform_AxisRot ), ALIGNMENT );
+    X->X.type = type;
+    X->a = a;
+    return X;
+}
+
+Xform_AxisTransRot *sys_newXform_AxisTransRot( System *sys, int type, double d, double a ) {
+    assert( type & XFORM_AXIS_T );
+    assert( type & XFORM_AXIS_R );
+
+    Xform_AxisTrans *X;
+    X = ar_alloc_aligned( sys->arena, sizeof( Xform_AxisTrans ), ALIGNMENT );
+    X->X.type = type;
+    X->d = d;
+    X->d = a;
+    return X;
+}
+
+Xform_AxisTrans *sys_newXform_Tx( System *sys, double d ) {
+    return sys_newXform_AxisTrans( sys, XFORM_TX, d );
+}
+
+Xform_AxisRot *sys_newXform_Rz( System *sys, double a ) {
+    return sys_newXform_AxisRot( sys, XFORM_RZ, a );
+}
+
+Xform_AxisTransRot *sys_newXform_TxRz( System *sys, double d, double a ) {
+    return sys_newXform_AxisTransRot( sys, XFORM_TX_RZ, d, a );
+}
+
+Xform_AxisTransRot *sys_newXform_Pxy( System *sys, double x, double y, double a ) {
+    return sys_newXform_( sys, XFORM_TX_RZ, d, a );
 }
 
 Xform *sys_newXform( System *sys, int type ) {

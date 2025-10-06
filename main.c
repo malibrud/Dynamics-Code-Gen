@@ -54,17 +54,13 @@ int main() {
         Vec3 *jpn = &jointLocs[ i+1 ];
         Vec3 *jan = &jointAxes[ i+1 ];
 
-        if ( i == 0 ) {
-            sys.xTree[ i ] = sys_newXform( &sys, XFORM_IDENT );
-            
+        sys.parent[ i ]   = i - 1;
+        sys.children[ i ] = i + 1;
 
-        }
-        else {
-            Xform_AxisTrans *X = sys_newXform( &sys, XFORM_TX );
-            X->d = v3_dist( jp, jpn );
-            sys.xTree[ i ] = X;
-        }
-        sys.xJoint[ i ]= sys_newXform( &sys, XFORM_RZ );
+        sys.xTree[ i ]       = sys_newXform_Tx( &sys, 1.0 );
+        sys.xJoint[ i ]      = sys_newXform_Rz( &sys, 0.0 );
+        sys.xFromParent[ i ] = sys_newXform_TxRz( &sys, 1, 0 );
+        sys.xFromBase[ i ]   = sys_newXform_Pxy( &sys, 1, 0, 0 );
 
         sys.bodies[ i ].m = masses[ i ];
         sys.bodies[ i ].m = masses[ i ];
