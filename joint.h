@@ -24,3 +24,5 @@ void j_updateXform( Joint *j ) {
             break;
     }
 }
+
+// void j_calc( )
