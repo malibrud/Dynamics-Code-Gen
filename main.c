@@ -38,7 +38,7 @@ Frame frames[ NBOD ] = { 0 };
 
 int main() {
     System sys = { 0 };
-    sys_init( &sys, 3 );
+    sys_init( &sys, 3, (Svec){0, 0, 0, 0, 0, -9.81 } );
     x_init( sys.arena );
 
     Vec3 plink = { 0 };

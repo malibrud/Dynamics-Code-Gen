@@ -133,6 +133,8 @@ Xform *x_newAxisRot( Xtype type, double a ) {
     X = ar_alloc_aligned( x_arena, sizeof( Xform_AxisRot ), ALIGNMENT );
     X->X.type = type;
     X->a = a;
+    X->cosa = cos( a );
+    X->sina = sin( a );
     return (Xform*)X;
 }
 
@@ -143,8 +145,12 @@ Xform *x_newAxisTransRot( Xtype type, double d, double a ) {
     Xform_AxisTransRot *X;
     X = ar_alloc_aligned( x_arena, sizeof( Xform_AxisTransRot ), ALIGNMENT );
     X->X.type = type;
-    X->d = d;
     X->a = a;
+    X->d = d;
+    X->cosa = cos( a );
+    X->sina = sin( a );
+    X->dcosa = d*X->cosa;
+    X->dsina = d*X->sina;
     return (Xform*)X;
 }
 
@@ -157,6 +163,14 @@ Xform *x_newAxisPlane( Xtype type, double c1, double c2, double a ) {
     X->a = a;
     X->c1 = c1;
     X->c2 = c2;
+    double c = cos( a );
+    double s = sin( a );
+    X->cosa = c;
+    X->sina = s;
+    X->c1cosa = c1*c;
+    X->c1sina = c1*s;
+    X->c2cosa = c2*c;
+    X->c2sina = c2*s;
     return (Xform*)X;
 }
 
@@ -310,5 +324,114 @@ void x_compose( Xform *Xba, Xform *Xcb, Xform *Xca ) {
         return;
     } else {
         assert( false );
+    }
+}
+
+void x_mapply_TxRz( Xform *xIn, Svec *vIn, Svec *vOut ) {
+    assert( xIn->type == XFORM_TX_RZ );
+    Xform_AxisTransRot *X = (Xform_AxisTransRot*)xIn;
+    double s   = X->sina;
+    double c   = X->cosa;
+    double rx  = X->d;
+    double rxs = X->dsina;
+    double rxc = X->dcosa;
+
+    double *vi = vIn->v;
+    double *vo = vOut->v;
+
+    vo[ 0 ] =  c*vi[0] + s*vi[1] +  0;
+    vo[ 1 ] = -s*vi[0] + c*vi[1] +  0;
+    vo[ 2 ] =    0     +   0     + vi[2];
+    
+    vo[ 3 ] = 0 +  0       + rxs*vi[2] + c*vi[3] + s*vi[4] + 0;
+    vo[ 4 ] = 0 +  0       + rxc*vi[2] - s*vi[3] + c*vi[4] + 0;
+    vo[ 5 ] = 0 - rx*vi[1] +     0     +   0     +    0    + vi[5];
+}
+
+void x_fapply_TxRz( Xform *xIn, Svec *vIn, Svec *vOut ) {
+    assert( xIn->type == XFORM_TX_RZ );
+    Xform_AxisTransRot *X = (Xform_AxisTransRot*)xIn;
+    double s   = X->sina;
+    double c   = X->cosa;
+    double rx  = X->d;
+    double rxs = X->dsina;
+    double rxc = X->dcosa;
+
+    double *vi = vIn->v;
+    double *vo = vOut->v;
+
+    vo[ 0 ] =  c*vi[0] + s*vi[1] +  0;
+    vo[ 1 ] = -s*vi[0] + c*vi[1] +  0;
+    vo[ 2 ] =    0     +   0     + vi[2];
+    
+    vo[ 3 ] = 0 +  0       + rxs*vi[2] + c*vi[3] + s*vi[4] + 0;
+    vo[ 4 ] = 0 +  0       + rxc*vi[2] - s*vi[3] + c*vi[4] + 0;
+    vo[ 5 ] = 0 - rx*vi[1] +     0     +   0     +    0    + vi[5];
+}
+
+// 
+void x_finvapply_TxRz( Xform *xIn, Svec *vIn, Svec *vOut ) {
+    assert( xIn->type == XFORM_TX_RZ );
+    Xform_AxisTransRot *X = (Xform_AxisTransRot*)xIn;
+    double s   = X->sina;
+    double c   = X->cosa;
+    double rx  = X->d;
+    double rxs = X->dsina;
+    double rxc = X->dcosa;
+
+    double *vi = vIn->v;
+    double *vo = vOut->v;
+
+    vo[ 0 ] = c*vi[0] - s*vi[1] +  0    +    0      +    0      + 0;
+    vo[ 1 ] = s*vi[0] + c*vi[1] +  0    +    0      +    0      - rx;
+    vo[ 2 ] =   0     +   0     + vi[2] + rxs*vi[3] + rxc*vi[4] + 0;
+    
+    vo[ 3 ] =   0     +   0     +  0    +  c*vi[3]  -  s*vi[4]  + 0;
+    vo[ 4 ] =   0     +   0     +  0    +  s*vi[3]  +  c*vi[4]  + 0;
+    vo[ 5 ] =   0     +   0     +  0    +    0      +     0     + vi[5];
+}
+
+// Apply the transformation to a motion vector, i.e. velocity or acceleration
+// See RBDA eq (2.24) pp 22
+void x_mapply( Xform *X, Svec *vMult, Svec *vResult ) {
+    switch ( X->type )
+    {
+    case XFORM_TX_RZ:
+        x_mapply_TxRz( X, vMult, vResult );
+        break;
+    
+    default:
+        assert( false );
+        break;
+    }
+}
+
+// Apply the transformation to a force vector, i.e. force or momentum
+// See RBDA eq (2.25) pp 22
+void x_fapply( Xform *X, Svec *vMult, Svec *vResult ) {
+    switch ( X->type )
+    {
+    case XFORM_TX_RZ:
+        x_fapply_TxRz( X, vMult, vResult );
+        break;
+    
+    default:
+        assert( false );
+        break;
+    }
+}
+
+// Apply the inverse transformation to a force vector, i.e. force or momentum
+// See RBDA eq (2.27) pp 22
+void x_finvapply( Xform *X, Svec *vMult, Svec *vResult ) {
+    switch ( X->type )
+    {
+    case XFORM_TX_RZ:
+        x_finvapply_TxRz( X, vMult, vResult );
+        break;
+    
+    default:
+        assert( false );
+        break;
     }
 }

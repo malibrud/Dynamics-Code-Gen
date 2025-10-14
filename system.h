@@ -23,13 +23,19 @@ typedef struct {
     double *q;
     double *qd;
     double *qdd;
+    double *tau;
+    double *C;
+    double *H;
     Xform **xTree;
     Xform **xJoint;
     Xform **xFromParent;
     Xform **xFromBase;
+    SpatialInertia *I0;
     Svec *vel;
     Svec *acc;
     Svec *force;
+    Svec *fext;
+    Svec grav;
 
     Arena *arena;
 } System;
@@ -40,13 +46,14 @@ void sys_updateJointXform( System *s, int jidx ) {
 }
 
 #define MB ( 1024 * 1024 )
-void sys_init( System *sys, int nBod ) {
+void sys_init( System *sys, int nBod, Svec gravity ) {
     assert( sys );
     assert( nBod > 0 );
 
     int N = nBod;
     Arena *ar = ar_create( 1*MB );
 
+    sys->grav = gravity;
     sys->nBod = nBod;
     sys->parent   = ar_alloc_array( ar, N, sizeof( int16_t ) );
     sys->children = ar_alloc_array( ar, N, sizeof( int16_t ) );
