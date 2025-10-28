@@ -1,6 +1,7 @@
 #pragma once
 
 #include "system.h"
+#include <stdlib.h>
 
 void fwd_dyn_crba( System *sys, double *q, double *qd, double *tau, double *out_qdd ) {
     int NB = sys->nBod;
@@ -85,7 +86,7 @@ void fwd_dyn_crba( System *sys, double *q, double *qd, double *tau, double *out_
         sv_subFrom( fi, &fext );
     }
 
-    for ( int i = NB ; i >= 0 ; i-- ) {
+    for ( int i = NB-1 ; i >= 0 ; i-- ) {
         // Get the joint force as the element of C, i.e. eq (6.2).
         // C_i = S_i^T * f_i
         if ( sys->jtype[ i ] == J_REVOLUTE ) {
@@ -102,5 +103,24 @@ void fwd_dyn_crba( System *sys, double *q, double *qd, double *tau, double *out_
         sv_addTo( &sys->force[ iParent ] , &childForce );
     }
 
-    // Now that we have C
+    // Calculate H
+    // See RBDA, Table 6.2, pp 107
+
+    // H = 0
+    memset( sys->H, 0, NB*NB*sizeof(double) );
+
+    for ( int i = 0 ; i < NB ; i++ ) {
+        sys->Ic[i] = sys->I0[i];
+    }
+
+    // Generate composite rigid body inertias.
+    for ( int i = 0 ; i < NB ; i++ ) sys->Ic[ i ] = sys->I0[ i ];
+    for ( int i = NB-1 ; i >= 0 ; i-- ) {
+        int iParent = sys->parent[ i ];
+        if ( i != 0 ) {
+            SpatialInertia Ip; // Ic in parent frame;
+            x_Iinvapply( sys->xFromParent, &sys->Ic[ i ], &Ip );
+            si_addTo( &sys->Ic[ iParent ], &Ip);
+        }
+    }
 }

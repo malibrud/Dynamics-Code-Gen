@@ -391,6 +391,63 @@ void x_finvapply_TxRz( Xform *xIn, Svec *vIn, Svec *vOut ) {
     vo[ 5 ] =   0     +   0     +  0    +    0      +     0     + vi[5];
 }
 
+void x_Iinvapply_Pxy( Xform *xIn, SpatialInertia *Iin, SpatialInertia *Iout ) {
+    assert( xIn->type == XFORM_PXY );
+    Xform_AxisPlane *X = (Xform_AxisPlane*)xIn;
+    double s   = X->sina;
+    double c   = X->cosa;
+    double cc  = c * c;
+    double ss  = s * s;
+    double sc  = s * c;
+    double rx  = X->c1;
+    double ry  = X->c2;
+    double rx2 = rx*rx;
+    double ry2 = ry*ry;
+    double rxs = X->c1sina;
+    double rxc = X->c1cosa;
+    double rys = X->c2sina;
+    double ryc = X->c2cosa;
+
+    double m   = Iin->m;
+    double Ixx = Iin->Ixx;
+    double Iyy = Iin->Iyy;
+    double Izz = Iin->Izz;
+    double Ixy = Iin->Ixy;
+    double Iyz = Iin->Iyz;
+    double Izx = Iin->Izx;
+
+    double Isx = Iin->sx;
+    double Isy = Iin->sy;
+    double Isz = Iin->sz;
+
+    // Upper left 3x3 block 
+    // E^T * I * E
+    Iout->Ixx = cc*Ixx - 2*sc*Ixy + ss*Iyy;
+    Iout->Iyy = ss*Ixx + 2*sc*Ixy + cc*Iyy;
+    Iout->Izz = Izz;
+    Iout->Ixy = sc*Ixx + (cc-ss)*Ixy - sc*Iyy;
+    Iout->Iyz =  s*Izx + c*Iyz;
+    Iout->Izx =  c*Izx - s*Iyz;
+
+    // [r^T]_x * [s]_x + [s]_x * [r^T]_x
+    Iout->Ixx +=            2*ry*Isy;
+    Iout->Iyy += 2*rx*Isx;
+    Iout->Izz += 2*rx*Isx + 2*ry*Isy;
+    Iout->Ixy +=  -rx*Isy -   ry*Isx;
+    Iout->Iyz +=  -ry*Isz -    0*Isy;
+    Iout->Izx +=  -rx*Isz -    0*Isx;
+
+    // m *[r^T]_x * [r]_x
+    Iout->Ixx += m*( ry2 +   0 );
+    Iout->Iyy += m*( rx2 +   0 );
+    Iout->Izz += m*( rx2 + ry2 );
+    Iout->Ixy += m*rx*ry;
+    Iout->Iyz += 0;
+    Iout->Izx += 0;
+
+    // Lower left and upper right
+}
+
 // Apply the transformation to a motion vector, i.e. velocity or acceleration
 // See RBDA eq (2.24) pp 22
 void x_mapply( Xform *X, Svec *vMult, Svec *vResult ) {
@@ -428,6 +485,26 @@ void x_finvapply( Xform *X, Svec *vMult, Svec *vResult ) {
     {
     case XFORM_TX_RZ:
         x_finvapply_TxRz( X, vMult, vResult );
+        break;
+    
+    default:
+        assert( false );
+        break;
+    }
+}
+
+// Apply the inverse transformation to a spatial inertia
+// Computes B_I = B_X^*_A * A_I * A_X_B
+// See RBDA eq (2.66) pp 34
+void x_Iinvapply( Xform *X, SpatialInertia *Iin, SpatialInertia *Iout ) {
+    switch ( X->type )
+    {
+    case XFORM_TX_RZ:
+        x_Iinvapply_TxRz( X, vMult, vResult );
+        break;
+    
+    case XFORM_PXY:
+        x_Iinvapply_Pxy( X, vMult, vResult );
         break;
     
     default:

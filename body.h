@@ -10,20 +10,24 @@ typedef struct {
     double zx;
 } Inertia;
 
+/* 
+Inertia tensor is defined with the off-diagonal minus signs absorbed into the terms.
+
+      [ Ixx Ixy Izx ]
+I_0 = [ Ixy Iyy Iyz ]
+      [ Izx Iyz Izz ]
+*/
 typedef struct {
     double m;
-    double mcx;
-    double mcy;
-    double mcz;
-    double mcxcy;
-    double mcycz;
-    double mczcx;
+    double sx; // m * c_x
+    double sy; // m * c_y
+    double sz; // m * c_z
     double Ixx;
     double Iyy;
     double Izz;
-    double Ixy;
-    double Iyz;
-    double Izx;
+    double Ixy; // minus sign absorbed into term.
+    double Iyz; // minus sign absorbed into term.
+    double Izx; // minus sign absorbed into term.
 } SpatialInertia;
 
 typedef struct {
@@ -43,17 +47,13 @@ SpatialInertia bd_translateInertia( Body B, Vec3 v, double m ) {
     I0.Iyy = B.I.yy + m*( x*x + z*z );
     I0.Izz = B.I.zz + m*( y*y + x*x );
 
-    I0.Ixy = B.I.xy + m*x*y;
-    I0.Iyz = B.I.yz + m*y*z;
-    I0.Izx = B.I.zx + m*z*x;
+    I0.Ixy = B.I.xy - m*x*y;
+    I0.Iyz = B.I.yz - m*y*z;
+    I0.Izx = B.I.zx - m*z*x;
 
-    I0.mcx = m * x;
-    I0.mcy = m * y;
-    I0.mcz = m * z;
-
-    I0.mcxcy = m * x * y;
-    I0.mcycz = m * y * z;
-    I0.mczcx = m * z * x;
+    I0.sx = m * x;
+    I0.sy = m * y;
+    I0.sz = m * z;
 
     return I0;
 }
@@ -62,13 +62,16 @@ SpatialInertia bd_translateInertia( Body B, Vec3 v, double m ) {
 void bd_m2f( SpatialInertia *I, Svec *vIn, Svec *vOut ) {
     double *f = vOut->v;
     double *v = vIn->v;
+    double wx = v[0];   // Omega_x
+    double wy = v[1];   // Omega_y
+    double wz = v[2];   // Omega_z
+    double vx = v[0];   // v0_x
+    double vy = v[1];   // v0_y
+    double vz = v[2];   // v0_z
     double m = I->m;
-    double mx = I->mcx;
-    double my = I->mcy;
-    double mz = I->mcz;
-    double mxy = I->mcxcy;
-    double myz = I->mcycz;
-    double mzx = I->mczcx;
+    double mx = I->sx;
+    double my = I->sy;
+    double mz = I->sz;
     double Ixx = I->Ixx;
     double Iyy = I->Iyy;
     double Izz = I->Izz;
@@ -76,11 +79,24 @@ void bd_m2f( SpatialInertia *I, Svec *vIn, Svec *vOut ) {
     double Iyz = I->Iyz;
     double Izx = I->Izx;
 
-    f[ 0 ] =  Ixx*v[0] - Ixy*v[1] - Izx*v[2]   +    0    - mz*v[4] + my*v[5];
-    f[ 1 ] = -Ixy*v[0] + Iyy*v[1] - Iyz*v[2]   + mz*v[3] +    0    - mx*v[5];
-    f[ 2 ] = -Izx*v[0] - Iyz*v[1] + Izz*v[2]   - my*v[3] + mx*v[4] +    0   ;
+    f[ 0 ] =  Ixx*wx + Ixy*wy + Izx*wz   +    0  - mz*vy + my*vz  ;
+    f[ 1 ] =  Ixy*wx + Iyy*wy + Iyz*wz   + mz*vx +    0  - mx*vz  ;
+    f[ 2 ] =  Izx*wx + Iyz*wy + Izz*wz   - my*vx + mx*vy +    0   ;
 
-    f[ 3 ] =    0*v[0] +  mz*v[1] -  my*v[2]   +  m*v[3] +    0    +    0   ;
-    f[ 4 ] =  -mz*v[0] +   0*v[1] +  mx*v[2]   +    0    +  m*v[4] +    0   ;
-    f[ 5 ] =   my*v[0] -  mx*v[1] +   0*v[2]   +    0    +    0    +  m*v[5];
+    f[ 3 ] =    0*wx +  mz*wy -  my*wz   +  m*vx +    0  +    0   ;
+    f[ 4 ] =  -mz*wx +   0*wy +  mx*wz   +    0  +  m*vy +    0   ;
+    f[ 5 ] =   my*wx -  mx*wy +   0*wz   +    0  +    0  +  m*vz  ;
+}
+
+void si_addTo( SpatialInertia *a, SpatialInertia *b ) {
+    a->Ixx += b->Ixx;
+    a->Iyy += b->Iyy;
+    a->Izz += b->Izz;
+    a->Ixy += b->Ixy;
+    a->Iyz += b->Iyz;
+    a->Izx += b->Izx;
+    a->m   += b->m;
+    a->sx  += b->sx;
+    a->sy  += b->sy;
+    a->sz  += b->sz;
 }

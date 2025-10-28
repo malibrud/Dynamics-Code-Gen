@@ -30,7 +30,8 @@ typedef struct {
     Xform **xJoint;
     Xform **xFromParent;
     Xform **xFromBase;
-    SpatialInertia *I0;
+    SpatialInertia *I0; // Spatial inertia of body in body coordinates, see RBDA, pp 33, eq. (2.63)
+    SpatialInertia *Ic; // Spatial inertia of the composite rigid body in body coordinates, see RBDA, pp 106, eq. (6.17)
     Svec *vel;
     Svec *acc;
     Svec *force;
