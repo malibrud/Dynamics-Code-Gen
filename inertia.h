@@ -1,4 +1,5 @@
 #pragma once
+#include <assert.h>
 #include "vec3.h"
 
 typedef struct {
@@ -99,4 +100,46 @@ void si_addTo( SpatialInertia *a, SpatialInertia *b ) {
     a->sx  += b->sx;
     a->sy  += b->sy;
     a->sz  += b->sz;
+}
+
+// Computes vOut = I * vIn
+void si_multBySvec( SpatialInertia *I, Svec *vIn, Svec *vOut ) {
+    double *vi = vIn->v;
+    double *vo = vOut->v;
+
+    // Revolute Joint
+    if ( vi[ 2 ] == 1 ) {
+        assert( vi[ 0 ] == 0 );
+        assert( vi[ 1 ] == 0 );
+        assert( vi[ 3 ] == 0 );
+        assert( vi[ 4 ] == 0 );
+        assert( vi[ 5 ] == 0 );
+
+        vo[ 0 ] = I->Izx;
+        vo[ 1 ] = I->Iyz;
+        vo[ 2 ] = I->Izz;
+        vo[ 3 ] = I->sy;
+        vo[ 4 ] = -I->sx;
+        vo[ 5 ] = 0;
+        return;
+    }
+    assert( false );
+}
+
+// Computes fOut = fIn^T * S
+double si_multForceByJointSubspace( Svec *fIn, Svec *S ) {
+    double *f = fIn->v;
+    double *s = S->v;
+
+    // Revolute Joint
+    if ( s[ 2 ] == 1 ) {
+        assert( s[ 0 ] == 0 );
+        assert( s[ 1 ] == 0 );
+        assert( s[ 3 ] == 0 );
+        assert( s[ 4 ] == 0 );
+        assert( s[ 5 ] == 0 );
+
+        return f[ 2 ];
+    }
+    assert( false );
 }

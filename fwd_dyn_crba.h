@@ -11,7 +11,6 @@ void fwd_dyn_crba( System *sys, double *q, double *qd, double *tau, double *out_
     for ( int i = 0 ; i < NB ; i++ ) {
         int iParent = sys->parent[ i ];
         // Calculate the joint values, i.e. jcalc() in RBDA.
-        Svec S = {};
         Svec vJ = {};
         Svec aJ = {};
         if ( sys->jtype[ i ] == J_REVOLUTE ) {
@@ -19,7 +18,7 @@ void fwd_dyn_crba( System *sys, double *q, double *qd, double *tau, double *out_
             x_update( sys->xJoint[ i ], &q[ i ] );
 
             // Get S_i.
-            S.v[ 2 ] = 1;
+            sys->S.v[ 2 ] = 1;
 
             // Get v_J = S_i * qdd_i.
             vJ.v[ 2 ] = qd[ i ];
@@ -114,13 +113,16 @@ void fwd_dyn_crba( System *sys, double *q, double *qd, double *tau, double *out_
     }
 
     // Generate composite rigid body inertias.
+    // Ic_i = I0_i + Sum(j = mu(i)) { i_X*_j * Ic_j * j_X_i }
     for ( int i = 0 ; i < NB ; i++ ) sys->Ic[ i ] = sys->I0[ i ];
     for ( int i = NB-1 ; i >= 0 ; i-- ) {
         int iParent = sys->parent[ i ];
         if ( i != 0 ) {
             SpatialInertia Ip; // Ic in parent frame;
-            x_Iinvapply( sys->xFromParent, &sys->Ic[ i ], &Ip );
+            x_Iinvapply( *sys->xFromParent, &sys->Ic[ i ], &Ip );
             si_addTo( &sys->Ic[ iParent ], &Ip);
         }
+        Svec F;
+        si_multBySvec( &sys->Ic[ i ], &sys->S[ i ], &F );
     }
 }

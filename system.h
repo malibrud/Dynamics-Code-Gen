@@ -4,7 +4,7 @@
 #include "svec.h"
 #include "vec3.h"
 #include "frame.h"
-#include "body.h"
+#include "inertia.h"
 #include "joint.h"
 #include "xform.h"
 #include "arena.h"
@@ -26,6 +26,7 @@ typedef struct {
     double *tau;
     double *C;
     double *H;
+    Svec *S;
     Xform **xTree;
     Xform **xJoint;
     Xform **xFromParent;

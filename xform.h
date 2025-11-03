@@ -500,11 +500,11 @@ void x_Iinvapply( Xform *X, SpatialInertia *Iin, SpatialInertia *Iout ) {
     switch ( X->type )
     {
     case XFORM_TX_RZ:
-        x_Iinvapply_TxRz( X, vMult, vResult );
+        x_Iinvapply_TxRz( X, Iin, Iout );
         break;
     
     case XFORM_PXY:
-        x_Iinvapply_Pxy( X, vMult, vResult );
+        x_Iinvapply_Pxy( X, Iin, Iout );
         break;
     
     default:
