@@ -124,5 +124,11 @@ void fwd_dyn_crba( System *sys, double *q, double *qd, double *tau, double *out_
         }
         Svec F;
         si_multBySvec( &sys->Ic[ i ], &sys->S[ i ], &F );
+        sys->H[ i*NB + i ] = si_multforcebyjointsubspace( &F, &sys->S[ i ] );
+
+        int j = i;
+        while ( j != 0 ) {
+            
+        }
     }
 }
