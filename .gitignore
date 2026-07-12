@@ -1,4 +1,5 @@
 references
+/build/
 *.obj
 *.exe
 *.ilk
