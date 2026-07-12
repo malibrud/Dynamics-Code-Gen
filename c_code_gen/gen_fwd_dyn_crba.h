@@ -72,8 +72,6 @@ void gen_fwd_dyn_crba( FILE *f, System *sys ) {
         string qd = format( "qd{}", i );
 
         sys->xFromParent[ i ] = compose( format( "Xlink{}", i ), sys->xJoint[ i ], sys->xTree[ i ] );
-        if ( i != 0 ) sys->xFromBase[ i ] = compose( format( "Xglobal{}", i ), sys->xFromParent[ i ], sys->xFromBase[ i-1 ] );
-        else sys->xFromBase[ i ] = Xform( XFORM_IDENT, "Xbase", "" );
 
         sys->S[ i ][ 2 ] = "1";
         sys->S[ i ].baseName = format( "S{}_", i );
@@ -93,9 +91,18 @@ void gen_fwd_dyn_crba( FILE *f, System *sys ) {
         prln( "" );
         sys->xFromParent[ i ].emit();
         prln( "" );
-        sys->xFromBase[ i ].emit();
 
-        prln( "" );
+        // xFromBase is composed only after xFromParent has been emitted, so it
+        // references the Xlink temps rather than re-expanding their expressions.
+        // For body 0 the parent is the base, so 0_X_base is just Xlink0 —
+        // already emitted, no new temps needed.
+        if ( i != 0 ) {
+            sys->xFromBase[ i ] = compose( format( "Xglobal{}", i ), sys->xFromParent[ i ], sys->xFromBase[ i-1 ] );
+            sys->xFromBase[ i ].emit();
+            prln( "" );
+        } else {
+            sys->xFromBase[ i ] = sys->xFromParent[ i ];
+        }
 
     }
 

@@ -21,31 +21,18 @@ void fwd_dyn_crba( double *q, double *qd, double *tau, double *out_qdd ) {
     double vJ0_4 = 0;
     double vJ0_5 = 0;
     
-    double X0_E00 = cos_q0;
-    double X0_E01 = -sin_q0;
-    double X0_E02 = 0;
-    double X0_E10 = sin_q0;
-    double X0_E11 = cos_q0;
-    double X0_E12 = 0;
-    double X0_E20 = 0;
-    double X0_E21 = 0;
-    double X0_E22 = 1;
-    double X0_r0 = 1 + cos_q0;
-    double X0_r1 = -sin_q0;
-    double X0_r2 = 0;
-    
-    double Base_E00 = 1;
-    double Base_E01 = 0;
-    double Base_E02 = 0;
-    double Base_E10 = 0;
-    double Base_E11 = 1;
-    double Base_E12 = 0;
-    double Base_E20 = 0;
-    double Base_E21 = 0;
-    double Base_E22 = 1;
-    double Base_r0 = 0;
-    double Base_r1 = 0;
-    double Base_r2 = 0;
+    double Xlink0_E00 = cos_q0;
+    double Xlink0_E01 = -sin_q0;
+    double Xlink0_E02 = 0;
+    double Xlink0_E10 = sin_q0;
+    double Xlink0_E11 = cos_q0;
+    double Xlink0_E12 = 0;
+    double Xlink0_E20 = 0;
+    double Xlink0_E21 = 0;
+    double Xlink0_E22 = 1;
+    double Xlink0_r0 = 1;
+    double Xlink0_r1 = 0;
+    double Xlink0_r2 = 0;
     
     // Body 1
     double q1 = q[ 1 ];
@@ -67,31 +54,31 @@ void fwd_dyn_crba( double *q, double *qd, double *tau, double *out_qdd ) {
     double vJ1_4 = 0;
     double vJ1_5 = 0;
     
-    double X1_E00 = cos_q1;
-    double X1_E01 = -sin_q1;
-    double X1_E02 = 0;
-    double X1_E10 = sin_q1;
-    double X1_E11 = cos_q1;
-    double X1_E12 = 0;
-    double X1_E20 = 0;
-    double X1_E21 = 0;
-    double X1_E22 = 1;
-    double X1_r0 = 1 + cos_q1;
-    double X1_r1 = -sin_q1;
-    double X1_r2 = 0;
+    double Xlink1_E00 = cos_q1;
+    double Xlink1_E01 = -sin_q1;
+    double Xlink1_E02 = 0;
+    double Xlink1_E10 = sin_q1;
+    double Xlink1_E11 = cos_q1;
+    double Xlink1_E12 = 0;
+    double Xlink1_E20 = 0;
+    double Xlink1_E21 = 0;
+    double Xlink1_E22 = 1;
+    double Xlink1_r0 = 1;
+    double Xlink1_r1 = 0;
+    double Xlink1_r2 = 0;
     
-    double X0_1_E00 = cos_q1;
-    double X0_1_E01 = -sin_q1;
-    double X0_1_E02 = 0;
-    double X0_1_E10 = sin_q1;
-    double X0_1_E11 = cos_q1;
-    double X0_1_E12 = 0;
-    double X0_1_E20 = 0;
-    double X0_1_E21 = 0;
-    double X0_1_E22 = 1;
-    double X0_1_r0 = 0;
-    double X0_1_r1 = 0;
-    double X0_1_r2 = 0;
+    double Xglobal1_E00 = Xlink1_E00*Xlink0_E00 + Xlink1_E01*Xlink0_E10;
+    double Xglobal1_E01 = Xlink1_E00*Xlink0_E01 + Xlink1_E01*Xlink0_E11;
+    double Xglobal1_E02 = 0;
+    double Xglobal1_E10 = Xlink1_E10*Xlink0_E00 + Xlink1_E11*Xlink0_E10;
+    double Xglobal1_E11 = Xlink1_E10*Xlink0_E01 + Xlink1_E11*Xlink0_E11;
+    double Xglobal1_E12 = 0;
+    double Xglobal1_E20 = 0;
+    double Xglobal1_E21 = 0;
+    double Xglobal1_E22 = 1;
+    double Xglobal1_r0 = 1 + Xlink0_E00;
+    double Xglobal1_r1 = Xlink0_E01;
+    double Xglobal1_r2 = 0;
     
     // Body 2
     double q2 = q[ 2 ];
@@ -113,30 +100,30 @@ void fwd_dyn_crba( double *q, double *qd, double *tau, double *out_qdd ) {
     double vJ2_4 = 0;
     double vJ2_5 = 0;
     
-    double X2_E00 = cos_q2;
-    double X2_E01 = -sin_q2;
-    double X2_E02 = 0;
-    double X2_E10 = sin_q2;
-    double X2_E11 = cos_q2;
-    double X2_E12 = 0;
-    double X2_E20 = 0;
-    double X2_E21 = 0;
-    double X2_E22 = 1;
-    double X2_r0 = 1 + cos_q2;
-    double X2_r1 = -sin_q2;
-    double X2_r2 = 0;
+    double Xlink2_E00 = cos_q2;
+    double Xlink2_E01 = -sin_q2;
+    double Xlink2_E02 = 0;
+    double Xlink2_E10 = sin_q2;
+    double Xlink2_E11 = cos_q2;
+    double Xlink2_E12 = 0;
+    double Xlink2_E20 = 0;
+    double Xlink2_E21 = 0;
+    double Xlink2_E22 = 1;
+    double Xlink2_r0 = 1;
+    double Xlink2_r1 = 0;
+    double Xlink2_r2 = 0;
     
-    double X0_2_E00 = cos_q2*cos_q1 + -sin_q2*sin_q1;
-    double X0_2_E01 = cos_q2*-sin_q1 + -sin_q2*cos_q1;
-    double X0_2_E02 = 0;
-    double X0_2_E10 = sin_q2*cos_q1 + cos_q2*sin_q1;
-    double X0_2_E11 = sin_q2*-sin_q1 + cos_q2*cos_q1;
-    double X0_2_E12 = 0;
-    double X0_2_E20 = 0;
-    double X0_2_E21 = 0;
-    double X0_2_E22 = 1;
-    double X0_2_r0 = 0;
-    double X0_2_r1 = 0;
-    double X0_2_r2 = 0;
+    double Xglobal2_E00 = Xlink2_E00*Xglobal1_E00 + Xlink2_E01*Xglobal1_E10;
+    double Xglobal2_E01 = Xlink2_E00*Xglobal1_E01 + Xlink2_E01*Xglobal1_E11;
+    double Xglobal2_E02 = 0;
+    double Xglobal2_E10 = Xlink2_E10*Xglobal1_E00 + Xlink2_E11*Xglobal1_E10;
+    double Xglobal2_E11 = Xlink2_E10*Xglobal1_E01 + Xlink2_E11*Xglobal1_E11;
+    double Xglobal2_E12 = 0;
+    double Xglobal2_E20 = 0;
+    double Xglobal2_E21 = 0;
+    double Xglobal2_E22 = 1;
+    double Xglobal2_r0 = Xglobal1_r0 + Xglobal1_E00;
+    double Xglobal2_r1 = Xglobal1_r1 + Xglobal1_E01;
+    double Xglobal2_r2 = 0;
     
 }

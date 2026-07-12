@@ -46,7 +46,7 @@ typedef int16_t Xtype;
 
 // Transformations in the planes XY, YZ, ZX
 #define XFORM_PXY ( XFORM_AXIS_P | (Xtype)25 )
-#define XFORM_PYZ ( XFORM_AXIS_P | (Xtype)25 )
+#define XFORM_PYZ ( XFORM_AXIS_P | (Xtype)26 )
 #define XFORM_PZX ( XFORM_AXIS_P | (Xtype)27 )
 
 // Transformations defined by D-H parameters
@@ -99,15 +99,21 @@ struct Xform {
         }
     }
 
+    // Emits each entry as a named temp, then replaces the entry with the temp's
+    // name so later compositions reference the emitted variable instead of
+    // re-expanding the expression.  Literals 0 and 1 are kept as-is so that
+    // sparsity keeps propagating through subsequent symbolic math.
     void emit() {
         // Generate E
         for ( int r = 0 ; r < 3 ; r++ )
         for ( int c = 0 ; c < 3 ; c++ )
         {
             prln( "double %s_E%d%d = %s;", baseName.c_str(), r, c, E[r][c].c_str() );
+            if ( E[r][c] != "0" && E[r][c] != "1" ) E[r][c] = format( "{}_E{}{}", baseName, r, c );
         }
         for ( int i = 0 ; i < 3 ; i++ ) {
             prln( "double %s_r%d = %s;", baseName.c_str(), i, r[i].c_str() );
+            if ( r[i] != "0" && r[i] != "1" ) r[i] = format( "{}_r{}", baseName, i );
         }
     }
 };
@@ -129,13 +135,13 @@ Xform compose( std::string base, Xform &X_C_B, Xform &X_B_A ) {
         X.E[r][c] = v;
     }
 
-    // Generate r
+    // Generate r = r_B_A + E_B_A^T * r_C_B
     for ( int r = 0 ; r < 3 ; r++ )
     {
         string v = X_B_A.r[r];
         for ( int i = 0 ; i < 3 ; i++ )
         {
-            auto term = multFactors( X_C_B.E[i][r], X_B_A.r[i] );
+            auto term = multFactors( X_B_A.E[i][r], X_C_B.r[i] );
             v = addTerms( v, term );
         }
         X.r[ r ] = v;
@@ -144,20 +150,41 @@ Xform compose( std::string base, Xform &X_C_B, Xform &X_B_A ) {
     return X;
 }
 
-Svec fwdXformMotion( string &name, Xform& X, Svec& v ) {
-    Svec s;
+// Transforms a motion vector from frame A to frame B, where X is the A-to-B transform.
+// vB_angular = E * w
+// vB_linear  = E * ( v - r x w )
+Svec fwdXformMotion( string name, Xform &X, Svec &vA ) {
+    Svec s( name );
+    const string *w = &vA.v[ 0 ];
+    const string *v = &vA.v[ 3 ];
 
-    // Top three elements
+    // Angular part: E * w
     for ( int r = 0 ; r < 3 ; r++ )
     {
-        string v = "0";
+        string sum = "0";
         for ( int i = 0 ; i < 3 ; i++ )
         {
-            auto term = multFactors( X.E[r][i], v.v[i] );
-            v = addTerms( v, term );
+            sum = addTerms( sum, multFactors( X.E[r][i], w[i] ) );
         }
-        X.r[ r ] = v;
+        s.v[ r ] = sum;
     }
 
+    // t = v - r x w
+    string t[ 3 ];
+    t[0] = subTerms( v[0], subTerms( multFactors( X.r[1], w[2] ), multFactors( X.r[2], w[1] ) ) );
+    t[1] = subTerms( v[1], subTerms( multFactors( X.r[2], w[0] ), multFactors( X.r[0], w[2] ) ) );
+    t[2] = subTerms( v[2], subTerms( multFactors( X.r[0], w[1] ), multFactors( X.r[1], w[0] ) ) );
 
+    // Linear part: E * t
+    for ( int r = 0 ; r < 3 ; r++ )
+    {
+        string sum = "0";
+        for ( int i = 0 ; i < 3 ; i++ )
+        {
+            sum = addTerms( sum, multFactors( X.E[r][i], t[i] ) );
+        }
+        s.v[ r + 3 ] = sum;
+    }
+
+    return s;
 }

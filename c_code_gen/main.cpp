@@ -42,12 +42,6 @@ Inertia inertias[] = {
 int main() {
     System sys( NBOD );
     for ( int i = 0 ; i < NBOD ; i++ ) {
-        Vec3 rlink;
-        Vec3 *jp = &jointLocs[ i ];
-        Vec3 *ja = &jointAxes[ i ];
-        Vec3 *jpn = &jointLocs[ i+1 ];
-        Vec3 *jan = &jointAxes[ i+1 ];
-
         sys.parent[ i ]   = i - 1;
         sys.children[ i ] = i + 1;
 

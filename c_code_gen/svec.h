@@ -32,10 +32,13 @@ struct Svec {
         return p;
     }
     
+    // Emits each element as a named temp, then replaces the element with the
+    // temp's name (literals 0 and 1 stay as-is to preserve sparsity).
     void emit() {
         for ( int i = 0 ; i < 6 ; i++ ) {
             string outStr = format( "double {}{} = {};", baseName, i, v[ i ] );
             prln( "%s", outStr.c_str() );
+            if ( v[ i ] != "0" && v[ i ] != "1" ) v[ i ] = format( "{}{}", baseName, i );
         }
     }
 };
