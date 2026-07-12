@@ -57,9 +57,6 @@ int main() {
         auto jName = std::format( "Xjoint_{}", i );
         sys.xTree[ i ]       = Xform( XFORM_TX, tName, "1"s );
         sys.xJoint[ i ]      = Xform( XFORM_RZ, jName, q );
-        sys.xFromParent[ i ] = compose( format( "X{}", i ), sys.xJoint[ i ], sys.xTree[ i ] );
-        if ( i != 0 ) sys.xFromBase[ i ] = compose( format( "X0_{}", i ), sys.xFromParent[ i ], sys.xFromBase[ i-1 ] );
-        else sys.xFromBase[ i ] = Xform( XFORM_IDENT, "Base", "" );
 
         // sys.bodies[ i ].m = masses[ i ];
         // sys.bodies[ i ].m = masses[ i ];

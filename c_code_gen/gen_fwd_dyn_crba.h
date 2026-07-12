@@ -7,54 +7,54 @@
 #include "system.h"
 #include "prln.h"
 
-#define VAR_SIZE 64
-typedef struct {
-    char s[ VAR_SIZE ];
-} Var;
-
-Var _Var( const char *f, ... ) {
-    Var v;
-    va_list args;
-    va_start( args, f );
-    vsnprintf( v.s, VAR_SIZE, f, args );
-    va_end( args );
-    return v;
-}
-
-typedef struct {
-    Var v[ 6 ];
-} Svec_;
-
-typedef struct {
-    Var E[ 3 ][ 3 ];
-    Var r[ 3 ];
-} xForm;
-
-Svec_ genS( int iBody, int jType ) {
-    Svec_ S;
-    switch( jType ) {
-        case J_REVOLUTE:
-            S.v[ 0 ] = _Var( "0" );
-            S.v[ 1 ] = _Var( "0" );
-            S.v[ 2 ] = _Var( "1" );
-            S.v[ 3 ] = _Var( "0" );
-            S.v[ 4 ] = _Var( "0" );
-            S.v[ 5 ] = _Var( "0" );
-            break;
-        default:
-            assert( false );
-    }
-    return S;
-}
-
-Svec_ genVJ( int iBody, Svec_ *S, Var *qd ) {
-    Svec_ vJ;
-    for ( int i = 0 ; i < 6 ; i++ ) {
-        bool isElement0 = !strcmp( S->v[ i ].s, "0" );
-        vJ.v[ i ] = isElement0 ? _Var( "0") : *qd;
-    }
-    return vJ;
-}
+// #define VAR_SIZE 64
+// typedef struct {
+//     char s[ VAR_SIZE ];
+// } Var;
+// 
+// Var _Var( const char *f, ... ) {
+//     Var v;
+//     va_list args;
+//     va_start( args, f );
+//     vsnprintf( v.s, VAR_SIZE, f, args );
+//     va_end( args );
+//     return v;
+// }
+// 
+// typedef struct {
+//     Var v[ 6 ];
+// } Svec_;
+// 
+// typedef struct {
+//     Var E[ 3 ][ 3 ];
+//     Var r[ 3 ];
+// } xForm;
+// 
+// Svec_ genS( int iBody, int jType ) {
+//     Svec_ S;
+//     switch( jType ) {
+//         case J_REVOLUTE:
+//             S.v[ 0 ] = _Var( "0" );
+//             S.v[ 1 ] = _Var( "0" );
+//             S.v[ 2 ] = _Var( "1" );
+//             S.v[ 3 ] = _Var( "0" );
+//             S.v[ 4 ] = _Var( "0" );
+//             S.v[ 5 ] = _Var( "0" );
+//             break;
+//         default:
+//             assert( false );
+//     }
+//     return S;
+// }
+// 
+// Svec_ genVJ( int iBody, Svec_ *S, Var *qd ) {
+//     Svec_ vJ;
+//     for ( int i = 0 ; i < 6 ; i++ ) {
+//         bool isElement0 = !strcmp( S->v[ i ].s, "0" );
+//         vJ.v[ i ] = isElement0 ? _Var( "0") : *qd;
+//     }
+//     return vJ;
+// }
 
 void gen_fwd_dyn_crba( FILE *f, System *sys ) {
     prln_file = f;
@@ -68,24 +68,35 @@ void gen_fwd_dyn_crba( FILE *f, System *sys ) {
     for ( int i = 0 ; i < NB ; i++ ) {
         prln( "// Body %d", i );
         int jType = sys->jtype[ i ];
-        Var q = _Var( "q%d", i );
-        Var qd = _Var( "qd%d", i );
-        Svec_ S = genS( i, jType );
-        Svec_ vJ = genVJ( i, &S, &qd );
+        string q = format( "q{}", i );
+        string qd = format( "qd{}", i );
 
-        prln( "double %s = q[ %d ];", q.s, i );
-        prln( "double %s = qd[ %d ];", qd.s, i );
-        prln( "double S%d[ 6 ] = { %s, %s, %s, %s, %s, %s };", 
-            i,
-            S.v[0], S.v[1], S.v[2], S.v[3], S.v[4], S.v[5]
-        );
-        prln( "double sin_%s = sin( %s );", q.s, q.s );
-        prln( "double cos_%s = cos( %s );", q.s, q.s );
+        sys->xFromParent[ i ] = compose( format( "Xlink{}", i ), sys->xJoint[ i ], sys->xTree[ i ] );
+        if ( i != 0 ) sys->xFromBase[ i ] = compose( format( "Xglobal{}", i ), sys->xFromParent[ i ], sys->xFromBase[ i-1 ] );
+        else sys->xFromBase[ i ] = Xform( XFORM_IDENT, "Xbase", "" );
 
+        sys->S[ i ][ 2 ] = "1";
+        sys->S[ i ].baseName = format( "S{}_", i );
+
+        sys->vJ[ i ] = sys->S[ i ] * qd;
+        sys->vJ[ i ].baseName = format( "vJ{}_", i );
+
+        prln( "double %s = q[ %d ];", q.c_str(), i );
+        prln( "double %s = qd[ %d ];", qd.c_str(), i );
+        prln( "double sin_%s = sin( %s );", q.c_str(), q.c_str() );
+        prln( "double cos_%s = cos( %s );", q.c_str(), q.c_str() );
+
+        prln( "" );
+        sys->S[ i ].emit();
+        prln( "" );
+        sys->vJ[ i ].emit();
+        prln( "" );
         sys->xFromParent[ i ].emit();
+        prln( "" );
         sys->xFromBase[ i ].emit();
 
         prln( "" );
+
     }
 
     prln_indent_level--;

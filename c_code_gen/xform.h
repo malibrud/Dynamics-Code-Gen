@@ -2,7 +2,9 @@
 #include <inttypes.h>
 #include <string>
 #include <format>
+#include "svec.h"
 #include "prln.h"
+#include "symmath.h"
 
 using namespace std;
 using namespace std::string_literals;
@@ -110,20 +112,6 @@ struct Xform {
     }
 };
 
-string addTerms( string &t1, string &t2 ) {
-    if ( t1 == "0" ) return t2;
-    if ( t2 == "0" ) return t1;
-    return format( "{} + {}", t1, t2 );
-}
-
-string multFactors( string &f1, string &f2 ) {
-    if ( f1 == "0" ) return "0";
-    if ( f2 == "0" ) return "0";
-    if ( f1 == "1" ) return f2;
-    if ( f2 == "1" ) return f1;
-    return format( "{}*{}", f1, f2 );
-}
-
 Xform compose( std::string base, Xform &X_C_B, Xform &X_B_A ) {
     Xform X;
     X.baseName = base;
@@ -154,4 +142,22 @@ Xform compose( std::string base, Xform &X_C_B, Xform &X_B_A ) {
     }
 
     return X;
+}
+
+Svec fwdXformMotion( string &name, Xform& X, Svec& v ) {
+    Svec s;
+
+    // Top three elements
+    for ( int r = 0 ; r < 3 ; r++ )
+    {
+        string v = "0";
+        for ( int i = 0 ; i < 3 ; i++ )
+        {
+            auto term = multFactors( X.E[r][i], v.v[i] );
+            v = addTerms( v, term );
+        }
+        X.r[ r ] = v;
+    }
+
+
 }
