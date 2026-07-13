@@ -17,9 +17,20 @@ string addTerms( const string &t1, const string &t2 ) {
     return format( "{} + {}", t1, t2 );
 }
 
+// Negates a term. If it's already a bare negation (e.g. "-1" or "-sin_q0",
+// as opposed to a parenthesized sum like "( a + b )"), strips the leading '-'
+// instead of stacking another one -- "--1" is not valid C (it parses as
+// pre-decrement of a non-lvalue), so double negatives must cancel here.
+string negate( const string &t ) {
+    if ( t == "0" ) return "0";
+    string p = paren( t );
+    if ( p[ 0 ] == '-' ) return p.substr( 1 );
+    return "-" + p;
+}
+
 string subTerms( const string &t1, const string &t2 ) {
     if ( t2 == "0" ) return t1;
-    if ( t1 == "0" ) return format( "-{}", paren( t2 ) );
+    if ( t1 == "0" ) return negate( t2 );
     return format( "{} - {}", t1, paren( t2 ) );
 }
 

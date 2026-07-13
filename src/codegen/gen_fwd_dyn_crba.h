@@ -60,7 +60,12 @@ void gen_fwd_dyn_crba( FILE *f, System *sys ) {
     prln_file = f;
 
     int NB = sys->nBod;
-    prln( "void fwd_dyn_crba( double *q, double *qd, double *tau, double *out_qdd ) {" );
+    prln( "// fext: external spatial forces, one per body, expressed in absolute (base)" );
+    prln( "// coordinates: fext[ i*6 + k ] with k = 0..2 the moment about the base origin" );
+    prln( "// and k = 3..5 the linear force (RBDA convention). Slots for bodies that were" );
+    prln( "// generated without external-force support are never read, so fext may be" );
+    prln( "// NULL when no body has it enabled." );
+    prln( "void fwd_dyn_crba( double *q, double *qd, double *tau, double *fext, double *out_qdd ) {" );
     prln_indent_level++;
 
     prln( "// The outward pass of the computation of C.  This is the first for loop of Table 5.1 in RBDA. ");
@@ -106,6 +111,7 @@ void gen_fwd_dyn_crba( FILE *f, System *sys ) {
 
     }
 
-    prln_indent_level--;
-    prln( "}" );
+    // Note: does not close the C function -- gen_crba_H() (see gen_crba.h)
+    // appends the H-matrix computation into this same function body using
+    // the xFromParent[]/S[] just populated above, and closes the brace.
 }

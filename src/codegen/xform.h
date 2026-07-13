@@ -150,6 +150,28 @@ Xform compose( std::string base, Xform &X_C_B, Xform &X_B_A ) {
     return X;
 }
 
+// Inverts a transform: if X maps A to B via (E, r), the inverse maps B to A
+// via (E^T, -E*r). Derivation: w_A = E^T w_B and v_A = E^T v_B + r x (E^T w_B),
+// which is the (E', r') form with E' = E^T, r' = -E*r since E (r x u) = (E r) x (E u)
+// for a rotation E. Call this on an already-emitted transform so the E
+// entries stay materialized names and only r' introduces new expressions.
+Xform invertXform( string name, Xform &X ) {
+    Xform inv;
+    inv.baseName = name;
+
+    for ( int r = 0 ; r < 3 ; r++ )
+    for ( int c = 0 ; c < 3 ; c++ )
+        inv.E[r][c] = X.E[c][r];
+
+    for ( int k = 0 ; k < 3 ; k++ ) {
+        string sum = "0";
+        for ( int i = 0 ; i < 3 ; i++ )
+            sum = addTerms( sum, multFactors( X.E[k][i], X.r[i] ) );
+        inv.r[k] = negate( sum );
+    }
+    return inv;
+}
+
 // Transforms a motion vector from frame A to frame B, where X is the A-to-B transform.
 // vB_angular = E * w
 // vB_linear  = E * ( v - r x w )

@@ -1,145 +1,207 @@
 #pragma once
-#include <assert.h>
+#include <string>
+#include <format>
+#include <array>
 #include "vec3.h"
+#include "xform.h"
+#include "svec.h"
+#include "symmath.h"
+#include "prln.h"
 
+using namespace std;
+
+// Physical description of a single rigid body, expressed about its own
+// body-fixed frame origin. These are ordinary numbers, known at
+// code-generation time -- only the joint variables q, qd are symbolic/runtime.
 typedef struct {
-    double xx;
-    double yy;
-    double zz;
-    double xy;
-    double yz;
-    double zx;
+    double xx, yy, zz, xy, yz, zx; // about the body's own CG, off-diagonal signs absorbed
 } Inertia;
 
-/* 
-Inertia tensor is defined with the off-diagonal minus signs absorbed into the terms.
-
-      [ Ixx Ixy Izx ]
-I_0 = [ Ixy Iyy Iyz ]
-      [ Izx Iyz Izz ]
-*/
 typedef struct {
     double m;
-    double sx; // m * c_x
-    double sy; // m * c_y
-    double sz; // m * c_z
-    double Ixx;
-    double Iyy;
-    double Izz;
-    double Ixy; // minus sign absorbed into term.
-    double Iyz; // minus sign absorbed into term.
-    double Izx; // minus sign absorbed into term.
-} SpatialInertia;
-
-typedef struct {
-    double m;
-    double cg[3];
-    Inertia I;
+    double cg[3]; // CG location relative to the body's own frame origin
+    Inertia I;    // rotational inertia about the CG
 } Body;
 
-SpatialInertia bd_translateInertia( Body B, Vec3 v, double m ) {
-    SpatialInertia I0 = { 0 };
-    double x = v.x;
-    double y = v.y;
-    double z = v.z;
+// A spatial (6x6, symmetric) rigid-body inertia in the compact 10-parameter
+// form (RBDA sec 2.13), with each entry a symbolic expression string. Field
+// layout mirrors src/numeric/inertia.h's SpatialInertia so the two stay easy
+// to compare.
+struct SpatialInertia {
+    string baseName;
+    string m;
+    string sx, sy, sz;                   // first moment of mass, h = m*cg
+    string Ixx, Iyy, Izz, Ixy, Iyz, Izx;  // rotational inertia about the frame origin
 
-    I0.m = m;
-    I0.Ixx = B.I.xx + m*( z*z + y*y );
-    I0.Iyy = B.I.yy + m*( x*x + z*z );
-    I0.Izz = B.I.zz + m*( y*y + x*x );
+    SpatialInertia() : SpatialInertia( ""s ) {}
+    SpatialInertia( string name )
+        :baseName( name )
+        ,m("0"), sx("0"), sy("0"), sz("0")
+        ,Ixx("0"), Iyy("0"), Izz("0"), Ixy("0"), Iyz("0"), Izx("0")
+    {}
 
-    I0.Ixy = B.I.xy - m*x*y;
-    I0.Iyz = B.I.yz - m*y*z;
-    I0.Izx = B.I.zx - m*z*x;
+    // Emits each field as a named temp, then replaces the field with the
+    // temp's name (0/1 literals are left alone so sparsity keeps propagating).
+    void emit() {
+        auto emitField = [&]( const char *suffix, string &field ) {
+            prln( "double %s_%s = %s;", baseName.c_str(), suffix, field.c_str() );
+            if ( field != "0" && field != "1" ) field = format( "{}_{}", baseName, suffix );
+        };
+        emitField( "m",   m );
+        emitField( "sx",  sx );
+        emitField( "sy",  sy );
+        emitField( "sz",  sz );
+        emitField( "Ixx", Ixx );
+        emitField( "Iyy", Iyy );
+        emitField( "Izz", Izz );
+        emitField( "Ixy", Ixy );
+        emitField( "Iyz", Iyz );
+        emitField( "Izx", Izx );
+    }
+};
 
-    I0.sx = m * x;
-    I0.sy = m * y;
-    I0.sz = m * z;
+// Builds the spatial inertia of a body about its own frame origin, given its
+// mass, rotational inertia about its CG, and the CG offset -- i.e. the
+// parallel axis theorem. All inputs are plain numbers (known at generation
+// time), so the arithmetic happens now in C++ and the result is baked in as
+// numeric-literal expression strings; only later composition with joint
+// transforms introduces q.
+SpatialInertia bodySpatialInertia( string name, Body &B ) {
+    SpatialInertia I( name );
+    double x = B.cg[0], y = B.cg[1], z = B.cg[2];
+    double m = B.m;
 
-    return I0;
+    I.m   = format( "{}", m );
+    I.sx  = format( "{}", m*x );
+    I.sy  = format( "{}", m*y );
+    I.sz  = format( "{}", m*z );
+    I.Ixx = format( "{}", B.I.xx + m*( z*z + y*y ) );
+    I.Iyy = format( "{}", B.I.yy + m*( x*x + z*z ) );
+    I.Izz = format( "{}", B.I.zz + m*( y*y + x*x ) );
+    I.Ixy = format( "{}", B.I.xy - m*x*y );
+    I.Iyz = format( "{}", B.I.yz - m*y*z );
+    I.Izx = format( "{}", B.I.zx - m*z*x );
+
+    return I;
 }
 
-// Computes vOut = I * vIn
-// void bd_m2f( SpatialInertia *I, Svec *vIn, Svec *vOut ) {
-//     double *f = vOut->v;
-//     double *v = vIn->v;
-//     double wx = v[0];   // Omega_x
-//     double wy = v[1];   // Omega_y
-//     double wz = v[2];   // Omega_z
-//     double vx = v[0];   // v0_x
-//     double vy = v[1];   // v0_y
-//     double vz = v[2];   // v0_z
-//     double m = I->m;
-//     double mx = I->sx;
-//     double my = I->sy;
-//     double mz = I->sz;
-//     double Ixx = I->Ixx;
-//     double Iyy = I->Iyy;
-//     double Izz = I->Izz;
-//     double Ixy = I->Ixy;
-//     double Iyz = I->Iyz;
-//     double Izx = I->Izx;
-// 
-//     f[ 0 ] =  Ixx*wx + Ixy*wy + Izx*wz   +    0  - mz*vy + my*vz  ;
-//     f[ 1 ] =  Ixy*wx + Iyy*wy + Iyz*wz   + mz*vx +    0  - mx*vz  ;
-//     f[ 2 ] =  Izx*wx + Iyz*wy + Izz*wz   - my*vx + mx*vy +    0   ;
-// 
-//     f[ 3 ] =    0*wx +  mz*wy -  my*wz   +  m*vx +    0  +    0   ;
-//     f[ 4 ] =  -mz*wx +   0*wy +  mx*wz   +    0  +  m*vy +    0   ;
-//     f[ 5 ] =   my*wx -  mx*wy +   0*wz   +    0  +    0  +  m*vz  ;
-// }
-// 
-// void si_addTo( SpatialInertia *a, SpatialInertia *b ) {
-//     a->Ixx += b->Ixx;
-//     a->Iyy += b->Iyy;
-//     a->Izz += b->Izz;
-//     a->Ixy += b->Ixy;
-//     a->Iyz += b->Iyz;
-//     a->Izx += b->Izx;
-//     a->m   += b->m;
-//     a->sx  += b->sx;
-//     a->sy  += b->sy;
-//     a->sz  += b->sz;
-// }
-// 
-// // Computes vOut = I * vIn
-// void si_multBySvec( SpatialInertia *I, Svec *vIn, Svec *vOut ) {
-//     double *vi = vIn->v;
-//     double *vo = vOut->v;
-// 
-//     // Revolute Joint
-//     if ( vi[ 2 ] == 1 ) {
-//         assert( vi[ 0 ] == 0 );
-//         assert( vi[ 1 ] == 0 );
-//         assert( vi[ 3 ] == 0 );
-//         assert( vi[ 4 ] == 0 );
-//         assert( vi[ 5 ] == 0 );
-// 
-//         vo[ 0 ] = I->Izx;
-//         vo[ 1 ] = I->Iyz;
-//         vo[ 2 ] = I->Izz;
-//         vo[ 3 ] = I->sy;
-//         vo[ 4 ] = -I->sx;
-//         vo[ 5 ] = 0;
-//         return;
-//     }
-//     assert( false );
-// }
-// 
-// // Computes fOut = fIn^T * S
-// double si_multForceByJointSubspace( Svec *fIn, Svec *S ) {
-//     double *f = fIn->v;
-//     double *s = S->v;
-// 
-//     // Revolute Joint
-//     if ( s[ 2 ] == 1 ) {
-//         assert( s[ 0 ] == 0 );
-//         assert( s[ 1 ] == 0 );
-//         assert( s[ 3 ] == 0 );
-//         assert( s[ 4 ] == 0 );
-//         assert( s[ 5 ] == 0 );
-// 
-//         return f[ 2 ];
-//     }
-//     assert( false );
-// }
+SpatialInertia addInertia( string name, SpatialInertia &a, SpatialInertia &b ) {
+    SpatialInertia s( name );
+    s.m   = addTerms( a.m,   b.m );
+    s.sx  = addTerms( a.sx,  b.sx );
+    s.sy  = addTerms( a.sy,  b.sy );
+    s.sz  = addTerms( a.sz,  b.sz );
+    s.Ixx = addTerms( a.Ixx, b.Ixx );
+    s.Iyy = addTerms( a.Iyy, b.Iyy );
+    s.Izz = addTerms( a.Izz, b.Izz );
+    s.Ixy = addTerms( a.Ixy, b.Ixy );
+    s.Iyz = addTerms( a.Iyz, b.Iyz );
+    s.Izx = addTerms( a.Izx, b.Izx );
+    return s;
+}
+
+// Expands the compact 10-parameter form into the full symmetric 6x6 block
+// matrix
+//     [  Ibar    h x ]
+//     [ -h x     m I ]
+// (RBDA eq 2.63), so it can be pushed through generic matrix algebra.
+array<array<string,6>,6> spatialInertiaTo6x6( SpatialInertia &I ) {
+    array<array<string,6>,6> M;
+    string nsx = subTerms( "0", I.sx );
+    string nsy = subTerms( "0", I.sy );
+    string nsz = subTerms( "0", I.sz );
+
+    M[0] = { I.Ixx, I.Ixy, I.Izx, "0",  nsz,  I.sy };
+    M[1] = { I.Ixy, I.Iyy, I.Iyz, I.sz, "0",  nsx  };
+    M[2] = { I.Izx, I.Iyz, I.Izz, nsy,  I.sx, "0"  };
+    M[3] = { "0",   nsz,   I.sy,  I.m,  "0",  "0"  };
+    M[4] = { I.sz,  "0",   nsx,   "0",  I.m,  "0"  };
+    M[5] = { nsy,   I.sx,  "0",   "0",  "0",  I.m  };
+    return M;
+}
+
+// Packs a (mathematically symmetric) full 6x6 block matrix back into the
+// compact 10-parameter form, reading only the upper triangle.
+SpatialInertia spatialInertiaFrom6x6( string name, array<array<string,6>,6> &M ) {
+    SpatialInertia I( name );
+    I.Ixx = M[0][0]; I.Iyy = M[1][1]; I.Izz = M[2][2];
+    I.Ixy = M[0][1]; I.Iyz = M[1][2]; I.Izx = M[0][2];
+    I.sx  = M[2][4]; I.sy  = M[0][5]; I.sz  = M[1][3];
+    I.m   = M[3][3];
+    return I;
+}
+
+// F = I * v (RBDA's "m2f" operation), computed generically from the full 6x6
+// form. For our single-DOF joints v = S is hyper-sparse ([0,0,1,0,0,0] for a
+// z-axis revolute), so multFactors/addTerms collapse this down to picking out
+// one column of M -- the same result src/numeric's hand-specialized
+// si_multBySvec hardcodes, but arrived at automatically instead of by hand.
+Svec spatialInertiaMulVec( string name, SpatialInertia &I, Svec &v ) {
+    auto M = spatialInertiaTo6x6( I );
+    Svec out( name );
+    for ( int r = 0 ; r < 6 ; r++ ) {
+        string sum = "0";
+        for ( int c = 0 ; c < 6 ; c++ ) sum = addTerms( sum, multFactors( M[r][c], v.v[c] ) );
+        out.v[r] = sum;
+    }
+    return out;
+}
+
+// Expands a motion transform X into its full 6x6 matrix form by pushing each
+// of the 6 standard basis vectors through the already-validated
+// fwdXformMotion -- this guarantees the matrix form agrees with the vector
+// form used everywhere else, instead of re-deriving the block structure
+// [[E,0],[-E*rx,E]] by hand.
+array<array<string,6>,6> xformTo6x6( Xform &X ) {
+    array<array<string,6>,6> M;
+    for ( int col = 0 ; col < 6 ; col++ ) {
+        Svec e( ""s );
+        e.v[ col ] = "1";
+        Svec c = fwdXformMotion( "tmp"s, X, e );
+        for ( int row = 0 ; row < 6 ; row++ ) M[row][col] = c.v[row];
+    }
+    return M;
+}
+
+array<array<string,6>,6> smat6Transpose( array<array<string,6>,6> &A ) {
+    array<array<string,6>,6> T;
+    for ( int r = 0 ; r < 6 ; r++ )
+    for ( int c = 0 ; c < 6 ; c++ )
+        T[r][c] = A[c][r];
+    return T;
+}
+
+array<array<string,6>,6> smat6Mul( array<array<string,6>,6> &A, array<array<string,6>,6> &B ) {
+    array<array<string,6>,6> C;
+    for ( int r = 0 ; r < 6 ; r++ )
+    for ( int c = 0 ; c < 6 ; c++ ) {
+        string sum = "0";
+        for ( int k = 0 ; k < 6 ; k++ ) sum = addTerms( sum, multFactors( A[r][k], B[k][c] ) );
+        C[r][c] = sum;
+    }
+    return C;
+}
+
+Svec smat6MulVec( array<array<string,6>,6> &A, Svec &v ) {
+    Svec out( ""s );
+    for ( int r = 0 ; r < 6 ; r++ ) {
+        string sum = "0";
+        for ( int c = 0 ; c < 6 ; c++ ) sum = addTerms( sum, multFactors( A[r][c], v.v[c] ) );
+        out.v[r] = sum;
+    }
+    return out;
+}
+
+// Congruence transform of a composite spatial inertia across a joint, i.e.
+// the CRBA recursion  Ic_parent += X^T * Ic_child * X  (RBDA Table 6.2/6.4).
+// This is exactly what spatial_v2's HandC.m does with plain 6x6 matrices --
+// IC{p} = IC{p} + Xup{i}'*IC{i}*Xup{i} -- just done symbolically here. X is
+// child_X_parent (our usual xFromParent[i] convention, matching Xup there).
+SpatialInertia transformInertia( string name, Xform &X, SpatialInertia &Ic ) {
+    auto X6  = xformTo6x6( X );
+    auto Xt6 = smat6Transpose( X6 );
+    auto M6  = spatialInertiaTo6x6( Ic );
+    auto N   = smat6Mul( M6, X6 );   // Ic * X
+    auto R   = smat6Mul( Xt6, N );   // X^T * Ic * X
+    return spatialInertiaFrom6x6( name, R );
+}
