@@ -20,6 +20,17 @@ directly, rather than shelling out to a C compiler.
   (so expressions never re-expand across pipeline stages). Running the
   generator produces `build/dynamics.c` — the specialized, sparsity-exploiting
   C implementation for the mechanism it was given.
+- `src/validate` — a dense-matrix validation reference. Implements the same
+  forward dynamics (RNEA bias force + CRBA mass matrix + solve) with full
+  6x6 spatial matrices built straight from the RBDA equations — explicit
+  Plucker transforms composed by plain matrix multiplication, `mcI` spatial
+  inertias, `crm`/`crf` cross-product operator matrices, and a generic
+  Gaussian solver for force coordinate changes. It shares no code with the
+  generator, then runs both implementations on 1000 random states (q, qd,
+  tau, external forces) and compares qdd to 1e-9. `build.bat` runs it on
+  every build and fails the build on disagreement. On its first run it
+  caught a real sign error in the generator's spatial-inertia lower-left
+  block that the earlier hand-picked tests couldn't see.
 - `src/numeric` — an earlier, currently non-building attempt at a runtime
   (non-generated) numeric implementation of the same algorithms. Kept for
   reference; `system.h` was removed mid-refactor and never replaced, so this
@@ -40,5 +51,7 @@ build.bat
 ```
 
 This builds `build/codegen.exe` from `src/codegen`, runs it to emit
-`build/dynamics.c`, and attempts to build `build/numeric.exe` from
-`src/numeric` (currently expected to fail — see above).
+`build/dynamics.c`, builds and runs `build/validate.exe` (dense reference vs
+generated code — the build fails if they disagree), and attempts to build
+`build/numeric.exe` from `src/numeric` (currently expected to fail — see
+above).

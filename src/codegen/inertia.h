@@ -102,9 +102,15 @@ SpatialInertia addInertia( string name, SpatialInertia &a, SpatialInertia &b ) {
 
 // Expands the compact 10-parameter form into the full symmetric 6x6 block
 // matrix
-//     [  Ibar    h x ]
-//     [ -h x     m I ]
-// (RBDA eq 2.63), so it can be pushed through generic matrix algebra.
+//     [  Ibar    h x  ]
+//     [ (h x)^T  m I  ]
+// (RBDA eq 2.63; h x is the skew matrix of h = (sx,sy,sz), and the lower-left
+// block is its transpose, i.e. -(h x)), so it can be pushed through generic
+// matrix algebra. Sanity anchor: for pure rotation w = z about the origin the
+// linear momentum must be m*(w x c) = (-sy, sx, 0) -- that's the lower-left
+// block's third column. The lower-left originally had the sign flipped
+// (copied from src/numeric's si_multBySvec, which shares the same bug); the
+// dense validator in src/validate caught it.
 array<array<string,6>,6> spatialInertiaTo6x6( SpatialInertia &I ) {
     array<array<string,6>,6> M;
     string nsx = subTerms( "0", I.sx );
@@ -114,9 +120,9 @@ array<array<string,6>,6> spatialInertiaTo6x6( SpatialInertia &I ) {
     M[0] = { I.Ixx, I.Ixy, I.Izx, "0",  nsz,  I.sy };
     M[1] = { I.Ixy, I.Iyy, I.Iyz, I.sz, "0",  nsx  };
     M[2] = { I.Izx, I.Iyz, I.Izz, nsy,  I.sx, "0"  };
-    M[3] = { "0",   nsz,   I.sy,  I.m,  "0",  "0"  };
-    M[4] = { I.sz,  "0",   nsx,   "0",  I.m,  "0"  };
-    M[5] = { nsy,   I.sx,  "0",   "0",  "0",  I.m  };
+    M[3] = { "0",   I.sz,  nsy,   I.m,  "0",  "0"  };
+    M[4] = { nsz,   "0",   I.sx,  "0",  I.m,  "0"  };
+    M[5] = { I.sy,  nsx,   "0",   "0",  "0",  I.m  };
     return M;
 }
 
@@ -134,8 +140,8 @@ SpatialInertia spatialInertiaFrom6x6( string name, array<array<string,6>,6> &M )
 // F = I * v (RBDA's "m2f" operation), computed generically from the full 6x6
 // form. For our single-DOF joints v = S is hyper-sparse ([0,0,1,0,0,0] for a
 // z-axis revolute), so multFactors/addTerms collapse this down to picking out
-// one column of M -- the same result src/numeric's hand-specialized
-// si_multBySvec hardcodes, but arrived at automatically instead of by hand.
+// one column of M. (Matches src/numeric's bd_m2f; note src/numeric's
+// si_multBySvec had the linear-part signs flipped -- see spatialInertiaTo6x6.)
 Svec spatialInertiaMulVec( string name, SpatialInertia &I, Svec &v ) {
     auto M = spatialInertiaTo6x6( I );
     Svec out( name );

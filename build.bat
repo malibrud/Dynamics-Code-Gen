@@ -44,6 +44,22 @@ if errorlevel 1 (
 )
 popd
 
+echo === Building and running dense validation ^(src\validate^) ===
+pushd "%BUILD%"
+cl /nologo /Zi /std:c17 /Fevalidate.exe /Fo"%BUILD%\\" "%SRC%\validate\main.c" "%BUILD%\dynamics.c"
+if errorlevel 1 (
+    echo Validation build failed.
+    popd
+    exit /b 1
+)
+"%BUILD%\validate.exe"
+if errorlevel 1 (
+    echo VALIDATION FAILED: generated dynamics.c disagrees with the dense reference.
+    popd
+    exit /b 1
+)
+popd
+
 echo === Building legacy numeric implementation ^(src\numeric^) ===
 pushd "%BUILD%"
 cl /nologo /Zi /std:c17 /Fenumeric.exe /Fo"%BUILD%\\" "%SRC%\numeric\main.c"

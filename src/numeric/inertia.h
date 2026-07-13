@@ -115,11 +115,15 @@ void si_multBySvec( SpatialInertia *I, Svec *vIn, Svec *vOut ) {
         assert( vi[ 4 ] == 0 );
         assert( vi[ 5 ] == 0 );
 
+        // Linear part is m*(w x c) with w = z: (-sy, sx, 0). These signs
+        // were originally flipped (+sy, -sx) -- caught by src/validate after
+        // the same bug was copied into the code generator (cf. bd_m2f above,
+        // which always had them right).
         vo[ 0 ] = I->Izx;
         vo[ 1 ] = I->Iyz;
         vo[ 2 ] = I->Izz;
-        vo[ 3 ] = I->sy;
-        vo[ 4 ] = -I->sx;
+        vo[ 3 ] = -I->sy;
+        vo[ 4 ] = I->sx;
         vo[ 5 ] = 0;
         return;
     }
