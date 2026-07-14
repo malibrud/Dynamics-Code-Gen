@@ -1,5 +1,7 @@
 #include <inttypes.h>
 #include <format>
+#include <stdio.h>
+#include "../model/model.h"
 #include "system.h"
 #include "vec3.h"
 #include "inertia.h"
@@ -9,74 +11,60 @@
 #include "gen_crba.h"
 #include "gen_solve_qdd.h"
 
-#define NBOD 3
+int main( int argc, char **argv ) {
+    if ( argc < 2 ) {
+        fprintf( stderr, "usage: codegen <mechanism-file> [output.c]\n" );
+        return 1;
+    }
 
-Vec3 cgs[] = {
-    { 0.5, 0.0, 0.0 },
-    { 1.0, 0.5, 0.0 },
-    { 1.5, 1.0, 0.0 },
-};
+    Model mdl;
+    char err[ 256 ];
+    if ( modelLoad( argv[ 1 ], &mdl, err, sizeof err ) ) {
+        fprintf( stderr, "codegen: %s\n", err );
+        return 1;
+    }
 
-Vec3 jointAxes[] = {
-    { 0.0, 0.0, 1.0 },
-    { 0.0, 0.0, 1.0 },
-    { 0.0, 0.0, 1.0 },
-};
+    System sys( mdl.nbod );
+    for ( int i = 0 ; i < mdl.nbod ; i++ ) {
+        ModelBody *b = &mdl.body[ i ];
 
-Vec3 jointLocs[] = {
-    { 0.0, 0.0, 0.0 },
-    { 1.0, 0.0, 0.0 },
-    { 1.0, 1.0, 0.0 },
-};
+        // The symbolic pipeline currently only knows how to emit S, xJoint,
+        // and vJ for a z-axis revolute joint. The file format already
+        // expresses more (prismatic, other axes, cylindrical, spherical);
+        // widen this check as the generator learns each one.
+        if ( b->jtype != JOINT_REVOLUTE || b->axis != 'z' ) {
+            fprintf( stderr, "codegen: body %d: only 'joint revolute z' is implemented so far\n", i );
+            return 1;
+        }
 
-double masses[] = {
-    1.0,
-    1.0,
-    1.0
-};
-
-Inertia inertias[] = {
-    { 1.0, 1.0, 1.0, 0.0, 0.0, 0.0 },
-    { 1.0, 1.0, 1.0, 0.0, 0.0, 0.0 },
-    { 1.0, 1.0, 1.0, 0.0, 0.0, 0.0 },
-};
-
-// Frame frames[ NBOD ] = { 0 };
-
-int main() {
-    System sys( NBOD );
-    for ( int i = 0 ; i < NBOD ; i++ ) {
-        sys.parent[ i ]   = i - 1;
+        sys.parent[ i ]   = (int16_t)b->parent;
         sys.children[ i ] = i + 1;
 
         string q = "q"s + to_string( i );
+        sys.xTree[ i ]  = Xform( format( "Xtree_{}", i ), b->tree[0], b->tree[1], b->tree[2] );
+        sys.xJoint[ i ] = Xform( XFORM_RZ, format( "Xjoint_{}", i ), q );
 
-        auto tName = std::format( "Xtree_{}", i );
-        auto jName = std::format( "Xjoint_{}", i );
-        sys.xTree[ i ]       = Xform( XFORM_TX, tName, "1"s );
-        sys.xJoint[ i ]      = Xform( XFORM_RZ, jName, q );
-
-        sys.bodies[ i ].m = masses[ i ];
-        sys.bodies[ i ].cg[ 0 ] = cgs[ i ].x;
-        sys.bodies[ i ].cg[ 1 ] = cgs[ i ].y;
-        sys.bodies[ i ].cg[ 2 ] = cgs[ i ].z;
-        sys.bodies[ i ].I = inertias[ i ];
-        sys.hasFext[ i ] = 1; // accept an external force on every body; set 0 to omit the code for a body
-        // Vec3 newx = v3_cross( &pframe.z, ja );
-
-        // rlink = v3_sub( jp, &plink );
-        // plink = *jp;
-        // if ( v3_isZero( &rlink ) ) {
-        //     sys.xTree[ i ]->type = XFORM_IDENT;
-        // }
-
+        sys.bodies[ i ].m = b->mass;
+        for ( int k = 0 ; k < 3 ; k++ ) sys.bodies[ i ].cg[ k ] = b->cg[ k ];
+        sys.bodies[ i ].I.xx = b->inertia[ 0 ];
+        sys.bodies[ i ].I.yy = b->inertia[ 1 ];
+        sys.bodies[ i ].I.zz = b->inertia[ 2 ];
+        sys.bodies[ i ].I.xy = b->inertia[ 3 ];
+        sys.bodies[ i ].I.yz = b->inertia[ 4 ];
+        sys.bodies[ i ].I.zx = b->inertia[ 5 ];
+        sys.hasFext[ i ] = (uint8_t)b->hasFext;
     }
 
-    // Physical gravity is (0,0,-9.81); sys.grav must hold the negated value
-    // used to seed the RNEA acceleration recursion (see System::grav).
-    sys.grav.v[ 5 ] = "9.81";
+    // sys.grav seeds the RNEA acceleration recursion with -a_grav, so negate
+    // the physical gravity from the file. numStr keeps zero components "0".
+    for ( int k = 0 ; k < 3 ; k++ ) sys.grav.v[ 3 + k ] = numStr( -mdl.gravity[ k ] );
 
-    FILE *f = fopen( "dynamics.c", "w" );
+    const char *outPath = argc > 2 ? argv[ 2 ] : "dynamics.c";
+    FILE *f = fopen( outPath, "w" );
+    if ( !f ) {
+        fprintf( stderr, "codegen: cannot write '%s'\n", outPath );
+        return 1;
+    }
     gen_prelude( f );
     gen_fwd_dyn_crba( f, &sys );
     gen_body_inertias( f, &sys );

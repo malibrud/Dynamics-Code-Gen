@@ -60,6 +60,10 @@ void gen_fwd_dyn_crba( FILE *f, System *sys ) {
     prln_file = f;
 
     int NB = sys->nBod;
+    prln( "// Number of bodies baked into this generated function, so harnesses can" );
+    prln( "// detect a dynamics.c that is stale relative to the mechanism file." );
+    prln( "const int fwd_dyn_crba_nbod = %d;", NB );
+    prln( "" );
     prln( "// fext: external spatial forces, one per body, expressed in absolute (base)" );
     prln( "// coordinates: fext[ i*6 + k ] with k = 0..2 the moment about the base origin" );
     prln( "// and k = 3..5 the linear force (RBDA convention). Slots for bodies that were" );

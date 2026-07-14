@@ -11,8 +11,19 @@ directly, rather than shelling out to a C compiler.
 
 ## Layout
 
-- `src/codegen` — the active approach. A small C++ program that walks the
-  mechanism definition and, instead of computing with numbers, computes with
+- `models/` — mechanism definition files (`.mech`), the single source of
+  truth for what gets generated and validated. A simple line-based text
+  format (documented in `src/model/model.h`) describing gravity and, per
+  body: parent, joint type and axis, tree translation, mass, CG, inertia,
+  and whether to support an external force. The grammar covers revolute,
+  prismatic, cylindrical, and spherical joints; the pipeline currently
+  implements revolute-z and rejects the rest with a clear error, widening
+  as the generator learns each type.
+- `src/model` — the shared model-file parser (plain C, header-only), used
+  by the generator, the validator, and the benchmark, so all three always
+  agree on the mechanism.
+- `src/codegen` — the active approach. A small C++ program that loads a
+  mechanism file and, instead of computing with numbers, computes with
   strings: each spatial-vector/transform component is a symbolic expression.
   `compose()`, `multFactors()`, `addTerms()` etc. simplify away structural
   zeros and ones as they go, then `emit()` prints each simplified expression
@@ -55,9 +66,17 @@ Requires MSVC (Visual Studio with the C++ workload) on Windows.
 build.bat
 ```
 
-This builds `build/codegen.exe` from `src/codegen`, runs it to emit
-`build/dynamics.c`, builds and runs `build/validate.exe` (dense reference vs
-generated code — the build fails if they disagree), builds and runs
-`build/bench.exe` (`/O2` timing of both implementations), and attempts to
-build `build/numeric.exe` from `src/numeric` (currently expected to fail —
-see above).
+This builds `build/codegen.exe` from `src/codegen`, runs it on
+`models/threelink.mech` to emit `build/dynamics.c`, builds and runs
+`build/validate.exe` (dense reference vs generated code — the build fails if
+they disagree), repeats generation + validation for `models/fourlink.mech`,
+builds and runs `build/bench.exe` (`/O2` timing of both implementations),
+and attempts to build `build/numeric.exe` from `src/numeric` (currently
+expected to fail — see above).
+
+To generate dynamics for a different mechanism:
+
+```
+build\codegen.exe models\mymodel.mech mydynamics.c
+build\validate.exe models\mymodel.mech      (after compiling it against mydynamics.c)
+```

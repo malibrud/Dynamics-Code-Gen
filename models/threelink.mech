@@ -1,0 +1,34 @@
+# Three-link planar chain: every joint revolute about z, each joint 1 along
+# x from its parent. This is the mechanism the generator, validator, and
+# benchmark have used since the beginning of the project.
+#
+# Format documentation: src/model/model.h.
+
+gravity 0 0 -9.81
+
+body                       # body 0
+parent -1
+joint revolute z
+tree 1 0 0
+mass 1
+cg 0.5 0 0
+inertia 1 1 1 0 0 0        # xx yy zz xy yz zx about the CG
+fext 1
+
+body                       # body 1
+parent 0
+joint revolute z
+tree 1 0 0
+mass 1
+cg 1.0 0.5 0
+inertia 1 1 1 0 0 0
+fext 1
+
+body                       # body 2
+parent 1
+joint revolute z
+tree 1 0 0
+mass 1
+cg 1.5 1.0 0
+inertia 1 1 1 0 0 0
+fext 1

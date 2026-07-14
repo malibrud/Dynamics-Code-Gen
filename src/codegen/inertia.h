@@ -71,16 +71,16 @@ SpatialInertia bodySpatialInertia( string name, Body &B ) {
     double x = B.cg[0], y = B.cg[1], z = B.cg[2];
     double m = B.m;
 
-    I.m   = format( "{}", m );
-    I.sx  = format( "{}", m*x );
-    I.sy  = format( "{}", m*y );
-    I.sz  = format( "{}", m*z );
-    I.Ixx = format( "{}", B.I.xx + m*( z*z + y*y ) );
-    I.Iyy = format( "{}", B.I.yy + m*( x*x + z*z ) );
-    I.Izz = format( "{}", B.I.zz + m*( y*y + x*x ) );
-    I.Ixy = format( "{}", B.I.xy - m*x*y );
-    I.Iyz = format( "{}", B.I.yz - m*y*z );
-    I.Izx = format( "{}", B.I.zx - m*z*x );
+    I.m   = numStr( m );
+    I.sx  = numStr( m*x );
+    I.sy  = numStr( m*y );
+    I.sz  = numStr( m*z );
+    I.Ixx = numStr( B.I.xx + m*( z*z + y*y ) );
+    I.Iyy = numStr( B.I.yy + m*( x*x + z*z ) );
+    I.Izz = numStr( B.I.zz + m*( y*y + x*x ) );
+    I.Ixy = numStr( B.I.xy - m*x*y );
+    I.Iyz = numStr( B.I.yz - m*y*z );
+    I.Izx = numStr( B.I.zx - m*z*x );
 
     return I;
 }

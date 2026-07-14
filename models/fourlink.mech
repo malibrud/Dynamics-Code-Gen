@@ -1,0 +1,42 @@
+# 4-link chain with varied link lengths and masses, joints offset in y, and
+# one body (1) without external-force support. Exercises the parts of the
+# format the classic three-link model doesn't; validated by build.bat as a
+# second model. Its first validation run caught the dense reference not
+# honoring 'fext 0'.
+gravity 0 0 -9.81
+
+body
+parent -1
+joint revolute z
+tree 0.5 0 0
+mass 2
+cg 0.4 0.1 0
+inertia 0.8 0.9 1.1 0.05 0 0
+fext 1
+
+body
+parent 0
+joint revolute z
+tree 1.5 0.2 0
+mass 1.5
+cg 0.7 0 0
+inertia 1 1 1.2 0 0 0
+fext 0
+
+body
+parent 1
+joint revolute z
+tree 0.8 0 0
+mass 0.5
+cg 0.3 -0.1 0
+inertia 0.2 0.25 0.3 0 0 0
+fext 1
+
+body
+parent 2
+joint revolute z
+tree 1.1 -0.3 0
+mass 0.75
+cg 0.5 0 0
+inertia 0.4 0.4 0.5 0 0 0
+fext 1

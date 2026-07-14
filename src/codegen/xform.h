@@ -99,6 +99,21 @@ struct Xform {
         }
     }
 
+    // General fixed translation (no rotation): E = 1, r = (x, y, z), with
+    // numeric components baked in at generation time. numStr keeps exact
+    // zeros as "0" so the data's own sparsity folds through the symbolic
+    // math just like structural sparsity does.
+    Xform( std::string name, double x, double y, double z )
+        :type( XFORM_3DOF_TRANS )
+        ,baseName( name )
+    {
+        E[0][0] = "1"; E[0][1] = "0"; E[0][2] = "0";
+        E[1][0] = "0"; E[1][1] = "1"; E[1][2] = "0";
+        E[2][0] = "0"; E[2][1] = "0"; E[2][2] = "1";
+
+        r[0] = numStr( x );  r[1] = numStr( y );  r[2] = numStr( z );
+    }
+
     // Emits each entry as a named temp, then replaces the entry with the temp's
     // name so later compositions reference the emitted variable instead of
     // re-expanding the expression.  Literals 0 and 1 are kept as-is so that

@@ -4,6 +4,15 @@
 
 using namespace std;
 
+// Formats a generation-time numeric constant as a minimal C literal. Exact
+// zeros (including -0.0) become "0" so they keep folding through
+// addTerms/multFactors; whole numbers drop the trailing ".0" (std::format
+// "{}" prints the shortest round-trip form, e.g. 1.0 -> "1").
+string numStr( double v ) {
+    if ( v == 0.0 ) return "0";
+    return format( "{}", v );
+}
+
 // Wrap a compound expression (one containing top-level + or -) in parentheses.
 // Products and single terms never contain spaces; sums and differences always do.
 string paren( const string &t ) {

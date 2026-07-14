@@ -15,35 +15,15 @@
 // Nothing here shares code with the generator, so agreement between the two
 // is a real check: the generator's symbolic simplification (structural zeros,
 // materialized temps, hand-derived block forms) against brute-force algebra.
+//
+// The mechanism comes from a model file (src/model/model.h). This reference
+// handles any single-DOF joint the format can express -- revolute or
+// prismatic about x, y, or z, arbitrary parent trees -- though only what the
+// generator also supports is cross-validated today.
 
 #pragma once
 #include <math.h>
-
-#define NBOD 3
-
-// ---------------------------------------------------------------------------
-// Model description. MUST MATCH src/codegen/main.cpp: a planar chain of NBOD
-// links, every joint revolute about z, every tree transform a translation of
-// 1 along x, parent(i) = i-1.
-// ---------------------------------------------------------------------------
-static const double masses[ NBOD ] = { 1.0, 1.0, 1.0 };
-static const double cgs[ NBOD ][ 3 ] = {
-    { 0.5, 0.0, 0.0 },
-    { 1.0, 0.5, 0.0 },
-    { 1.5, 1.0, 0.0 },
-};
-// Rotational inertia about the CG: xx, yy, zz, xy, yz, zx (actual matrix
-// entries, off-diagonal minus signs already absorbed -- same convention as
-// the generator's Inertia struct).
-static const double icm[ NBOD ][ 6 ] = {
-    { 1.0, 1.0, 1.0, 0.0, 0.0, 0.0 },
-    { 1.0, 1.0, 1.0, 0.0, 0.0, 0.0 },
-    { 1.0, 1.0, 1.0, 0.0, 0.0, 0.0 },
-};
-static const double linkLen = 1.0;
-// -a_grav, the seed of the RNEA acceleration recursion (the generator's
-// sys.grav): physical gravity is (0,0,-9.81), so this is +9.81 in linear z.
-static const double gravNeg[ 6 ] = { 0, 0, 0, 0, 0, 9.81 };
+#include "../model/model.h"
 
 // ---------------------------------------------------------------------------
 // Generic dense linear algebra.
@@ -84,6 +64,12 @@ static void m6_tmulvec( const double A[6][6], const double x[6], double y[6] ) {
         for ( int c = 0 ; c < 6 ; c++ ) s += A[c][r] * x[c];
         y[r] = s;
     }
+}
+
+static double dot6( const double a[6], const double b[6] ) {
+    double s = 0;
+    for ( int k = 0 ; k < 6 ; k++ ) s += a[k] * b[k];
+    return s;
 }
 
 // Solves A x = b (n x n, row-major) by Gaussian elimination with partial
@@ -144,13 +130,51 @@ static void plux( const double E[3][3], const double r[3], double X[6][6] ) {
     }
 }
 
-// Rotation about z by q, in the generator's XFORM_RZ convention:
-// E = [ c -s 0; s c 0; 0 0 1 ].
-static void rotz( double q, double E[3][3] ) {
+// Unit vector for a canonical joint axis.
+static void axisVec( char axis, double a[3] ) {
+    a[0] = a[1] = a[2] = 0;
+    if      ( axis == 'x' ) a[0] = 1;
+    else if ( axis == 'y' ) a[1] = 1;
+    else                    a[2] = 1;
+}
+
+// Rotation by q about a canonical axis, in the generator's convention
+// (XFORM_RZ: E = [ c -s 0; s c 0; 0 0 1 ], and the cyclic analogues).
+static void rotAxis( char axis, double q, double E[3][3] ) {
     double c = cos( q ), s = sin( q );
-    E[0][0] = c; E[0][1] = -s; E[0][2] = 0;
-    E[1][0] = s; E[1][1] =  c; E[1][2] = 0;
-    E[2][0] = 0; E[2][1] =  0; E[2][2] = 1;
+    if ( axis == 'x' ) {
+        E[0][0] = 1; E[0][1] = 0; E[0][2] =  0;
+        E[1][0] = 0; E[1][1] = c; E[1][2] = -s;
+        E[2][0] = 0; E[2][1] = s; E[2][2] =  c;
+    } else if ( axis == 'y' ) {
+        E[0][0] =  c; E[0][1] = 0; E[0][2] = s;
+        E[1][0] =  0; E[1][1] = 1; E[1][2] = 0;
+        E[2][0] = -s; E[2][1] = 0; E[2][2] = c;
+    } else {
+        E[0][0] = c; E[0][1] = -s; E[0][2] = 0;
+        E[1][0] = s; E[1][1] =  c; E[1][2] = 0;
+        E[2][0] = 0; E[2][1] =  0; E[2][2] = 1;
+    }
+}
+
+// Joint transform XJ and motion subspace S for a single-DOF joint at
+// position q. Revolute: rotation about the axis, S = (axis; 0). Prismatic:
+// translation along the axis, S = (0; axis).
+static void jointXS( const ModelBody *b, double q, double XJ[6][6], double S[6] ) {
+    double a3[3], Eident[3][3] = { {1,0,0},{0,1,0},{0,0,1} }, r0[3] = { 0, 0, 0 };
+    axisVec( b->axis, a3 );
+    for ( int k = 0 ; k < 6 ; k++ ) S[k] = 0;
+
+    if ( b->jtype == JOINT_REVOLUTE ) {
+        double E[3][3];
+        rotAxis( b->axis, q, E );
+        plux( E, r0, XJ );
+        for ( int k = 0 ; k < 3 ; k++ ) S[k] = a3[k];
+    } else { // JOINT_PRISMATIC (spherical/cylindrical rejected upstream)
+        double rq[3] = { a3[0]*q, a3[1]*q, a3[2]*q };
+        plux( Eident, rq, XJ );
+        for ( int k = 0 ; k < 3 ; k++ ) S[k+3] = a3[k];
+    }
 }
 
 // Spatial inertia from mass, CG offset, and rotational inertia about the CG
@@ -208,47 +232,54 @@ static void crf( const double v[6], double M[6][6] ) {
 
 // ---------------------------------------------------------------------------
 // Dense forward dynamics: H*qdd = tau - C, with C from the RNEA (RBDA Table
-// 5.1, aJ = 0) and H from the CRBA (RBDA Table 6.4). parent(i) = i-1.
+// 5.1, aJ = 0) and H from the CRBA (RBDA Table 6.4).
 // ---------------------------------------------------------------------------
-static void fd_dense( const double *q, const double *qd, const double *tau,
-                      const double *fext, double *qdd_out ) {
-    double Xup[ NBOD ][6][6]; // i_X_lambda(i)
-    double Xa[ NBOD ][6][6];  // i_X_0
-    double I6[ NBOD ][6][6];
-    double v[ NBOD ][6], avp[ NBOD ][6], fvp[ NBOD ][6];
+static void fd_dense( const Model *mdl, const double *q, const double *qd,
+                      const double *tau, const double *fext, double *qdd_out ) {
+    int nb = mdl->nbod;
+    double Xup[ MODEL_MAX_BODIES ][6][6]; // i_X_lambda(i)
+    double Xa[ MODEL_MAX_BODIES ][6][6];  // i_X_0
+    double I6[ MODEL_MAX_BODIES ][6][6];
+    double S[ MODEL_MAX_BODIES ][6];
+    double v[ MODEL_MAX_BODIES ][6], avp[ MODEL_MAX_BODIES ][6], fvp[ MODEL_MAX_BODIES ][6];
 
-    for ( int i = 0 ; i < NBOD ; i++ ) {
-        mcI( masses[i], cgs[i], icm[i], I6[i] );
+    // -a_grav, the seed of the RNEA acceleration recursion.
+    double gravNeg[6] = { 0, 0, 0, -mdl->gravity[0], -mdl->gravity[1], -mdl->gravity[2] };
+
+    for ( int i = 0 ; i < nb ; i++ ) {
+        const ModelBody *b = &mdl->body[ i ];
+        int par = b->parent;
+
+        mcI( b->mass, b->cg, b->inertia, I6[i] );
 
         // Xup = XJ * XT, exactly as the generator composes
         // Xlink = xJoint o xTree.
-        double E[3][3], Eident[3][3] = { {1,0,0},{0,1,0},{0,0,1} };
-        double rT[3] = { linkLen, 0, 0 }, r0[3] = { 0, 0, 0 };
+        double Eident[3][3] = { {1,0,0},{0,1,0},{0,0,1} };
         double XJ[6][6], XT[6][6];
-        rotz( q[i], E );
-        plux( E, r0, XJ );
-        plux( Eident, rT, XT );
+        jointXS( b, q[i], XJ, S[i] );
+        plux( Eident, b->tree, XT );
         m6_mul( XJ, XT, Xup[i] );
 
-        if ( i == 0 ) {
+        if ( par == -1 ) {
             for ( int r = 0 ; r < 6 ; r++ )
             for ( int c = 0 ; c < 6 ; c++ ) Xa[i][r][c] = Xup[i][r][c];
         } else {
-            m6_mul( Xup[i], Xa[i-1], Xa[i] );
+            m6_mul( Xup[i], Xa[par], Xa[i] );
         }
 
-        // v_i = Xup * v_parent + vJ,  vJ = S * qd_i = (0,0,qd,0,0,0)
-        double vJ[6] = { 0, 0, qd[i], 0, 0, 0 };
-        if ( i == 0 ) {
+        // v_i = Xup * v_parent + vJ,  vJ = S * qd_i
+        double vJ[6];
+        for ( int k = 0 ; k < 6 ; k++ ) vJ[k] = S[i][k] * qd[i];
+        if ( par == -1 ) {
             for ( int k = 0 ; k < 6 ; k++ ) v[i][k] = vJ[k];
         } else {
-            m6_mulvec( Xup[i], v[i-1], v[i] );
+            m6_mulvec( Xup[i], v[par], v[i] );
             for ( int k = 0 ; k < 6 ; k++ ) v[i][k] += vJ[k];
         }
 
-        // avp_i = Xup * avp_parent + crm(v_i)*vJ   (avp_parent(0) = -a_grav)
+        // avp_i = Xup * avp_parent + crm(v_i)*vJ   (avp_parent(base) = -a_grav)
         double crmV[6][6], vCrossVJ[6];
-        m6_mulvec( Xup[i], i == 0 ? gravNeg : avp[i-1], avp[i] );
+        m6_mulvec( Xup[i], par == -1 ? gravNeg : avp[par], avp[i] );
         crm( v[i], crmV );
         m6_mulvec( crmV, vJ, vCrossVJ );
         for ( int k = 0 ; k < 6 ; k++ ) avp[i][k] += vCrossVJ[k];
@@ -261,59 +292,68 @@ static void fd_dense( const double *q, const double *qd, const double *tau,
         m6_mulvec( crfV, Iv, vIv );
         for ( int k = 0 ; k < 6 ; k++ ) fvp[i][k] = Ia[k] + vIv[k];
 
-        double XaT[36], b[6], fb[6];
-        for ( int r = 0 ; r < 6 ; r++ )
-        for ( int c = 0 ; c < 6 ; c++ ) XaT[ r*6 + c ] = Xa[i][c][r];
-        for ( int k = 0 ; k < 6 ; k++ ) b[k] = fext[ i*6 + k ];
-        linsolve( 6, XaT, b, fb );
-        for ( int k = 0 ; k < 6 ; k++ ) fvp[i][k] -= fb[k];
+        // Bodies generated without external-force support ignore their fext
+        // slots entirely (spatial_v2's empty f_ext{i} cells) -- mirror that
+        // here or the two implementations diverge whenever the harness fills
+        // fext for a body whose flag is off.
+        if ( b->hasFext ) {
+            double XaT[36], bvec[6], fb[6];
+            for ( int r = 0 ; r < 6 ; r++ )
+            for ( int c = 0 ; c < 6 ; c++ ) XaT[ r*6 + c ] = Xa[i][c][r];
+            for ( int k = 0 ; k < 6 ; k++ ) bvec[k] = fext[ i*6 + k ];
+            linsolve( 6, XaT, bvec, fb );
+            for ( int k = 0 ; k < 6 ; k++ ) fvp[i][k] -= fb[k];
+        }
     }
 
-    // Inward pass: C_i = S^T fvp_i; fvp_parent += Xup^T fvp_i.
-    double C[ NBOD ];
-    for ( int i = NBOD - 1 ; i >= 0 ; i-- ) {
-        C[i] = fvp[i][2];
-        if ( i > 0 ) {
+    // Inward pass: C_i = S_i . fvp_i; fvp_parent += Xup^T fvp_i.
+    double C[ MODEL_MAX_BODIES ];
+    for ( int i = nb - 1 ; i >= 0 ; i-- ) {
+        int par = mdl->body[i].parent;
+        C[i] = dot6( S[i], fvp[i] );
+        if ( par != -1 ) {
             double up[6];
             m6_tmulvec( Xup[i], fvp[i], up );
-            for ( int k = 0 ; k < 6 ; k++ ) fvp[i-1][k] += up[k];
+            for ( int k = 0 ; k < 6 ; k++ ) fvp[par][k] += up[k];
         }
     }
 
     // CRBA: composite inertias, then H.
-    double IC[ NBOD ][6][6];
-    for ( int i = 0 ; i < NBOD ; i++ )
+    double IC[ MODEL_MAX_BODIES ][6][6];
+    for ( int i = 0 ; i < nb ; i++ )
         for ( int r = 0 ; r < 6 ; r++ )
         for ( int c = 0 ; c < 6 ; c++ ) IC[i][r][c] = I6[i][r][c];
 
-    double H[ NBOD ][ NBOD ] = { 0 };
-    for ( int i = NBOD - 1 ; i >= 0 ; i-- ) {
-        if ( i > 0 ) {
+    double H[ MODEL_MAX_BODIES ][ MODEL_MAX_BODIES ] = { 0 };
+    for ( int i = nb - 1 ; i >= 0 ; i-- ) {
+        int par = mdl->body[i].parent;
+        if ( par != -1 ) {
             double folded[6][6];
             m6_congruence( Xup[i], IC[i], folded );
             for ( int r = 0 ; r < 6 ; r++ )
-            for ( int c = 0 ; c < 6 ; c++ ) IC[i-1][r][c] += folded[r][c];
+            for ( int c = 0 ; c < 6 ; c++ ) IC[par][r][c] += folded[r][c];
         }
         double F[6];
-        for ( int k = 0 ; k < 6 ; k++ ) F[k] = IC[i][k][2]; // IC * S, S = e_z
-        H[i][i] = F[2];
-        for ( int j = i ; j > 0 ; ) {
+        m6_mulvec( IC[i], S[i], F );
+        H[i][i] = dot6( F, S[i] );
+        int j = i;
+        while ( mdl->body[j].parent != -1 ) {
             double Fup[6];
             m6_tmulvec( Xup[j], F, Fup );
             for ( int k = 0 ; k < 6 ; k++ ) F[k] = Fup[k];
-            j = j - 1;
-            H[i][j] = F[2]; // F . S_j
+            j = mdl->body[j].parent;
+            H[i][j] = dot6( F, S[j] );
             H[j][i] = H[i][j];
         }
     }
 
     // Solve H qdd = tau - C.
-    double A[ NBOD * NBOD ], rhs[ NBOD ];
-    for ( int i = 0 ; i < NBOD ; i++ ) {
+    double A[ MODEL_MAX_BODIES * MODEL_MAX_BODIES ], rhs[ MODEL_MAX_BODIES ];
+    for ( int i = 0 ; i < nb ; i++ ) {
         rhs[i] = tau[i] - C[i];
-        for ( int j = 0 ; j < NBOD ; j++ ) A[ i*NBOD + j ] = H[i][j];
+        for ( int j = 0 ; j < nb ; j++ ) A[ i*nb + j ] = H[i][j];
     }
-    linsolve( NBOD, A, rhs, qdd_out );
+    linsolve( nb, A, rhs, qdd_out );
 }
 
 // ---------------------------------------------------------------------------

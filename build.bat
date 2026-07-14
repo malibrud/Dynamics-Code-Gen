@@ -36,7 +36,7 @@ if errorlevel 1 (
 )
 
 echo === Running code generator to emit dynamics.c ===
-"%BUILD%\codegen.exe"
+"%BUILD%\codegen.exe" "%ROOT%models\threelink.mech"
 if errorlevel 1 (
     echo Code generator run failed.
     popd
@@ -52,9 +52,31 @@ if errorlevel 1 (
     popd
     exit /b 1
 )
-"%BUILD%\validate.exe"
+"%BUILD%\validate.exe" "%ROOT%models\threelink.mech"
 if errorlevel 1 (
     echo VALIDATION FAILED: generated dynamics.c disagrees with the dense reference.
+    popd
+    exit /b 1
+)
+popd
+
+echo === Validating second model ^(models\fourlink.mech^) ===
+pushd "%BUILD%"
+"%BUILD%\codegen.exe" "%ROOT%models\fourlink.mech" dynamics4.c
+if errorlevel 1 (
+    echo Code generator run failed for fourlink.mech.
+    popd
+    exit /b 1
+)
+cl /nologo /Zi /std:c17 /Fevalidate4.exe /Fo"%BUILD%\\" "%SRC%\validate\main.c" "%BUILD%\dynamics4.c"
+if errorlevel 1 (
+    echo Validation build failed for fourlink.mech.
+    popd
+    exit /b 1
+)
+"%BUILD%\validate4.exe" "%ROOT%models\fourlink.mech"
+if errorlevel 1 (
+    echo VALIDATION FAILED: generated dynamics4.c disagrees with the dense reference.
     popd
     exit /b 1
 )
@@ -68,7 +90,7 @@ if errorlevel 1 (
     popd
     exit /b 1
 )
-"%BUILD%\bench.exe"
+"%BUILD%\bench.exe" "%ROOT%models\threelink.mech"
 popd
 
 echo === Building legacy numeric implementation ^(src\numeric^) ===
