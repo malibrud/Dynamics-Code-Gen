@@ -31,6 +31,11 @@ directly, rather than shelling out to a C compiler.
   every build and fails the build on disagreement. On its first run it
   caught a real sign error in the generator's spatial-inertia lower-left
   block that the earlier hand-picked tests couldn't see.
+- `src/bench` — benchmark comparing the generated sparse code against the
+  dense reference (both built with `/O2`), cycling through a pool of random
+  states with a checksum to defeat dead-code elimination. Run by `build.bat`
+  after validation; on the original dev machine the 3-link chain runs at
+  ~50 ns/call generated vs ~800 ns/call dense (~16x).
 - `src/numeric` — an earlier, currently non-building attempt at a runtime
   (non-generated) numeric implementation of the same algorithms. Kept for
   reference; `system.h` was removed mid-refactor and never replaced, so this
@@ -52,6 +57,7 @@ build.bat
 
 This builds `build/codegen.exe` from `src/codegen`, runs it to emit
 `build/dynamics.c`, builds and runs `build/validate.exe` (dense reference vs
-generated code — the build fails if they disagree), and attempts to build
-`build/numeric.exe` from `src/numeric` (currently expected to fail — see
-above).
+generated code — the build fails if they disagree), builds and runs
+`build/bench.exe` (`/O2` timing of both implementations), and attempts to
+build `build/numeric.exe` from `src/numeric` (currently expected to fail —
+see above).

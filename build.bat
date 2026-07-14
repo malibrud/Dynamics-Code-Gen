@@ -60,6 +60,17 @@ if errorlevel 1 (
 )
 popd
 
+echo === Building and running benchmark ^(src\bench, /O2^) ===
+pushd "%BUILD%"
+cl /nologo /O2 /std:c17 /Febench.exe /Fo"%BUILD%\\" "%SRC%\bench\main.c" "%BUILD%\dynamics.c"
+if errorlevel 1 (
+    echo Benchmark build failed.
+    popd
+    exit /b 1
+)
+"%BUILD%\bench.exe"
+popd
+
 echo === Building legacy numeric implementation ^(src\numeric^) ===
 pushd "%BUILD%"
 cl /nologo /Zi /std:c17 /Fenumeric.exe /Fo"%BUILD%\\" "%SRC%\numeric\main.c"

@@ -1,0 +1,85 @@
+// Benchmark: generated sparse dynamics (build/dynamics.c) vs the dense 6x6
+// reference (src/validate/dense.h), same inputs, wall-clock timed with
+// QueryPerformanceCounter. Build with /O2 -- timing unoptimized code says
+// nothing useful (build.bat does this).
+//
+// Each implementation cycles through a pool of pre-generated random states so
+// the compiler can't specialize on constant inputs, and a running checksum of
+// the outputs is printed so the calls can't be dead-code eliminated. Timing
+// runs in batches until a minimum elapsed time, so the per-call figure is
+// stable regardless of how fast the machine is.
+
+#include <stdio.h>
+#include <windows.h>
+#include "../validate/dense.h"
+
+// The generated implementation (compiled from build/dynamics.c).
+void fwd_dyn_crba( double *q, double *qd, double *tau, double *fext, double *out_qdd );
+
+#define NSTATES 256 // power of two so the index wrap is a mask
+
+static double qs[ NSTATES ][ NBOD ];
+static double qds[ NSTATES ][ NBOD ];
+static double taus[ NSTATES ][ NBOD ];
+static double fexts[ NSTATES ][ NBOD * 6 ];
+
+typedef void (*FdFn)( const double *q, const double *qd, const double *tau,
+                      const double *fext, double *qdd );
+
+// The generated function's signature is non-const; the inputs are never
+// written, so adapting via cast is safe here.
+static void genAdapter( const double *q, const double *qd, const double *tau,
+                        const double *fext, double *qdd ) {
+    fwd_dyn_crba( (double*)q, (double*)qd, (double*)tau, (double*)fext, qdd );
+}
+
+// Runs fn in batches until minSeconds has elapsed; returns ns per call.
+static double benchOne( FdFn fn, double minSeconds, double *checksumPerCall ) {
+    LARGE_INTEGER freq, t0, t1;
+    QueryPerformanceFrequency( &freq );
+
+    double qdd[ NBOD ];
+    double checksum = 0;
+    long long calls = 0;
+    double elapsed = 0;
+
+    QueryPerformanceCounter( &t0 );
+    do {
+        for ( int b = 0 ; b < 10000 ; b++ ) {
+            int s = (int)( calls & ( NSTATES - 1 ) );
+            fn( qs[s], qds[s], taus[s], fexts[s], qdd );
+            checksum += qdd[ 0 ] + qdd[ NBOD - 1 ];
+            calls++;
+        }
+        QueryPerformanceCounter( &t1 );
+        elapsed = (double)( t1.QuadPart - t0.QuadPart ) / (double)freq.QuadPart;
+    } while ( elapsed < minSeconds );
+
+    *checksumPerCall = checksum / (double)calls;
+    return elapsed * 1e9 / (double)calls;
+}
+
+int main( void ) {
+    for ( int s = 0 ; s < NSTATES ; s++ ) {
+        for ( int i = 0 ; i < NBOD ; i++ ) {
+            qs[s][i]   = 3.0 * frand();
+            qds[s][i]  = 2.0 * frand();
+            taus[s][i] = 5.0 * frand();
+        }
+        for ( int k = 0 ; k < NBOD * 6 ; k++ ) fexts[s][k] = 5.0 * frand();
+    }
+
+    // Warm-up (page in code, settle clocks), then measure.
+    double cs;
+    benchOne( genAdapter, 0.05, &cs );
+    benchOne( fd_dense,   0.05, &cs );
+
+    double csGen, csDense;
+    double nsGen   = benchOne( genAdapter, 1.0, &csGen );
+    double nsDense = benchOne( fd_dense,   1.0, &csDense );
+
+    printf( "bench: generated sparse  %8.1f ns/call  (checksum/call %+.6f)\n", nsGen, csGen );
+    printf( "bench: dense reference   %8.1f ns/call  (checksum/call %+.6f)\n", nsDense, csDense );
+    printf( "bench: speedup %.1fx\n", nsDense / nsGen );
+    return 0;
+}
