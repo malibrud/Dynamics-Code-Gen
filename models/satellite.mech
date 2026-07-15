@@ -1,0 +1,50 @@
+# Free-flying satellite: a floating (6-DOF) main bus carrying two solar
+# panel arms and an antenna boom -- the standard floating-base example
+# (RBDA ch. 9, sec 9.4). The 'floating' joint is a genuine 6-DOF joint
+# with quaternion orientation, so there is no gimbal lock at any attitude.
+# Coordinate layout (nq = 10, nv = 9):
+#   q[0..3]  bus orientation, unit quaternion (w,x,y,z); normalized on input
+#   q[4..6]  bus position in base coordinates
+#   q[7..9]  appendage joint angles
+#   qd[0..5] bus spatial velocity in its own frame (wx,wy,wz,vx,vy,vz)
+#   qd[6..8] appendage joint rates
+# tau and out_qdd use the qd layout. Thruster force enters through fext on
+# the bus. Under gravity alone the whole assembly is in free fall: at
+# identity attitude qdd[5] = -9.81 (body-frame linear z), all appendage
+# accelerations zero.
+
+gravity 0 0 -9.81
+
+body                    # 0: main bus, free-flying; thruster fext here
+parent -1
+joint floating
+tree 0 0 1
+mass 100
+cg 0 0.02 0.05
+inertia 10 12 8 0.5 0.2 0.3
+fext 1
+
+body                    # 1: left solar panel arm
+parent 0
+joint revolute y
+tree 0.6 0 0
+mass 5
+cg 0.5 0 0
+inertia 0.1 0.45 0.5 0 0 0
+fext 1
+
+body                    # 2: right solar panel arm
+parent 0
+joint revolute y
+tree -0.6 0 0
+mass 5
+cg -0.5 0 0
+inertia 0.1 0.45 0.5 0 0 0
+
+body                    # 3: antenna boom
+parent 0
+joint revolute z
+tree 0 0.3 0.4
+mass 1
+cg 0 0.15 0
+inertia 0.01 0.002 0.01 0 0 0

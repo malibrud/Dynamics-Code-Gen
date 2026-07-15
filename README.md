@@ -16,9 +16,34 @@ directly, rather than shelling out to a C compiler.
   format (documented in `src/model/model.h`) describing gravity and, per
   body: parent, joint type and axis, tree translation, mass, CG, inertia,
   and whether to support an external force. The grammar covers revolute,
-  prismatic, cylindrical, and spherical joints; the pipeline currently
-  implements revolute-z and rejects the rest with a clear error, widening
-  as the generator learns each type.
+  prismatic, cylindrical, spherical, and floating joints; the pipeline
+  implements all single-DOF joints (revolute and prismatic about x, y, or
+  z) plus genuine 6-DOF `floating` bodies (RBDA sec 9.4): orientation is a
+  unit quaternion — normalized on input, no gimbal lock at any attitude —
+  so a floating body takes 7 position coordinates but 6 velocity
+  coordinates (nq ≠ nv; the packed layouts are given by the model's
+  qidx/vidx maps, and the quaternion-rate integration q̇ = G(q)ω is the
+  integrator's job, outside the generated function). Spherical and
+  cylindrical joints are rejected with a clear error until they're
+  implemented. The example set spans the standard textbook topologies,
+  every one generated, validated, and benchmarked by `build.bat`:
+  - `threelink` / `fourlink` — the original planar chains
+  - `elbow` — 6R spatial arm with spherical wrist (Spong/Craig); maximally
+    serial, mixed z/y/x axes, dense H
+  - `stanford` — Stanford arm, the classic serial chain with a prismatic
+    boom (R-R-P plus 3R wrist)
+  - `gantry` — Cartesian PPP robot; no trigonometry survives generation
+    and H is constant (~19 ns/call, ~36x over dense)
+  - `pendulums` — four independent spatial pendulums off the base;
+    maximally parallel, H is diagonal by branch-induced sparsity
+  - `bintree` — Featherstone's balanced binary tree (7 bodies); block
+    sparsity between the two subtrees
+  - `satellite` — free-flying bus (`joint floating`) carrying two solar
+    panel arms and an antenna boom (RBDA ch. 9 floating base); nq = 10
+    (quaternion + position + 3 angles), nv = 9. In free fall the generated
+    code reproduces |linear qdd| = 9.81 with zero angular and joint
+    acceleration at every attitude — including the ones that were
+    ill-conditioned for the earlier Euler-chain formulation
 - `src/model` — the shared model-file parser (plain C, header-only), used
   by the generator, the validator, and the benchmark, so all three always
   agree on the mechanism.

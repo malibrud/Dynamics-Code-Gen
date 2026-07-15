@@ -1,0 +1,32 @@
+# Cartesian (PPP) gantry robot: three orthogonal prismatic axes -- the
+# standard "Cartesian manipulator" of the intro chapters (Spong ch. 1).
+# With no revolute joints the mass matrix is configuration-independent and
+# no trigonometry survives; the generator's symbolic zeros collapse nearly
+# the whole computation, making this a good stress test of the folding.
+
+gravity 0 0 -9.81
+
+body                    # 0: bridge carriage, travels along x
+parent -1
+joint prismatic x
+tree 0 0 1
+mass 20
+cg 0 0 0
+inertia 1.2 1.5 1.5 0 0 0
+
+body                    # 1: cross carriage, travels along y
+parent 0
+joint prismatic y
+tree 0 0 0
+mass 10
+cg 0 0 -0.05
+inertia 0.4 0.4 0.5 0 0 0
+
+body                    # 2: vertical ram, travels along z; tool force here
+parent 1
+joint prismatic z
+tree 0 0 0
+mass 5
+cg 0 0 -0.3
+inertia 0.4 0.4 0.02 0 0 0
+fext 1

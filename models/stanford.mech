@@ -1,0 +1,56 @@
+# Stanford arm: two revolutes plus a prismatic boom, then a spherical wrist
+# modeled as three intersecting revolutes -- the classic textbook example of
+# a serial chain containing a prismatic joint (Scheinman 1969; Paul 1981;
+# Craig ch. 3). Maximally serial; the characteristic shoulder offset in y
+# keeps the geometry fully three-dimensional.
+
+gravity 0 0 -9.81
+
+body                    # 0: waist
+parent -1
+joint revolute z
+tree 0 0 0.4
+mass 8
+cg 0 0 0.2
+inertia 0.15 0.15 0.04 0 0 0
+
+body                    # 1: shoulder pitch, offset sideways
+parent 0
+joint revolute y
+tree 0 0.15 0.1
+mass 4
+cg 0 0.05 0
+inertia 0.05 0.03 0.05 0 0 0
+
+body                    # 2: boom, slides along its own z
+parent 1
+joint prismatic z
+tree 0 0.15 0
+mass 2
+cg 0 0 0.15
+inertia 0.06 0.06 0.005 0 0 0
+
+body                    # 3: wrist roll
+parent 2
+joint revolute z
+tree 0 0 0.3
+mass 0.8
+cg 0 0 0.03
+inertia 0.003 0.003 0.001 0 0 0
+
+body                    # 4: wrist pitch
+parent 3
+joint revolute y
+tree 0 0 0.08
+mass 0.6
+cg 0 0 0.03
+inertia 0.002 0.002 0.001 0 0 0
+
+body                    # 5: wrist yaw / tool; external force here
+parent 4
+joint revolute z
+tree 0 0 0.08
+mass 0.4
+cg 0 0 0.02
+inertia 0.001 0.001 0.0008 0 0 0
+fext 1

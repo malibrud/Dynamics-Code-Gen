@@ -57,10 +57,24 @@ void gen_crba_H( FILE *f, System *sys ) {
             prln( "" );
         }
 
+        int vi = sys->vidx[ i ];
+
+        if ( sys->jtype[ i ] == J_FLOATING ) {
+            // S = identity(6): this joint's diagonal H block is the composite
+            // inertia itself, written out as a full 6x6. Floating joints are
+            // roots, so there is no ancestor walk to do either.
+            auto M = spatialInertiaTo6x6( sys->Ic[ i ] );
+            for ( int r = 0 ; r < 6 ; r++ )
+            for ( int c = 0 ; c < 6 ; c++ )
+                prln( "double H_%d_%d = %s;", vi + r, vi + c, M[r][c].c_str() );
+            prln( "" );
+            continue;
+        }
+
         Svec F = spatialInertiaMulVec( format( "F{}_0_", i ), sys->Ic[ i ], sys->S[ i ] );
         F.emit();
         string Hii = svecDot( F, sys->S[ i ] );
-        prln( "double H%d%d = %s;", i, i, Hii.c_str() );
+        prln( "double H_%d_%d = %s;", vi, vi, Hii.c_str() );
         prln( "" );
 
         // Walk up the ancestor chain, propagating F and picking off the
@@ -69,6 +83,8 @@ void gen_crba_H( FILE *f, System *sys ) {
         // only shows up -- as permanently-zero H entries between bodies on
         // separate branches -- once the tree actually branches. Each step
         // gets a unique F{i}_{step}_ temp name so nothing gets redeclared.
+        // Reaching a floating ancestor (S = identity) contributes a full
+        // 1x6 block: the propagated F itself.
         int j = i;
         int step = 0;
         while ( sys->parent[ j ] != -1 ) {
@@ -80,10 +96,18 @@ void gen_crba_H( FILE *f, System *sys ) {
             F.emit();
 
             j = sys->parent[ j ];
+            int vj = sys->vidx[ j ];
 
-            string Hij = svecDot( F, sys->S[ j ] );
-            prln( "double H%d%d = %s;", i, j, Hij.c_str() );
-            prln( "double H%d%d = H%d%d;", j, i, i, j );
+            if ( sys->jtype[ j ] == J_FLOATING ) {
+                for ( int k = 0 ; k < 6 ; k++ ) {
+                    prln( "double H_%d_%d = %s;", vi, vj + k, F.v[ k ].c_str() );
+                    prln( "double H_%d_%d = H_%d_%d;", vj + k, vi, vi, vj + k );
+                }
+            } else {
+                string Hij = svecDot( F, sys->S[ j ] );
+                prln( "double H_%d_%d = %s;", vi, vj, Hij.c_str() );
+                prln( "double H_%d_%d = H_%d_%d;", vj, vi, vi, vj );
+            }
             prln( "" );
         }
     }

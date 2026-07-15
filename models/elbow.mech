@@ -1,0 +1,56 @@
+# Six-revolute spatial manipulator: an "elbow manipulator" with spherical
+# wrist -- the standard serial-arm example of the robotics texts (Spong
+# ch. 3, Craig ch. 3). Maximally serial: every body's parent is the previous
+# body, so the joint-space inertia matrix H is fully dense. The axes mix
+# z, y, and x so the motion is fully three-dimensional.
+
+gravity 0 0 -9.81
+
+body                    # 0: waist column, rotates about vertical
+parent -1
+joint revolute z
+tree 0 0 0.5
+mass 10
+cg 0 0 0.25
+inertia 0.23 0.23 0.05 0 0 0
+
+body                    # 1: upper arm, shoulder pitch
+parent 0
+joint revolute y
+tree 0 0 0.3
+mass 5
+cg 0.2 0 0
+inertia 0.01 0.07 0.07 0 0 0
+
+body                    # 2: forearm, elbow pitch
+parent 1
+joint revolute y
+tree 0.4 0 0
+mass 3
+cg 0.2 0 0
+inertia 0.01 0.04 0.04 0 0 0
+
+body                    # 3: wrist roll
+parent 2
+joint revolute z
+tree 0.4 0 0
+mass 1
+cg 0.05 0 0
+inertia 0.005 0.005 0.002 0 0 0
+
+body                    # 4: wrist pitch
+parent 3
+joint revolute y
+tree 0.1 0 0
+mass 0.8
+cg 0.04 0 0
+inertia 0.004 0.004 0.002 0 0 0
+
+body                    # 5: wrist yaw / tool plate; external force here
+parent 4
+joint revolute x
+tree 0.1 0 0
+mass 0.5
+cg 0.03 0 0
+inertia 0.002 0.003 0.003 0 0 0
+fext 1

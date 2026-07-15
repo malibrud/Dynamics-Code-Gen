@@ -13,7 +13,16 @@ struct System{
     int nBod;
     vector<int16_t> parent;
     vector<int16_t> children;
-    vector<uint8_t> jtype;
+    vector<uint8_t> jtype;     // J_REVOLUTE, J_PRISMATIC, or J_FLOATING (joint.h)
+    vector<char> jaxis;        // 'x', 'y', or 'z' (unused for floating)
+
+    // Coordinate layout: floating joints take 7 q slots (quaternion + position)
+    // and 6 velocity slots; single-DOF joints take 1 of each, so nq != nv when
+    // any body floats.
+    vector<int> qidx;          // body i's first slot in the q vector
+    vector<int> vidx;          // body i's first slot in qd / tau / out_qdd
+    int nq = 0;
+    int nv = 0;
 
     vector<Svec> S;
     vector<Svec> vJ;
@@ -47,6 +56,9 @@ struct System{
         ,parent( N )
         ,children( N )
         ,jtype( N )
+        ,jaxis( N, 'z' )
+        ,qidx( N )
+        ,vidx( N )
         ,S( N )
         ,vJ( N )
         ,v( N )

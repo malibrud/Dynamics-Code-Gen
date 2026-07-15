@@ -37,9 +37,17 @@ void gen_rnea_C( FILE *f, System *sys ) {
         sys->v[ i ].emit();
 
         // a_i = i_X_lambda(i) * a_lambda(i) + v_i x vJ_i  (aJ = 0; a_lambda(0) = -a_grav)
+        // For a floating joint v_i == vJ_i (root body, S = identity), so the
+        // cross term is exactly zero and is skipped rather than generating
+        // expressions that cancel only numerically.
         Svec aParent = smat6MulVec( X6, iParent == -1 ? sys->grav : sys->a[ iParent ] );
-        Svec viCrossVJ = svCrossMotion( "", sys->v[ i ], sys->vJ[ i ] );
-        sys->a[ i ] = svecAdd( format( "a{}_", i ), aParent, viCrossVJ );
+        if ( sys->jtype[ i ] == J_FLOATING ) {
+            sys->a[ i ] = aParent;
+            sys->a[ i ].baseName = format( "a{}_", i );
+        } else {
+            Svec viCrossVJ = svCrossMotion( "", sys->v[ i ], sys->vJ[ i ] );
+            sys->a[ i ] = svecAdd( format( "a{}_", i ), aParent, viCrossVJ );
+        }
         sys->a[ i ].emit();
 
         // f_i = I_i * a_i + v_i x* (I_i * v_i) - i_X*_0 * fext_i
@@ -80,7 +88,20 @@ void gen_rnea_C( FILE *f, System *sys ) {
     }
 
     for ( int i = NB - 1 ; i >= 0 ; i-- ) {
-        prln( "double C%d = %s;", i, sys->force[ i ].v[2].c_str() );
+        // C_i = S_i^T f_i, one slot per velocity coordinate. For a floating
+        // joint S = identity, so the whole 6-component force vector lands in
+        // C. svecDot collapses to the single component S_i selects for
+        // single-DOF joints (this was previously hardcoded to .v[2], which
+        // is correct only for a z-axis revolute -- caught by the validator
+        // the moment other joint types existed).
+        int vi = sys->vidx[ i ];
+        if ( sys->jtype[ i ] == J_FLOATING ) {
+            for ( int k = 0 ; k < 6 ; k++ )
+                prln( "double C%d = %s;", vi + k, sys->force[ i ].v[ k ].c_str() );
+        } else {
+            string Ci = svecDot( sys->force[ i ], sys->S[ i ] );
+            prln( "double C%d = %s;", vi, Ci.c_str() );
+        }
 
         int iParent = sys->parent[ i ];
         if ( iParent != -1 ) {

@@ -5,6 +5,10 @@ set ROOT=%~dp0
 set BUILD=%ROOT%build
 set SRC=%ROOT%src
 
+rem Every model in this list is generated, validated against the dense
+rem reference, and benchmarked. The build fails on any disagreement.
+set MODELS=threelink fourlink elbow stanford gantry pendulums bintree satellite
+
 if not exist "%BUILD%" mkdir "%BUILD%"
 
 rem If cl.exe isn't already on PATH (e.g. not running from a Developer
@@ -34,64 +38,12 @@ if errorlevel 1 (
     popd
     exit /b 1
 )
-
-echo === Running code generator to emit dynamics.c ===
-"%BUILD%\codegen.exe" "%ROOT%models\threelink.mech"
-if errorlevel 1 (
-    echo Code generator run failed.
-    popd
-    exit /b 1
-)
 popd
 
-echo === Building and running dense validation ^(src\validate^) ===
-pushd "%BUILD%"
-cl /nologo /Zi /std:c17 /Fevalidate.exe /Fo"%BUILD%\\" "%SRC%\validate\main.c" "%BUILD%\dynamics.c"
-if errorlevel 1 (
-    echo Validation build failed.
-    popd
-    exit /b 1
+for %%M in (%MODELS%) do (
+    call :valbench %%M
+    if errorlevel 1 exit /b 1
 )
-"%BUILD%\validate.exe" "%ROOT%models\threelink.mech"
-if errorlevel 1 (
-    echo VALIDATION FAILED: generated dynamics.c disagrees with the dense reference.
-    popd
-    exit /b 1
-)
-popd
-
-echo === Validating second model ^(models\fourlink.mech^) ===
-pushd "%BUILD%"
-"%BUILD%\codegen.exe" "%ROOT%models\fourlink.mech" dynamics4.c
-if errorlevel 1 (
-    echo Code generator run failed for fourlink.mech.
-    popd
-    exit /b 1
-)
-cl /nologo /Zi /std:c17 /Fevalidate4.exe /Fo"%BUILD%\\" "%SRC%\validate\main.c" "%BUILD%\dynamics4.c"
-if errorlevel 1 (
-    echo Validation build failed for fourlink.mech.
-    popd
-    exit /b 1
-)
-"%BUILD%\validate4.exe" "%ROOT%models\fourlink.mech"
-if errorlevel 1 (
-    echo VALIDATION FAILED: generated dynamics4.c disagrees with the dense reference.
-    popd
-    exit /b 1
-)
-popd
-
-echo === Building and running benchmark ^(src\bench, /O2^) ===
-pushd "%BUILD%"
-cl /nologo /O2 /std:c17 /Febench.exe /Fo"%BUILD%\\" "%SRC%\bench\main.c" "%BUILD%\dynamics.c"
-if errorlevel 1 (
-    echo Benchmark build failed.
-    popd
-    exit /b 1
-)
-"%BUILD%\bench.exe" "%ROOT%models\threelink.mech"
-popd
 
 echo === Building legacy numeric implementation ^(src\numeric^) ===
 pushd "%BUILD%"
@@ -102,3 +54,39 @@ if errorlevel 1 (
 popd
 
 echo === Done. Artifacts and generated sources are in .\build ===
+goto :eof
+
+rem ---------------------------------------------------------------------------
+rem valbench <name>: generate dynamics_<name>.c from models\<name>.mech,
+rem validate it against the dense reference, and benchmark it.
+rem ---------------------------------------------------------------------------
+:valbench
+echo === %1: generate, validate, benchmark ===
+pushd "%BUILD%"
+"%BUILD%\codegen.exe" "%ROOT%models\%1.mech" dynamics_%1.c
+if errorlevel 1 (
+    echo Code generation failed for %1.
+    popd
+    exit /b 1
+)
+cl /nologo /Zi /std:c17 /Fevalidate_%1.exe /Fo"%BUILD%\\" "%SRC%\validate\main.c" "%BUILD%\dynamics_%1.c"
+if errorlevel 1 (
+    echo Validation build failed for %1.
+    popd
+    exit /b 1
+)
+"%BUILD%\validate_%1.exe" "%ROOT%models\%1.mech"
+if errorlevel 1 (
+    echo VALIDATION FAILED: dynamics_%1.c disagrees with the dense reference.
+    popd
+    exit /b 1
+)
+cl /nologo /O2 /std:c17 /Febench_%1.exe /Fo"%BUILD%\\" "%SRC%\bench\main.c" "%BUILD%\dynamics_%1.c"
+if errorlevel 1 (
+    echo Benchmark build failed for %1.
+    popd
+    exit /b 1
+)
+"%BUILD%\bench_%1.exe" "%ROOT%models\%1.mech"
+popd
+exit /b 0

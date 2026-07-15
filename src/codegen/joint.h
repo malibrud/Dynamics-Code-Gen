@@ -3,6 +3,7 @@
 
 #define J_REVOLUTE 0
 #define J_PRISMATIC 1
+#define J_FLOATING 2   // genuine 6-DOF joint: quaternion orientation, S = identity(6)
 
 // typedef struct {
 //     uint8_t type;

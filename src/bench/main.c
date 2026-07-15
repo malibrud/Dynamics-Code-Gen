@@ -16,14 +16,15 @@
 
 // The generated implementation (compiled from build/dynamics.c).
 void fwd_dyn_crba( double *q, double *qd, double *tau, double *fext, double *out_qdd );
-extern const int fwd_dyn_crba_nbod;
+extern const int fwd_dyn_crba_nq;
+extern const int fwd_dyn_crba_nv;
 
 #define NSTATES 256 // power of two so the index wrap is a mask
 
 static Model g_mdl;
-static double qs[ NSTATES ][ MODEL_MAX_BODIES ];
-static double qds[ NSTATES ][ MODEL_MAX_BODIES ];
-static double taus[ NSTATES ][ MODEL_MAX_BODIES ];
+static double qs[ NSTATES ][ MODEL_MAX_Q ];
+static double qds[ NSTATES ][ MODEL_MAX_V ];
+static double taus[ NSTATES ][ MODEL_MAX_V ];
 static double fexts[ NSTATES ][ MODEL_MAX_BODIES * 6 ];
 
 typedef void (*FdFn)( const double *q, const double *qd, const double *tau,
@@ -46,7 +47,7 @@ static double benchOne( FdFn fn, double minSeconds, double *checksumPerCall ) {
     LARGE_INTEGER freq, t0, t1;
     QueryPerformanceFrequency( &freq );
 
-    double qdd[ MODEL_MAX_BODIES ];
+    double qdd[ MODEL_MAX_V ];
     double checksum = 0;
     long long calls = 0;
     double elapsed = 0;
@@ -56,7 +57,7 @@ static double benchOne( FdFn fn, double minSeconds, double *checksumPerCall ) {
         for ( int b = 0 ; b < 10000 ; b++ ) {
             int s = (int)( calls & ( NSTATES - 1 ) );
             fn( qs[s], qds[s], taus[s], fexts[s], qdd );
-            checksum += qdd[ 0 ] + qdd[ g_mdl.nbod - 1 ];
+            checksum += qdd[ 0 ] + qdd[ g_mdl.nv - 1 ];
             calls++;
         }
         QueryPerformanceCounter( &t1 );
@@ -79,20 +80,17 @@ int main( int argc, char **argv ) {
         fprintf( stderr, "bench: %s\n", unsup );
         return 1;
     }
-    if ( fwd_dyn_crba_nbod != g_mdl.nbod ) {
-        fprintf( stderr, "bench: dynamics.c was generated for %d bodies but '%s' has %d -- regenerate\n",
-                 fwd_dyn_crba_nbod, path, g_mdl.nbod );
+    if ( fwd_dyn_crba_nq != g_mdl.nq || fwd_dyn_crba_nv != g_mdl.nv ) {
+        fprintf( stderr, "bench: dynamics.c was generated for nq=%d nv=%d but '%s' has nq=%d nv=%d -- regenerate\n",
+                 fwd_dyn_crba_nq, fwd_dyn_crba_nv, path, g_mdl.nq, g_mdl.nv );
         return 1;
     }
-    int nb = g_mdl.nbod;
 
     for ( int s = 0 ; s < NSTATES ; s++ ) {
-        for ( int i = 0 ; i < nb ; i++ ) {
-            qs[s][i]   = 3.0 * frand();
-            qds[s][i]  = 2.0 * frand();
-            taus[s][i] = 5.0 * frand();
-        }
-        for ( int k = 0 ; k < nb * 6 ; k++ ) fexts[s][k] = 5.0 * frand();
+        for ( int k = 0 ; k < g_mdl.nq ; k++ )     qs[s][k]   = 3.0 * frand();
+        for ( int k = 0 ; k < g_mdl.nv ; k++ )     qds[s][k]  = 2.0 * frand();
+        for ( int k = 0 ; k < g_mdl.nv ; k++ )     taus[s][k] = 5.0 * frand();
+        for ( int k = 0 ; k < g_mdl.nbod * 6 ; k++ ) fexts[s][k] = 5.0 * frand();
     }
 
     // Warm-up (page in code, settle clocks), then measure.
@@ -104,7 +102,7 @@ int main( int argc, char **argv ) {
     double nsGen   = benchOne( genAdapter,   1.0, &csGen );
     double nsDense = benchOne( denseAdapter, 1.0, &csDense );
 
-    printf( "bench: %s (%d bodies)\n", path, nb );
+    printf( "bench: %s (%d bodies, nq %d, nv %d)\n", path, g_mdl.nbod, g_mdl.nq, g_mdl.nv );
     printf( "bench: generated sparse  %8.1f ns/call  (checksum/call %+.6f)\n", nsGen, csGen );
     printf( "bench: dense reference   %8.1f ns/call  (checksum/call %+.6f)\n", nsDense, csDense );
     printf( "bench: speedup %.1fx\n", nsDense / nsGen );

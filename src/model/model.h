@@ -10,8 +10,28 @@
 //
 //   body                         starts body i (bodies are numbered in file order)
 //   parent <p>                   parent body index; -1 = fixed base. Must be < i.
-//   joint <type> [axis]          type: revolute | prismatic | cylindrical | spherical
-//                                axis: x | y | z (required except for spherical)
+//   joint <type> [axis]          type: revolute | prismatic | cylindrical |
+//                                spherical | floating
+//                                axis: x | y | z (required for revolute,
+//                                prismatic, cylindrical)
+//
+// A 'floating' joint gives the body all six DOF relative to the fixed base:
+// a genuine free-flying body (RBDA sec 9.4), with the orientation carried as
+// a unit quaternion so there is no gimbal lock anywhere. It must be attached
+// to the base (parent -1). Because a quaternion has four components, the
+// position and velocity coordinate counts differ (nq != nv):
+//
+//   q  slots (7): [ qw qx qy qz ] unit quaternion (normalized on input, so
+//                 any nonzero quaternion is accepted), then [ x y z ]
+//                 position of the body frame in base coordinates
+//   qd slots (6): the body's spatial velocity IN ITS OWN FRAME,
+//                 [ wx wy wz vx vy vz ]
+//
+// out_qdd gets the corresponding 6 spatial-acceleration slots. Integrating
+// a floating state therefore needs the quaternion-rate map qdot = G(q) w;
+// that is the integrator's job, not this function's. Use modelNq()/modelNv()
+// (m->nq, m->nv) and the per-body offsets m->qidx[i], m->vidx[i] to address
+// the packed q/qd vectors.
 //   tree <x> <y> <z>             translation from the parent's frame to this
 //                                joint's frame (no fixed rotation yet)
 //   mass <m>
@@ -31,12 +51,15 @@
 #include <stdlib.h>
 
 #define MODEL_MAX_BODIES 32
+#define MODEL_MAX_Q  ( MODEL_MAX_BODIES * 7 ) // worst case: every body floating
+#define MODEL_MAX_V  ( MODEL_MAX_BODIES * 6 )
 
 typedef enum {
     JOINT_REVOLUTE,
     JOINT_PRISMATIC,
     JOINT_CYLINDRICAL,
     JOINT_SPHERICAL,
+    JOINT_FLOATING,    // genuine 6-DOF joint, quaternion orientation
 } ModelJointType;
 
 typedef struct {
@@ -52,9 +75,16 @@ typedef struct {
 
 typedef struct {
     int nbod;
+    int nq;                // total position coordinates (7 per floating body, 1 otherwise)
+    int nv;                // total velocity coordinates (6 per floating body, 1 otherwise)
+    int qidx[ MODEL_MAX_BODIES ]; // body i's first slot in q
+    int vidx[ MODEL_MAX_BODIES ]; // body i's first slot in qd / tau / out_qdd
     double gravity[3];     // physical gravity
     ModelBody body[ MODEL_MAX_BODIES ];
 } Model;
+
+static int modelBodyNq( const ModelBody *b ) { return b->jtype == JOINT_FLOATING ? 7 : 1; }
+static int modelBodyNv( const ModelBody *b ) { return b->jtype == JOINT_FLOATING ? 6 : 1; }
 
 // Loads a mechanism file. Returns 0 on success; on failure returns nonzero
 // and writes a message (with file/line context) into err.
@@ -112,11 +142,12 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
             else if ( !strcmp( type, "prismatic" ) )   cur->jtype = JOINT_PRISMATIC;
             else if ( !strcmp( type, "cylindrical" ) ) cur->jtype = JOINT_CYLINDRICAL;
             else if ( !strcmp( type, "spherical" ) )   cur->jtype = JOINT_SPHERICAL;
+            else if ( !strcmp( type, "floating" ) )    cur->jtype = JOINT_FLOATING;
             else {
                 snprintf( err, errSize, "%s:%d: unknown joint type '%s'", path, lineNo, type );
                 goto fail;
             }
-            if ( cur->jtype == JOINT_SPHERICAL ) {
+            if ( cur->jtype == JOINT_SPHERICAL || cur->jtype == JOINT_FLOATING ) {
                 cur->axis = 0;
             } else {
                 if ( n < 2 || axis[1] != 0 || ( axis[0] != 'x' && axis[0] != 'y' && axis[0] != 'z' ) ) {
@@ -154,16 +185,37 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
         return 1;
     }
     for ( int i = 0 ; i < m->nbod ; i++ ) {
-        if ( m->body[i].parent < -1 || m->body[i].parent >= i ) {
+        ModelBody *b = &m->body[ i ];
+        if ( b->parent < -1 || b->parent >= i ) {
             snprintf( err, errSize, "%s: body %d: parent %d out of range (must be -1..%d, i.e. defined earlier)",
-                      path, i, m->body[i].parent, i - 1 );
+                      path, i, b->parent, i - 1 );
             return 1;
         }
-        if ( m->body[i].mass <= 0 ) {
+        if ( b->mass <= 0 ) {
             snprintf( err, errSize, "%s: body %d: mass must be positive", path, i );
             return 1;
         }
+        if ( b->jtype == JOINT_FLOATING && b->parent != -1 ) {
+            snprintf( err, errSize, "%s: body %d: a floating joint must attach to the base (parent -1)",
+                      path, i );
+            return 1;
+        }
     }
+
+    // Position/velocity coordinate layout: floating bodies take 7 q slots
+    // and 6 qd slots, everything else takes 1 of each. (Declared without
+    // initializers so the error-path goto above is legal in C++ too.)
+    int qi, vi;
+    qi = 0;
+    vi = 0;
+    for ( int i = 0 ; i < m->nbod ; i++ ) {
+        m->qidx[ i ] = qi;
+        m->vidx[ i ] = vi;
+        qi += modelBodyNq( &m->body[ i ] );
+        vi += modelBodyNv( &m->body[ i ] );
+    }
+    m->nq = qi;
+    m->nv = vi;
     return 0;
 
 fail:

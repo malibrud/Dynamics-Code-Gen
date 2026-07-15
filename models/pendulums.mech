@@ -1,0 +1,42 @@
+# Four independent spatial pendulums hanging from a common fixed base --
+# the maximally parallel topology: every body's parent is the base, so the
+# joint-space inertia matrix is diagonal (Featherstone's branch-induced
+# sparsity, CRBA.pdf slide 11, second pattern) and the CRBA ancestor walk
+# terminates immediately for every body. Axes alternate x and y and the
+# rods hang in -z, so all three dimensions participate.
+
+gravity 0 0 -9.81
+
+body                    # 0
+parent -1
+joint revolute x
+tree 1 0 0
+mass 1
+cg 0 0 -0.5
+inertia 0.09 0.09 0.01 0 0 0
+fext 1
+
+body                    # 1
+parent -1
+joint revolute y
+tree -1 0 0
+mass 2
+cg 0 0 -0.4
+inertia 0.12 0.12 0.02 0 0 0
+
+body                    # 2
+parent -1
+joint revolute x
+tree 0 1 0
+mass 0.5
+cg 0 0.05 -0.6
+inertia 0.06 0.06 0.005 0 0 0
+
+body                    # 3
+parent -1
+joint revolute y
+tree 0 -1 0.2
+mass 1.5
+cg 0.05 0 -0.45
+inertia 0.1 0.11 0.02 0 0 0
+fext 1

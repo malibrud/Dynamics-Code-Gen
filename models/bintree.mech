@@ -1,0 +1,66 @@
+# Balanced binary tree of 7 bodies -- Featherstone's standard branching
+# example (CRBA.pdf slides 12-14, spatial_v2's autoTree): body 0 carries two
+# subtrees of three bodies each. Sits between fully serial and fully
+# parallel: H has the classic block-sparsity pattern, and the CRBA ancestor
+# walk stops at each branch point. Mixed revolute axes plus one prismatic
+# leaf keep it fully three-dimensional.
+
+gravity 0 0 -9.81
+
+body                    # 0: trunk
+parent -1
+joint revolute z
+tree 0 0 0.2
+mass 2
+cg 0 0 0.1
+inertia 0.02 0.02 0.01 0 0 0
+
+body                    # 1: left branch
+parent 0
+joint revolute y
+tree 0.2 0 0.1
+mass 1
+cg 0.1 0 0
+inertia 0.005 0.01 0.01 0 0 0
+
+body                    # 2: right branch
+parent 0
+joint revolute x
+tree -0.2 0 0.1
+mass 1
+cg -0.1 0 0
+inertia 0.005 0.01 0.01 0 0 0
+
+body                    # 3: left-left leaf; external force here
+parent 1
+joint revolute x
+tree 0.15 0.05 0
+mass 0.5
+cg 0.08 0 0
+inertia 0.002 0.004 0.004 0 0 0
+fext 1
+
+body                    # 4: left-right leaf
+parent 1
+joint revolute z
+tree 0.15 -0.05 0
+mass 0.5
+cg 0.08 0 0
+inertia 0.002 0.004 0.004 0 0 0
+
+body                    # 5: right-left leaf, prismatic
+parent 2
+joint prismatic z
+tree -0.15 0.05 0
+mass 0.5
+cg 0 0 0.1
+inertia 0.004 0.004 0.001 0 0 0
+
+body                    # 6: right-right leaf; external force here
+parent 2
+joint revolute y
+tree -0.15 -0.05 0
+mass 0.5
+cg -0.08 0 0
+inertia 0.002 0.004 0.004 0 0 0
+fext 1

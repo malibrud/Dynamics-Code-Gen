@@ -23,26 +23,41 @@ int main( int argc, char **argv ) {
         fprintf( stderr, "codegen: %s\n", err );
         return 1;
     }
+    const char *unsup = modelUnsupported( &mdl );
+    if ( unsup ) {
+        fprintf( stderr, "codegen: %s\n", unsup );
+        return 1;
+    }
 
     System sys( mdl.nbod );
     for ( int i = 0 ; i < mdl.nbod ; i++ ) {
         ModelBody *b = &mdl.body[ i ];
 
-        // The symbolic pipeline currently only knows how to emit S, xJoint,
-        // and vJ for a z-axis revolute joint. The file format already
-        // expresses more (prismatic, other axes, cylindrical, spherical);
-        // widen this check as the generator learns each one.
-        if ( b->jtype != JOINT_REVOLUTE || b->axis != 'z' ) {
-            fprintf( stderr, "codegen: body %d: only 'joint revolute z' is implemented so far\n", i );
-            return 1;
-        }
-
         sys.parent[ i ]   = (int16_t)b->parent;
         sys.children[ i ] = i + 1;
 
-        string q = "q"s + to_string( i );
-        sys.xTree[ i ]  = Xform( format( "Xtree_{}", i ), b->tree[0], b->tree[1], b->tree[2] );
-        sys.xJoint[ i ] = Xform( XFORM_RZ, format( "Xjoint_{}", i ), q );
+        // Map the model's joint onto the symbolic joint transform and record
+        // type/axis so gen_fwd_dyn_crba can build S and vJ. For a floating
+        // joint the transform depends on emitted quaternion temps, so
+        // gen_fwd_dyn_crba builds xJoint itself.
+        sys.jaxis[ i ] = b->axis;
+        sys.xTree[ i ] = Xform( format( "Xtree_{}", i ), b->tree[0], b->tree[1], b->tree[2] );
+        if ( b->jtype == JOINT_FLOATING ) {
+            sys.jtype[ i ] = J_FLOATING;
+        } else {
+            Xtype xt;
+            if ( b->jtype == JOINT_REVOLUTE ) {
+                xt = b->axis == 'x' ? XFORM_RX : b->axis == 'y' ? XFORM_RY : XFORM_RZ;
+                sys.jtype[ i ] = J_REVOLUTE;
+            } else { // JOINT_PRISMATIC (spherical/cylindrical rejected above)
+                xt = b->axis == 'x' ? XFORM_TX : b->axis == 'y' ? XFORM_TY : XFORM_TZ;
+                sys.jtype[ i ] = J_PRISMATIC;
+            }
+            string q = "q"s + to_string( i );
+            sys.xJoint[ i ] = Xform( xt, format( "Xjoint_{}", i ), q );
+        }
+        sys.qidx[ i ] = mdl.qidx[ i ];
+        sys.vidx[ i ] = mdl.vidx[ i ];
 
         sys.bodies[ i ].m = b->mass;
         for ( int k = 0 ; k < 3 ; k++ ) sys.bodies[ i ].cg[ k ] = b->cg[ k ];
@@ -54,6 +69,8 @@ int main( int argc, char **argv ) {
         sys.bodies[ i ].I.zx = b->inertia[ 5 ];
         sys.hasFext[ i ] = (uint8_t)b->hasFext;
     }
+    sys.nq = mdl.nq;
+    sys.nv = mdl.nv;
 
     // sys.grav seeds the RNEA acceleration recursion with -a_grav, so negate
     // the physical gravity from the file. numStr keeps zero components "0".

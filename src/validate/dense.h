@@ -157,24 +157,44 @@ static void rotAxis( char axis, double q, double E[3][3] ) {
     }
 }
 
-// Joint transform XJ and motion subspace S for a single-DOF joint at
-// position q. Revolute: rotation about the axis, S = (axis; 0). Prismatic:
-// translation along the axis, S = (0; axis).
-static void jointXS( const ModelBody *b, double q, double XJ[6][6], double S[6] ) {
+// Joint transform XJ and motion subspace S (6 x ndof, stored as columns of a
+// 6x6 array) for a joint at position coordinates qseg (this body's slice of
+// the packed q vector). Revolute: rotation about the axis, S = (axis; 0).
+// Prismatic: translation along the axis, S = (0; axis). Floating: quaternion
+// orientation plus position, S = identity(6) -- a genuine 6-DOF joint with
+// no gimbal lock.
+static int jointXS( const ModelBody *b, const double *qseg, double XJ[6][6], double S[6][6] ) {
     double a3[3], Eident[3][3] = { {1,0,0},{0,1,0},{0,0,1} }, r0[3] = { 0, 0, 0 };
-    axisVec( b->axis, a3 );
-    for ( int k = 0 ; k < 6 ; k++ ) S[k] = 0;
+    for ( int r = 0 ; r < 6 ; r++ )
+    for ( int c = 0 ; c < 6 ; c++ ) S[r][c] = 0;
 
+    if ( b->jtype == JOINT_FLOATING ) {
+        // Unit quaternion (w,x,y,z), normalized here; rotation matrix in
+        // this codebase's E convention (transpose of spatial_v2's rq.m).
+        double w = qseg[0], x = qseg[1], y = qseg[2], z = qseg[3];
+        double n = 1.0 / sqrt( w*w + x*x + y*y + z*z );
+        w *= n; x *= n; y *= n; z *= n;
+        double E[3][3];
+        E[0][0] = 2.0*( w*w + x*x - 0.5 ); E[0][1] = 2.0*( x*y - w*z );       E[0][2] = 2.0*( x*z + w*y );
+        E[1][0] = 2.0*( x*y + w*z );       E[1][1] = 2.0*( w*w + y*y - 0.5 ); E[1][2] = 2.0*( y*z - w*x );
+        E[2][0] = 2.0*( x*z - w*y );       E[2][1] = 2.0*( y*z + w*x );       E[2][2] = 2.0*( w*w + z*z - 0.5 );
+        plux( E, qseg + 4, XJ );
+        for ( int k = 0 ; k < 6 ; k++ ) S[k][k] = 1;
+        return 6;
+    }
+
+    axisVec( b->axis, a3 );
     if ( b->jtype == JOINT_REVOLUTE ) {
         double E[3][3];
-        rotAxis( b->axis, q, E );
+        rotAxis( b->axis, qseg[0], E );
         plux( E, r0, XJ );
-        for ( int k = 0 ; k < 3 ; k++ ) S[k] = a3[k];
+        for ( int k = 0 ; k < 3 ; k++ ) S[k][0] = a3[k];
     } else { // JOINT_PRISMATIC (spherical/cylindrical rejected upstream)
-        double rq[3] = { a3[0]*q, a3[1]*q, a3[2]*q };
+        double rq[3] = { a3[0]*qseg[0], a3[1]*qseg[0], a3[2]*qseg[0] };
         plux( Eident, rq, XJ );
-        for ( int k = 0 ; k < 3 ; k++ ) S[k+3] = a3[k];
+        for ( int k = 0 ; k < 3 ; k++ ) S[k+3][0] = a3[k];
     }
+    return 1;
 }
 
 // Spatial inertia from mass, CG offset, and rotational inertia about the CG
@@ -232,15 +252,21 @@ static void crf( const double v[6], double M[6][6] ) {
 
 // ---------------------------------------------------------------------------
 // Dense forward dynamics: H*qdd = tau - C, with C from the RNEA (RBDA Table
-// 5.1, aJ = 0) and H from the CRBA (RBDA Table 6.4).
+// 5.1, aJ = 0) and H from the CRBA (RBDA Table 6.4). Joints may have 1 DOF
+// (revolute/prismatic) or 6 (floating), so H is nv x nv with per-joint
+// blocks; q is addressed through mdl->qidx and qd/tau/qdd through mdl->vidx.
+// The large working arrays are static: fd_dense is not reentrant, but stays
+// comfortably off the stack even at MODEL_MAX_V.
 // ---------------------------------------------------------------------------
 static void fd_dense( const Model *mdl, const double *q, const double *qd,
                       const double *tau, const double *fext, double *qdd_out ) {
     int nb = mdl->nbod;
+    int nv = mdl->nv;
     double Xup[ MODEL_MAX_BODIES ][6][6]; // i_X_lambda(i)
     double Xa[ MODEL_MAX_BODIES ][6][6];  // i_X_0
     double I6[ MODEL_MAX_BODIES ][6][6];
-    double S[ MODEL_MAX_BODIES ][6];
+    double S[ MODEL_MAX_BODIES ][6][6];   // motion subspace, ndof[i] columns
+    int ndof[ MODEL_MAX_BODIES ];
     double v[ MODEL_MAX_BODIES ][6], avp[ MODEL_MAX_BODIES ][6], fvp[ MODEL_MAX_BODIES ][6];
 
     // -a_grav, the seed of the RNEA acceleration recursion.
@@ -249,6 +275,7 @@ static void fd_dense( const Model *mdl, const double *q, const double *qd,
     for ( int i = 0 ; i < nb ; i++ ) {
         const ModelBody *b = &mdl->body[ i ];
         int par = b->parent;
+        int vi = mdl->vidx[ i ];
 
         mcI( b->mass, b->cg, b->inertia, I6[i] );
 
@@ -256,7 +283,7 @@ static void fd_dense( const Model *mdl, const double *q, const double *qd,
         // Xlink = xJoint o xTree.
         double Eident[3][3] = { {1,0,0},{0,1,0},{0,0,1} };
         double XJ[6][6], XT[6][6];
-        jointXS( b, q[i], XJ, S[i] );
+        ndof[i] = jointXS( b, q + mdl->qidx[ i ], XJ, S[i] );
         plux( Eident, b->tree, XT );
         m6_mul( XJ, XT, Xup[i] );
 
@@ -267,9 +294,10 @@ static void fd_dense( const Model *mdl, const double *q, const double *qd,
             m6_mul( Xup[i], Xa[par], Xa[i] );
         }
 
-        // v_i = Xup * v_parent + vJ,  vJ = S * qd_i
-        double vJ[6];
-        for ( int k = 0 ; k < 6 ; k++ ) vJ[k] = S[i][k] * qd[i];
+        // v_i = Xup * v_parent + vJ,  vJ = S * qd-slice
+        double vJ[6] = { 0, 0, 0, 0, 0, 0 };
+        for ( int r = 0 ; r < 6 ; r++ )
+            for ( int k = 0 ; k < ndof[i] ; k++ ) vJ[r] += S[i][r][k] * qd[ vi + k ];
         if ( par == -1 ) {
             for ( int k = 0 ; k < 6 ; k++ ) v[i][k] = vJ[k];
         } else {
@@ -278,6 +306,8 @@ static void fd_dense( const Model *mdl, const double *q, const double *qd,
         }
 
         // avp_i = Xup * avp_parent + crm(v_i)*vJ   (avp_parent(base) = -a_grav)
+        // For a floating root v == vJ, so the cross term is zero -- crm(v)*v
+        // cancels exactly in floating point, so no special case is needed.
         double crmV[6][6], vCrossVJ[6];
         m6_mulvec( Xup[i], par == -1 ? gravNeg : avp[par], avp[i] );
         crm( v[i], crmV );
@@ -306,11 +336,16 @@ static void fd_dense( const Model *mdl, const double *q, const double *qd,
         }
     }
 
-    // Inward pass: C_i = S_i . fvp_i; fvp_parent += Xup^T fvp_i.
-    double C[ MODEL_MAX_BODIES ];
+    // Inward pass: C block = S_i^T fvp_i; fvp_parent += Xup^T fvp_i.
+    static double C[ MODEL_MAX_V ];
     for ( int i = nb - 1 ; i >= 0 ; i-- ) {
         int par = mdl->body[i].parent;
-        C[i] = dot6( S[i], fvp[i] );
+        int vi = mdl->vidx[ i ];
+        for ( int k = 0 ; k < ndof[i] ; k++ ) {
+            double s = 0;
+            for ( int r = 0 ; r < 6 ; r++ ) s += S[i][r][k] * fvp[i][r];
+            C[ vi + k ] = s;
+        }
         if ( par != -1 ) {
             double up[6];
             m6_tmulvec( Xup[i], fvp[i], up );
@@ -318,42 +353,69 @@ static void fd_dense( const Model *mdl, const double *q, const double *qd,
         }
     }
 
-    // CRBA: composite inertias, then H.
+    // CRBA: composite inertias, then H blocks.
     double IC[ MODEL_MAX_BODIES ][6][6];
     for ( int i = 0 ; i < nb ; i++ )
         for ( int r = 0 ; r < 6 ; r++ )
         for ( int c = 0 ; c < 6 ; c++ ) IC[i][r][c] = I6[i][r][c];
 
-    double H[ MODEL_MAX_BODIES ][ MODEL_MAX_BODIES ] = { 0 };
+    static double H[ MODEL_MAX_V ][ MODEL_MAX_V ];
+    for ( int r = 0 ; r < nv ; r++ )
+    for ( int c = 0 ; c < nv ; c++ ) H[r][c] = 0;
+
     for ( int i = nb - 1 ; i >= 0 ; i-- ) {
         int par = mdl->body[i].parent;
+        int vi = mdl->vidx[ i ];
         if ( par != -1 ) {
             double folded[6][6];
             m6_congruence( Xup[i], IC[i], folded );
             for ( int r = 0 ; r < 6 ; r++ )
             for ( int c = 0 ; c < 6 ; c++ ) IC[par][r][c] += folded[r][c];
         }
-        double F[6];
-        m6_mulvec( IC[i], S[i], F );
-        H[i][i] = dot6( F, S[i] );
+
+        // F = IC * S_i, one 6-vector per DOF of joint i.
+        double F[6][6];
+        for ( int k = 0 ; k < ndof[i] ; k++ ) {
+            double col[6];
+            for ( int r = 0 ; r < 6 ; r++ ) col[r] = S[i][r][k];
+            m6_mulvec( IC[i], col, F[k] );
+        }
+        // Diagonal block: H[vi+a][vi+b] = S_a . F_b.
+        for ( int a = 0 ; a < ndof[i] ; a++ )
+        for ( int bcol = 0 ; bcol < ndof[i] ; bcol++ ) {
+            double s = 0;
+            for ( int r = 0 ; r < 6 ; r++ ) s += S[i][r][a] * F[bcol][r];
+            H[ vi + a ][ vi + bcol ] = s;
+        }
+
+        // Ancestor walk, propagating all of joint i's F columns together.
         int j = i;
         while ( mdl->body[j].parent != -1 ) {
-            double Fup[6];
-            m6_tmulvec( Xup[j], F, Fup );
-            for ( int k = 0 ; k < 6 ; k++ ) F[k] = Fup[k];
+            for ( int k = 0 ; k < ndof[i] ; k++ ) {
+                double Fup[6];
+                m6_tmulvec( Xup[j], F[k], Fup );
+                for ( int r = 0 ; r < 6 ; r++ ) F[k][r] = Fup[r];
+            }
             j = mdl->body[j].parent;
-            H[i][j] = dot6( F, S[j] );
-            H[j][i] = H[i][j];
+            int vj = mdl->vidx[ j ];
+            for ( int a = 0 ; a < ndof[i] ; a++ )
+            for ( int bcol = 0 ; bcol < ndof[j] ; bcol++ ) {
+                double s = 0;
+                for ( int r = 0 ; r < 6 ; r++ ) s += F[a][r] * S[j][r][bcol];
+                H[ vi + a ][ vj + bcol ] = s;
+                H[ vj + bcol ][ vi + a ] = s;
+            }
         }
     }
 
     // Solve H qdd = tau - C.
-    double A[ MODEL_MAX_BODIES * MODEL_MAX_BODIES ], rhs[ MODEL_MAX_BODIES ];
-    for ( int i = 0 ; i < nb ; i++ ) {
-        rhs[i] = tau[i] - C[i];
-        for ( int j = 0 ; j < nb ; j++ ) A[ i*nb + j ] = H[i][j];
+    static double A[ MODEL_MAX_V * MODEL_MAX_V ];
+    double rhs[ MODEL_MAX_V ];
+    for ( int r = 0 ; r < nv ; r++ ) {
+        rhs[r] = tau[r] - C[r];
+        for ( int c = 0 ; c < nv ; c++ ) A[ r*nv + c ] = H[r][c];
     }
-    linsolve( nb, A, rhs, qdd_out );
+    linsolve( nv, A, rhs, qdd_out );
 }
 
 // ---------------------------------------------------------------------------

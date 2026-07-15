@@ -8,7 +8,8 @@
 
 // The generated implementation under test (compiled from build/dynamics.c).
 void fwd_dyn_crba( double *q, double *qd, double *tau, double *fext, double *out_qdd );
-extern const int fwd_dyn_crba_nbod;
+extern const int fwd_dyn_crba_nq;
+extern const int fwd_dyn_crba_nv;
 
 int main( int argc, char **argv ) {
     const char *path = argc > 1 ? argv[ 1 ] : "../models/threelink.mech";
@@ -23,12 +24,12 @@ int main( int argc, char **argv ) {
         fprintf( stderr, "validate: %s\n", unsup );
         return 1;
     }
-    if ( fwd_dyn_crba_nbod != mdl.nbod ) {
-        fprintf( stderr, "validate: dynamics.c was generated for %d bodies but '%s' has %d -- regenerate\n",
-                 fwd_dyn_crba_nbod, path, mdl.nbod );
+    if ( fwd_dyn_crba_nq != mdl.nq || fwd_dyn_crba_nv != mdl.nv ) {
+        fprintf( stderr, "validate: dynamics.c was generated for nq=%d nv=%d but '%s' has nq=%d nv=%d -- regenerate\n",
+                 fwd_dyn_crba_nq, fwd_dyn_crba_nv, path, mdl.nq, mdl.nv );
         return 1;
     }
-    int nb = mdl.nbod;
+    int nb = mdl.nbod, nq = mdl.nq, nv = mdl.nv;
 
     const int NTRIALS = 1000;
     const double TOL = 1e-9;
@@ -36,29 +37,39 @@ int main( int argc, char **argv ) {
     int worstTrial = -1;
 
     for ( int t = 0 ; t < NTRIALS ; t++ ) {
-        double q[ MODEL_MAX_BODIES ], qd[ MODEL_MAX_BODIES ], tau[ MODEL_MAX_BODIES ];
+        double q[ MODEL_MAX_Q ], qd[ MODEL_MAX_V ], tau[ MODEL_MAX_V ];
         double fext[ MODEL_MAX_BODIES * 6 ];
 
         // First trials pin down special cases; the rest are fully random.
-        for ( int i = 0 ; i < nb ; i++ ) {
-            q[i]   = ( t == 0 ) ? 0 : 3.0 * frand();
-            qd[i]  = ( t <= 1 ) ? 0 : 2.0 * frand();
-            tau[i] = ( t <= 2 ) ? 0 : 5.0 * frand();
-        }
+        for ( int k = 0 ; k < nq ; k++ ) q[k]   = ( t == 0 ) ? 0 : 3.0 * frand();
+        for ( int k = 0 ; k < nv ; k++ ) qd[k]  = ( t <= 1 ) ? 0 : 2.0 * frand();
+        for ( int k = 0 ; k < nv ; k++ ) tau[k] = ( t <= 2 ) ? 0 : 5.0 * frand();
         for ( int k = 0 ; k < nb * 6 ; k++ )
             fext[k] = ( t <= 3 ) ? 0 : 5.0 * frand();
 
-        double qddGen[ MODEL_MAX_BODIES ], qddRef[ MODEL_MAX_BODIES ];
+        // An all-zero quaternion is not a pose; the at-rest trial needs the
+        // identity quaternion for every floating body. Random trials keep
+        // whatever they drew -- both implementations normalize identically.
+        if ( t == 0 ) {
+            for ( int i = 0 ; i < nb ; i++ )
+                if ( mdl.body[i].jtype == JOINT_FLOATING ) q[ mdl.qidx[i] ] = 1.0;
+        }
+
+        double qddGen[ MODEL_MAX_V ], qddRef[ MODEL_MAX_V ];
         fwd_dyn_crba( q, qd, tau, fext, qddGen );
         fd_dense( &mdl, q, qd, tau, fext, qddRef );
 
-        for ( int i = 0 ; i < nb ; i++ ) {
-            double e = fabs( qddGen[i] - qddRef[i] );
+        for ( int k = 0 ; k < nv ; k++ ) {
+            // Scaled error: absolute for O(1) values, relative for large
+            // ones, so ill-conditioned states (near-singular H) measure
+            // agreement rather than conditioning. A real bug still shows
+            // up as a large relative error.
+            double e = fabs( qddGen[k] - qddRef[k] ) / fmax( 1.0, fabs( qddRef[k] ) );
             if ( e > maxErr ) { maxErr = e; worstTrial = t; }
         }
     }
 
-    printf( "validate: %s: %d trials, max |qdd_generated - qdd_dense| = %.3e (worst at trial %d)\n",
+    printf( "validate: %s: %d trials, max scaled |qdd_generated - qdd_dense| = %.3e (worst at trial %d)\n",
             path, NTRIALS, maxErr, worstTrial );
     if ( maxErr < TOL ) {
         printf( "validate: PASS\n" );
