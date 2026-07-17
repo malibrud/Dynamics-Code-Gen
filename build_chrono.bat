@@ -25,7 +25,7 @@ if not exist "%EIGEN_DIR%\Eigen" (
     exit /b 1
 )
 
-set MODELS=threelink fourlink elbow stanford gantry pendulums bintree satellite
+set MODELS=threelink fourlink elbow stanford gantry pendulums bintree satellite fourbar rrrs
 
 if not exist "%BUILD%" mkdir "%BUILD%"
 

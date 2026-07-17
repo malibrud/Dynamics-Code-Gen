@@ -239,6 +239,16 @@ static ChQuaterniond zToAxis( char axis ) {
     return ChQuaterniond( 1, 0, 0, 0 );
 }
 
+// Rotation mapping local x onto the joint axis: ChLinkLockPointLine's line is
+// the x axis of its second marker (the mask locks relative y and z), unlike
+// the z-axis convention of the other ChLinkLock joints.
+static ChQuaterniond xToAxis( char axis ) {
+    const double s = 0.70710678118654752440;
+    if ( axis == 'y' ) return ChQuaterniond( s, 0, 0,  s ); // +90 about z
+    if ( axis == 'z' ) return ChQuaterniond( s, 0, -s, 0 ); // -90 about y
+    return ChQuaterniond( 1, 0, 0, 0 );
+}
+
 static void buildChronoModel( const Model *mdl, ChronoModel &cm ) {
     cm.sys.SetGravitationalAcceleration( v3( mdl->gravity ) );
     // Bilateral-only system: a direct sparse solver gives machine-precision
@@ -294,6 +304,106 @@ static void buildChronoModel( const Model *mdl, ChronoModel &cm ) {
             link = chrono_types::make_shared<ChLinkLockPrismatic>();
         link->Initialize( cb.body, parent, true, frameChild, frameParent );
         cm.sys.AddLink( link );
+    }
+
+    // Loop-closing joints (RBDA ch. 8): body1 = successor, body2 =
+    // predecessor, matching the .mech convention that point-on-line pins the
+    // SUCCESSOR's point to the PREDECESSOR's line (marker 1 is the point,
+    // marker 2 the line, in Chrono's point-line formulation). Marker frames
+    // are local, so an unassembled build configuration is harmless: every
+    // trial repositions the bodies to a closure-projected state first.
+    for ( int l = 0 ; l < mdl->nloop ; l++ ) {
+        const ModelLoop *lp = &mdl->loop[ l ];
+        std::shared_ptr<ChBody> pb = lp->pred == -1 ? cm.ground : cm.bod[ lp->pred ].body;
+        std::shared_ptr<ChBody> sb = lp->succ == -1 ? cm.ground : cm.bod[ lp->succ ].body;
+        ChVector3d pCg = lp->pred == -1 ? ChVector3d( 0, 0, 0 ) : cm.bod[ lp->pred ].cg;
+        ChVector3d sCg = lp->succ == -1 ? ChVector3d( 0, 0, 0 ) : cm.bod[ lp->succ ].cg;
+
+        ChQuaterniond A = lp->jtype == JOINT_POINTONLINE ? xToAxis( lp->axis ) : zToAxis( lp->axis );
+        ChFramed frameSucc( v3( lp->stree ) - sCg, A );
+        ChFramed framePred( v3( lp->ptree ) - pCg, A );
+
+        std::shared_ptr<ChLinkLock> link;
+        switch ( lp->jtype ) {
+            case JOINT_REVOLUTE:    link = chrono_types::make_shared<ChLinkLockRevolute>();    break;
+            case JOINT_PRISMATIC:   link = chrono_types::make_shared<ChLinkLockPrismatic>();   break;
+            case JOINT_CYLINDRICAL: link = chrono_types::make_shared<ChLinkLockCylindrical>(); break;
+            case JOINT_SPHERICAL:   link = chrono_types::make_shared<ChLinkLockSpherical>();   break;
+            default:                link = chrono_types::make_shared<ChLinkLockPointLine>();   break;
+        }
+        link->Initialize( sb, pb, true, frameSucc, framePred );
+        cm.sys.AddLink( link );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Closure projection for loop models: random states do not satisfy the loop
+// constraints, and comparing constrained dynamics at a torn-open
+// configuration is meaningless (each side would fight the violation with its
+// own stabilization). fd_dense_full exposes delta (the position error, with
+// K = d(delta)/dq to first order), so Newton with minimal-norm updates
+// dq = -K^T (K K^T)^-1 delta pulls q onto the manifold, and the same
+// projector applied to K qd makes the velocity consistent.
+//
+// Coordinate note: the projector indexes q by velocity coordinate, which is
+// only valid while nq == nv. Loop models with floating bodies would need the
+// quaternion tangent map here.
+// ---------------------------------------------------------------------------
+static int projectClosure( const Model *mdl, double *q ) {
+    if ( !mdl->nloop ) return 0;
+    static double K[ MODEL_MAX_NC * MODEL_MAX_V ];
+    double delta[ MODEL_MAX_NC ], qdd[ MODEL_MAX_V ];
+    double zeroV[ MODEL_MAX_V ] = { 0 }, zeroF[ MODEL_MAX_BODIES * 6 ] = { 0 };
+    int nc = mdl->nc, nv = mdl->nv;
+
+    for ( int iter = 0 ; iter < 100 ; iter++ ) {
+        fd_dense_full( mdl, q, zeroV, zeroV, zeroF, qdd, K, delta );
+        double n2 = 0;
+        for ( int c = 0 ; c < nc ; c++ ) n2 += delta[c] * delta[c];
+        if ( sqrt( n2 ) < 1e-12 ) return 0;
+
+        double G[ MODEL_MAX_NC * MODEL_MAX_NC ], rhs[ MODEL_MAX_NC ], lam[ MODEL_MAX_NC ];
+        for ( int r = 0 ; r < nc ; r++ ) {
+            rhs[r] = delta[r];
+            for ( int c = 0 ; c < nc ; c++ ) {
+                double s = 0;
+                for ( int k = 0 ; k < nv ; k++ ) s += K[ r*nv + k ] * K[ c*nv + k ];
+                G[ r*nc + c ] = s;
+            }
+        }
+        linsolve( nc, G, rhs, lam );
+        for ( int k = 0 ; k < nv ; k++ ) {
+            double s = 0;
+            for ( int c = 0 ; c < nc ; c++ ) s += K[ c*nv + k ] * lam[c];
+            q[k] -= s;
+        }
+    }
+    return 1;
+}
+
+static void projectVelocity( const Model *mdl, const double *q, double *qd ) {
+    if ( !mdl->nloop ) return;
+    static double K[ MODEL_MAX_NC * MODEL_MAX_V ];
+    double qdd[ MODEL_MAX_V ];
+    double zeroV[ MODEL_MAX_V ] = { 0 }, zeroF[ MODEL_MAX_BODIES * 6 ] = { 0 };
+    int nc = mdl->nc, nv = mdl->nv;
+    fd_dense_full( mdl, q, zeroV, zeroV, zeroF, qdd, K, NULL );
+
+    double G[ MODEL_MAX_NC * MODEL_MAX_NC ], rhs[ MODEL_MAX_NC ], lam[ MODEL_MAX_NC ];
+    for ( int r = 0 ; r < nc ; r++ ) {
+        rhs[r] = 0;
+        for ( int k = 0 ; k < nv ; k++ ) rhs[r] += K[ r*nv + k ] * qd[k];
+        for ( int c = 0 ; c < nc ; c++ ) {
+            double s = 0;
+            for ( int k = 0 ; k < nv ; k++ ) s += K[ r*nv + k ] * K[ c*nv + k ];
+            G[ r*nc + c ] = s;
+        }
+    }
+    linsolve( nc, G, rhs, lam );
+    for ( int k = 0 ; k < nv ; k++ ) {
+        double s = 0;
+        for ( int c = 0 ; c < nc ; c++ ) s += K[ c*nv + k ] * lam[c];
+        qd[k] -= s;
     }
 }
 
@@ -524,7 +634,11 @@ static int crossCheck( const Model *mdl, const char *path ) {
 
         // Staging: t0 at rest, then add random q, qd, tau, fext one at a time
         // so a convention mismatch points at the term that introduced it.
-        for ( int k = 0 ; k < nq ; k++ ) q[k]   = ( t == 0 ) ? 0 : 3.0 * frand();
+        // Loop models always draw random q (a staged q = 0 can sit at a
+        // variable-mobility singularity -- see src/validate/main.c) and are
+        // then projected onto the closure manifold: constrained dynamics is
+        // only comparable at states that satisfy the constraints.
+        for ( int k = 0 ; k < nq ; k++ ) q[k]   = ( t == 0 && !mdl->nloop ) ? 0 : 3.0 * frand();
         for ( int k = 0 ; k < nv ; k++ ) qd[k]  = ( t <= 1 ) ? 0 : 2.0 * frand();
         for ( int k = 0 ; k < nv ; k++ ) tau[k] = ( t <= 2 ) ? 0 : 5.0 * frand();
         for ( int k = 0 ; k < nb * 6 ; k++ )
@@ -532,6 +646,14 @@ static int crossCheck( const Model *mdl, const char *path ) {
         if ( t == 0 )
             for ( int i = 0 ; i < nb ; i++ )
                 if ( mdl->body[i].jtype == JOINT_FLOATING ) q[ mdl->qidx[i] ] = 1.0;
+
+        if ( mdl->nloop ) {
+            if ( projectClosure( mdl, q ) ) {
+                fprintf( stderr, "chrono_check: closure projection failed to converge at trial %d\n", t );
+                return 1;
+            }
+            projectVelocity( mdl, q, qd );
+        }
 
         setChronoState( mdl, cm, q, qd, tau, fext, kin );
         if ( !solveAccelerations( cm.sys ) ) {
@@ -613,6 +735,13 @@ static void initialState( const Model *mdl, double *q, double *qd ) {
         double *qs = q + mdl->qidx[ i ];
         qs[0] = 0.9; qs[1] = 0.2; qs[2] = -0.3; qs[3] = 0.1; // normalized on use
         qs[4] = 0.0; qs[5] = 0.0; qs[6] = 0.0;
+    }
+
+    // Loop models: pull the deterministic state onto the closure manifold so
+    // both simulations start from an assembled mechanism.
+    if ( mdl->nloop ) {
+        projectClosure( mdl, q );
+        projectVelocity( mdl, q, qd );
     }
 }
 
@@ -726,6 +855,10 @@ int main( int argc, char **argv ) {
     const char *unsup = modelUnsupported( &mdl );
     if ( unsup ) {
         fprintf( stderr, "chrono_check: %s\n", unsup );
+        return 1;
+    }
+    if ( mdl.nloop && mdl.nq != mdl.nv ) {
+        fprintf( stderr, "chrono_check: closure projection does not support floating bodies yet (nq != nv)\n" );
         return 1;
     }
     // This binary links one model's generated dynamics; catch a mismatch

@@ -1,0 +1,51 @@
+# Planar four-bar linkage (RBDA ch. 8): the canonical closed-loop test.
+# Spanning tree = crank -> coupler -> rocker off the fixed base; the loop
+# joint reconnects the rocker's far end to the ground pivot at (2, 0, 0).
+#
+# Ground g = 2.0, crank a = 0.5, coupler b = 1.5, rocker c = 1.2 satisfies
+# Grashof (0.5 + 2.0 < 1.5 + 1.2), so the crank turns fully.
+#
+# The loop is closed with point-on-line, NOT revolute: a planar loop closed
+# by a revolute is overconstrained (nc = 5, rank(K) = 2) and this pipeline
+# requires properly constrained loops (see src/model/model.h). point-on-line
+# about z constrains exactly the two in-plane translations at the pivot:
+# nc = 2 = rank(K).
+#
+# n = 3 tree DOF - 2 constraints = mobility 1, as a four-bar should have.
+
+gravity 0 0 -9.81
+stab 0.05
+
+body                     # 0: crank, ground pivot at the origin
+parent -1
+joint revolute z
+tree 0 0 0
+mass 1.0
+cg 0.25 0 0
+inertia 0.02 0.03 0.03 0 0 0
+fext 1
+
+body                     # 1: coupler, hangs off the crank tip
+parent 0
+joint revolute z
+tree 0.5 0 0
+mass 2.0
+cg 0.75 0.05 0
+inertia 0.05 0.4 0.4 0.01 0 0
+fext 0
+
+body                     # 2: rocker, hangs off the coupler tip
+parent 1
+joint revolute z
+tree 1.5 0 0
+mass 1.5
+cg 0.6 0 0
+inertia 0.03 0.2 0.2 0 0 0
+fext 1
+
+loop                     # rocker far end back to the ground pivot at (2,0,0)
+predecessor -1
+successor 2
+joint point-on-line z
+ptree 2.0 0 0
+stree 1.2 0 0

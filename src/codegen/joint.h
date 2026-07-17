@@ -5,6 +5,14 @@
 #define J_PRISMATIC 1
 #define J_FLOATING 2   // genuine 6-DOF joint: quaternion orientation, S = identity(6)
 
+// Loop-joint types (RBDA ch. 8): these close kinematic loops and impose
+// constraints instead of adding coordinates, so they never appear as tree
+// joints. nc = 6 minus the joint's motion freedoms; see loopNc() in
+// gen_loops.h.
+#define J_CYLINDRICAL 3
+#define J_SPHERICAL   4
+#define J_POINTONLINE 5  // sphere-in-cylinder: 2 constraints, closes planar loops without redundancy
+
 // typedef struct {
 //     uint8_t type;
 //     uint8_t dof;

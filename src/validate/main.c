@@ -11,6 +11,37 @@ void fwd_dyn_crba( double *q, double *qd, double *tau, double *fext, double *out
 extern const int fwd_dyn_crba_nq;
 extern const int fwd_dyn_crba_nv;
 
+// Numerical rank of the nc x nv constraint matrix K by Gaussian elimination
+// with full pivoting. The pipeline requires properly constrained loops
+// (rank = nc); anything less means redundant constraints and a singular
+// K H^-1 K^T, which the generated method-2 solve cannot handle.
+static int rankK( int nc, int nv, const double *Kin ) {
+    double K[ MODEL_MAX_NC ][ MODEL_MAX_V ];
+    for ( int r = 0 ; r < nc ; r++ )
+    for ( int c = 0 ; c < nv ; c++ ) K[r][c] = Kin[ r*nv + c ];
+
+    double maxAbs = 0;
+    for ( int r = 0 ; r < nc ; r++ )
+    for ( int c = 0 ; c < nv ; c++ ) if ( fabs( K[r][c] ) > maxAbs ) maxAbs = fabs( K[r][c] );
+    double tol = 1e-8 * ( maxAbs > 0 ? maxAbs : 1.0 );
+
+    int rank = 0;
+    for ( int step = 0 ; step < nc ; step++ ) {
+        int pr = -1, pc = -1;
+        double best = tol;
+        for ( int r = step ; r < nc ; r++ )
+        for ( int c = 0 ; c < nv ; c++ ) if ( fabs( K[r][c] ) > best ) { best = fabs( K[r][c] ); pr = r; pc = c; }
+        if ( pr < 0 ) break;
+        rank++;
+        for ( int c = 0 ; c < nv ; c++ ) { double t = K[step][c]; K[step][c] = K[pr][c]; K[pr][c] = t; }
+        for ( int r = step + 1 ; r < nc ; r++ ) {
+            double f = K[r][pc] / K[step][pc];
+            for ( int c = 0 ; c < nv ; c++ ) K[r][c] -= f * K[step][c];
+        }
+    }
+    return rank;
+}
+
 int main( int argc, char **argv ) {
     const char *path = argc > 1 ? argv[ 1 ] : "../models/threelink.mech";
     Model mdl;
@@ -41,7 +72,13 @@ int main( int argc, char **argv ) {
         double fext[ MODEL_MAX_BODIES * 6 ];
 
         // First trials pin down special cases; the rest are fully random.
-        for ( int k = 0 ; k < nq ; k++ ) q[k]   = ( t == 0 ) ? 0 : 3.0 * frand();
+        // Loop models always draw random q: a staged q = 0 can sit at a
+        // variable-mobility singularity (RBDA sec 8.10, e.g. a four-bar with
+        // all links collinear), where rank(K) legitimately drops and the
+        // method-2 solve is undefined. Random configurations hit such
+        // singular sets with probability zero, so the rank check below then
+        // really does detect structural overconstraint only.
+        for ( int k = 0 ; k < nq ; k++ ) q[k]   = ( t == 0 && !mdl.nloop ) ? 0 : 3.0 * frand();
         for ( int k = 0 ; k < nv ; k++ ) qd[k]  = ( t <= 1 ) ? 0 : 2.0 * frand();
         for ( int k = 0 ; k < nv ; k++ ) tau[k] = ( t <= 2 ) ? 0 : 5.0 * frand();
         for ( int k = 0 ; k < nb * 6 ; k++ )
@@ -56,8 +93,20 @@ int main( int argc, char **argv ) {
         }
 
         double qddGen[ MODEL_MAX_V ], qddRef[ MODEL_MAX_V ];
+        static double K[ MODEL_MAX_NC * MODEL_MAX_V ];
         fwd_dyn_crba( q, qd, tau, fext, qddGen );
-        fd_dense( &mdl, q, qd, tau, fext, qddRef );
+        fd_dense_full( &mdl, q, qd, tau, fext, qddRef, mdl.nloop ? K : NULL, NULL );
+
+        if ( mdl.nloop ) {
+            int r = rankK( mdl.nc, nv, K );
+            if ( r < mdl.nc ) {
+                fprintf( stderr, "validate: FAIL: rank(K) = %d < nc = %d at trial %d -- the loop joints\n"
+                                 "impose redundant constraints (RBDA sec 8.10). Close the loop with a\n"
+                                 "joint imposing fewer constraints (e.g. point-on-line for planar loops).\n",
+                         r, mdl.nc, t );
+                return 1;
+            }
+        }
 
         for ( int k = 0 ; k < nv ; k++ ) {
             // Scaled error: absolute for O(1) values, relative for large

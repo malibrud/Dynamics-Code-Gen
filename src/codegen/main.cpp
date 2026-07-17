@@ -9,6 +9,7 @@
 #include "gen_fwd_dyn_crba.h"
 #include "gen_rnea.h"
 #include "gen_crba.h"
+#include "gen_loops.h"
 #include "gen_solve_qdd.h"
 
 int main( int argc, char **argv ) {
@@ -72,6 +73,28 @@ int main( int argc, char **argv ) {
     sys.nq = mdl.nq;
     sys.nv = mdl.nv;
 
+    // Loop joints (RBDA ch. 8): constraints only, no coordinates.
+    sys.stab = mdl.stab;
+    for ( int l = 0 ; l < mdl.nloop ; l++ ) {
+        ModelLoop *lp = &mdl.loop[ l ];
+        System::SysLoop sl;
+        sl.pred = lp->pred;
+        sl.succ = lp->succ;
+        sl.axis = lp->axis;
+        switch ( lp->jtype ) {
+            case JOINT_REVOLUTE:    sl.jtype = J_REVOLUTE;    break;
+            case JOINT_PRISMATIC:   sl.jtype = J_PRISMATIC;   break;
+            case JOINT_CYLINDRICAL: sl.jtype = J_CYLINDRICAL; break;
+            case JOINT_SPHERICAL:   sl.jtype = J_SPHERICAL;   break;
+            default:                sl.jtype = J_POINTONLINE; break;
+        }
+        for ( int k = 0 ; k < 3 ; k++ ) {
+            sl.ptree[ k ] = lp->ptree[ k ];
+            sl.stree[ k ] = lp->stree[ k ];
+        }
+        sys.loops.push_back( sl );
+    }
+
     // sys.grav seeds the RNEA acceleration recursion with -a_grav, so negate
     // the physical gravity from the file. numStr keeps zero components "0".
     for ( int k = 0 ; k < 3 ; k++ ) sys.grav.v[ 3 + k ] = numStr( -mdl.gravity[ k ] );
@@ -82,11 +105,12 @@ int main( int argc, char **argv ) {
         fprintf( stderr, "codegen: cannot write '%s'\n", outPath );
         return 1;
     }
-    gen_prelude( f );
+    gen_prelude( f, mdl.nloop > 0 );
     gen_fwd_dyn_crba( f, &sys );
     gen_body_inertias( f, &sys );
     gen_rnea_C( f, &sys );
     gen_crba_H( f, &sys );
+    gen_loops( f, &sys );
     gen_solve_qdd( f, &sys );
     fclose( f );
 

@@ -50,6 +50,23 @@ struct System{
     // gravity vector, set by the caller.
     Svec grav;
 
+    // Kinematic loops (RBDA ch. 8). Loop joints add constraints, never
+    // coordinates. gen_loops() fills Kentry/kfulName with the emitted temp
+    // names (or "0" for structural zeros) that gen_solve_qdd() assembles
+    // into the method-2 solve.
+    struct SysLoop {
+        int pred, succ;        // body indices; -1 = fixed base
+        uint8_t jtype;         // J_REVOLUTE .. J_POINTONLINE
+        char axis;             // 'x' | 'y' | 'z'; unused for spherical
+        double ptree[3];       // predecessor body frame -> loop joint frame
+        double stree[3];       // successor body frame -> loop joint frame
+    };
+    vector<SysLoop> loops;
+    double stab = 0.1;             // Baumgarte Tstab; alpha = beta = 1/stab
+    int nc = 0;                    // total constraint rows, set by gen_loops()
+    vector<vector<string>> Kentry; // nc x nv expressions ("0" = structural zero)
+    vector<string> kfulName;       // nc RHS temps (k + kstab of RBDA eq 8.35)
+
     System(): System(0) {}
     System( int N )
         :nBod( N )

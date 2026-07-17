@@ -43,6 +43,13 @@ directly, rather than shelling out to a C compiler.
     code reproduces |linear qdd| = 9.81 with zero angular and joint
     acceleration at every attitude — including the ones that were
     ill-conditioned for the earlier Euler-chain formulation
+  - `fourbar` — planar four-bar linkage, the canonical closed kinematic
+    loop (RBDA ch. 8): crank–coupler–rocker spanning tree, loop closed
+    back to the ground pivot with a `point-on-line` joint (see
+    [Closed loops](#closed-kinematic-loops) below)
+  - `rrrs` — spatial RRRS loop: four revolute tree joints with mixed axes
+    and 3D offsets, closed by a `spherical` loop joint; properly
+    constrained with nc = 3 = rank(K), mobility 1
 - `src/model` — the shared model-file parser (plain C, header-only), used
   by the generator, the validator, and the benchmark, so all three always
   agree on the mechanism.
@@ -124,6 +131,61 @@ directly, rather than shelling out to a C compiler.
 - `references/` — course notes, slides, and the `spatial_v2` MATLAB
   reference implementation this project is checked against. Not checked into
   git (see `.gitignore`).
+
+## Closed kinematic loops
+
+Mechanisms may contain kinematic loops (RBDA ch. 8). The bodies always form
+a spanning tree; a `loop` block in the `.mech` file adds a loop-closing
+joint between two existing bodies (or a body and the base). Loop joints
+impose **constraints, never coordinates** — nq/nv are untouched — and the
+dynamics becomes method 2 of RBDA sec 8.5: with the loop Jacobian K and the
+acceleration-level RHS k + kstab (Table 8.4, computed in base coordinates),
+solve
+
+```
+A lambda = k + kstab - K qdd0        A = K H^-1 K^T,  qdd0 = H^-1 (tau - C)
+H qdd    = tau - C + K^T lambda
+```
+
+One Gaussian elimination of H serves qdd0 and all columns of H^-1 K^T
+(`solveLinearSystemM` in the generated code), and everything before the
+solve — K's epsilon structure (only tree joints on the loop's two root
+paths get entries, RBDA eq 8.18–8.20), the Table 8.1 position-error
+formulae, the axis alignment — is symbolic, so loop constraints get the
+same structural-sparsity treatment as the tree dynamics.
+
+Loop joint types and the constraints they impose: `revolute`/`prismatic`
+(5), `cylindrical` (4), `spherical` (3), `point-on-line` (2, the book's
+sphere-in-cylinder). Two properties worth knowing:
+
+- **Loops must be properly constrained: rank(K) = nc.** Any planar loop
+  closed by a revolute is overconstrained (nc = 5, rank 2 — RBDA sec 8.10),
+  which makes A singular; the validator computes rank(K) at every random
+  trial and fails the build with a pointer to the fix: close planar loops
+  with `point-on-line`, which constrains exactly the two translations
+  perpendicular to its axis. Isolated variable-mobility singularities
+  (e.g. a four-bar with all links collinear) are fine — random states hit
+  them with probability zero, which is also why loop models draw random q
+  in every validation trial instead of staging q = 0.
+- **Baumgarte stabilization** (RBDA sec 8.3) with alpha = beta = 1/Tstab is
+  baked into the generated k + kstab; `stab <Tstab>` in the model file
+  (default 0.1 s) sets the error-decay time constant. Torn-open states are
+  pulled back onto the closure manifold exponentially; at consistent
+  states the terms vanish.
+
+`point-on-line`'s constraint-force basis T is fixed to the *predecessor*
+frame (its constraint directions follow the predecessor's axis), unlike the
+Table 8.1 types whose T is successor-fixed; RBDA eq 8.47 for k is unchanged
+either way by cross-product antisymmetry — see `loopJcalc` in
+`src/validate/dense.h`, whose header comment carries the derivation. Its
+position error is exact (recovered from rho~ = -E^T B), not small-angle.
+
+The Chrono cross-check builds loop joints as Chrono constraint links
+(point-on-line's free axis is marker x there, not z) and Newton-projects
+each random trial state onto the closure manifold first — comparing
+constrained dynamics at torn-open states would just compare stabilization
+schemes. Both loop models agree with Chrono to ~1e-9 on accelerations and
+track its trajectories with the expected first-order truncation ratio.
 
 ## Conventions
 

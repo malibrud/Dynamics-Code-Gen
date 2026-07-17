@@ -1,0 +1,55 @@
+# Spatial RRRS loop: four revolute tree joints with mixed axes and 3D
+# offsets, closed by a spherical loop joint pinning a point of body 3 to a
+# point of the base. Unlike the planar four-bar, this loop is properly
+# constrained with a full-rank spherical closure: nc = 3 = rank(K)
+# (generic spatial geometry, no planar redundancy), mobility = 4 - 3 = 1.
+#
+# The geometry is arranged to close exactly at q = 0: body 3's frame sits at
+# (1.9, 0.1, 0.6) with all joints at zero, so the anchor point stree =
+# (0.4, 0.2, -0.1) lands at (2.3, 0.3, 0.5) = ptree on the base.
+
+gravity 0 0 -9.81
+stab 0.05
+
+body                     # 0
+parent -1
+joint revolute z
+tree 0 0 0
+mass 1.2
+cg 0.4 0 0.1
+inertia 0.05 0.08 0.08 0.01 0 0
+fext 1
+
+body                     # 1
+parent 0
+joint revolute x
+tree 0.8 0 0.2
+mass 0.8
+cg 0.3 0.15 0
+inertia 0.04 0.03 0.05 0 0.005 0
+fext 0
+
+body                     # 2
+parent 1
+joint revolute y
+tree 0.6 0.3 0
+mass 1.5
+cg 0.25 -0.1 0.2
+inertia 0.09 0.07 0.06 0.01 0 0.005
+fext 1
+
+body                     # 3
+parent 2
+joint revolute x
+tree 0.5 -0.2 0.4
+mass 0.6
+cg 0.2 0.1 -0.05
+inertia 0.02 0.03 0.025 0 0 0
+fext 1
+
+loop                     # body 3's far point back to a base anchor
+predecessor -1
+successor 3
+joint spherical
+ptree 2.3 0.3 0.5
+stree 0.4 0.2 -0.1

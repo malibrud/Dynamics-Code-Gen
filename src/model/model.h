@@ -73,6 +73,36 @@
 //   fext <0|1>                   1 = generate support for an external spatial
 //                                force on this body
 //
+// Kinematic loops (RBDA ch. 8)
+// ----------------------------
+// After the bodies, a mechanism may declare loop-closing joints. The bodies
+// always form a spanning tree; a loop joint adds CONSTRAINTS between two
+// existing bodies, never coordinates, so nq/nv are untouched (method 2 of
+// RBDA sec 8.5: solve for the constraint forces lambda first).
+//
+//   stab <Tstab>                 global: Baumgarte stabilization time constant
+//                                in seconds (RBDA sec 8.3, alpha = beta =
+//                                1/Tstab). Default 0.1.
+//
+//   loop                         starts a loop joint
+//   predecessor <p>              body index, or -1 for the fixed base
+//   successor <s>                body index, or -1 for the fixed base
+//   joint <type> [axis]          type: revolute | prismatic | cylindrical |
+//                                spherical | point-on-line
+//                                axis: x | y | z (all types except spherical)
+//   ptree <x> <y> <z>            translation, predecessor body frame -> loop
+//                                joint frame (RBDA's XP)
+//   stree <x> <y> <z>            translation, successor body frame -> loop
+//                                joint frame (RBDA's XS)
+//
+// A loop joint imposes nc constraints: revolute/prismatic 5, cylindrical 4,
+// spherical 3, point-on-line 2. point-on-line is RBDA sec 8.10's
+// sphere-in-cylinder: it constrains only the two translations perpendicular
+// to the axis, and exists so planar loops can be closed WITHOUT redundant
+// constraints -- a planar loop closed by a revolute has rank(K) = 2 < nc = 5,
+// which this pipeline rejects (the validator checks rank(K) = nc and fails
+// the build; see README). Close planar loops with point-on-line.
+//
 // All joint types parse; which ones a given consumer implements is up to it
 // (see modelUnsupported below for the current single-DOF pipeline).
 
@@ -91,6 +121,7 @@ typedef enum {
     JOINT_CYLINDRICAL,
     JOINT_SPHERICAL,
     JOINT_FLOATING,    // genuine 6-DOF joint, quaternion orientation
+    JOINT_POINTONLINE, // sphere-in-cylinder; loop joints only
 } ModelJointType;
 
 typedef struct {
@@ -104,6 +135,18 @@ typedef struct {
     int hasFext;
 } ModelBody;
 
+#define MODEL_MAX_LOOPS 8
+#define MODEL_MAX_NC ( MODEL_MAX_LOOPS * 5 ) // worst case: every loop revolute/prismatic
+
+typedef struct {
+    int pred;              // predecessor body index; -1 = base
+    int succ;              // successor body index; -1 = base
+    ModelJointType jtype;  // constraint pattern only; a loop joint has no q/qd
+    char axis;             // 'x' | 'y' | 'z'; 0 for spherical
+    double ptree[3];       // translation, predecessor body frame -> loop joint frame (XP)
+    double stree[3];       // translation, successor body frame -> loop joint frame (XS)
+} ModelLoop;
+
 typedef struct {
     int nbod;
     int nq;                // total position coordinates (7 per floating body, 1 otherwise)
@@ -112,10 +155,27 @@ typedef struct {
     int vidx[ MODEL_MAX_BODIES ]; // body i's first slot in qd / tau / out_qdd
     double gravity[3];     // physical gravity
     ModelBody body[ MODEL_MAX_BODIES ];
+    int nloop;
+    int nc;                // total loop constraints, sum of modelLoopNc
+    int cidx[ MODEL_MAX_LOOPS ];  // loop l's first constraint row in K / lambda
+    double stab;           // Baumgarte time constant Tstab (s); alpha = beta = 1/stab
+    ModelLoop loop[ MODEL_MAX_LOOPS ];
 } Model;
 
 static int modelBodyNq( const ModelBody *b ) { return b->jtype == JOINT_FLOATING ? 7 : 1; }
 static int modelBodyNv( const ModelBody *b ) { return b->jtype == JOINT_FLOATING ? 6 : 1; }
+
+// Constraints imposed by a loop joint (6 minus its motion freedoms).
+static int modelLoopNc( const ModelLoop *l ) {
+    switch ( l->jtype ) {
+        case JOINT_REVOLUTE:
+        case JOINT_PRISMATIC:   return 5;
+        case JOINT_CYLINDRICAL: return 4;
+        case JOINT_SPHERICAL:   return 3;
+        case JOINT_POINTONLINE: return 2;
+        default:                return 0; // unreachable; floating rejected at parse
+    }
+}
 
 // Loads a mechanism file. Returns 0 on success; on failure returns nonzero
 // and writes a message (with file/line context) into err.
@@ -127,7 +187,9 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
     }
 
     memset( m, 0, sizeof *m );
+    m->stab = 0.1;
     ModelBody *cur = NULL;
+    ModelLoop *curLoop = NULL;
     char line[ 512 ];
     int lineNo = 0;
 
@@ -145,16 +207,74 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
             if ( sscanf( rest, "%lf %lf %lf", &m->gravity[0], &m->gravity[1], &m->gravity[2] ) != 3 ) goto badArgs;
             continue;
         }
+        if ( !strcmp( key, "stab" ) ) {
+            if ( sscanf( rest, "%lf", &m->stab ) != 1 ) goto badArgs;
+            continue;
+        }
         if ( !strcmp( key, "body" ) ) {
             if ( m->nbod >= MODEL_MAX_BODIES ) {
                 snprintf( err, errSize, "%s:%d: too many bodies (max %d)", path, lineNo, MODEL_MAX_BODIES );
                 goto fail;
             }
             cur = &m->body[ m->nbod++ ];
+            curLoop = NULL;
             memset( cur, 0, sizeof *cur );
             cur->parent = -1;
             cur->jtype = JOINT_REVOLUTE;
             cur->axis = 'z';
+            continue;
+        }
+        if ( !strcmp( key, "loop" ) ) {
+            if ( m->nloop >= MODEL_MAX_LOOPS ) {
+                snprintf( err, errSize, "%s:%d: too many loops (max %d)", path, lineNo, MODEL_MAX_LOOPS );
+                goto fail;
+            }
+            curLoop = &m->loop[ m->nloop++ ];
+            cur = NULL;
+            memset( curLoop, 0, sizeof *curLoop );
+            curLoop->pred = -2; // "unset" so validation can insist both ends are given
+            curLoop->succ = -2;
+            curLoop->jtype = JOINT_REVOLUTE;
+            curLoop->axis = 'z';
+            continue;
+        }
+
+        // Loop-block keys.
+        if ( curLoop ) {
+            if ( !strcmp( key, "predecessor" ) ) {
+                if ( sscanf( rest, "%d", &curLoop->pred ) != 1 ) goto badArgs;
+            } else if ( !strcmp( key, "successor" ) ) {
+                if ( sscanf( rest, "%d", &curLoop->succ ) != 1 ) goto badArgs;
+            } else if ( !strcmp( key, "joint" ) ) {
+                char type[ 32 ] = "", axis[ 8 ] = "";
+                int n = sscanf( rest, "%31s %7s", type, axis );
+                if ( n < 1 ) goto badArgs;
+                if      ( !strcmp( type, "revolute" ) )      curLoop->jtype = JOINT_REVOLUTE;
+                else if ( !strcmp( type, "prismatic" ) )     curLoop->jtype = JOINT_PRISMATIC;
+                else if ( !strcmp( type, "cylindrical" ) )   curLoop->jtype = JOINT_CYLINDRICAL;
+                else if ( !strcmp( type, "spherical" ) )     curLoop->jtype = JOINT_SPHERICAL;
+                else if ( !strcmp( type, "point-on-line" ) ) curLoop->jtype = JOINT_POINTONLINE;
+                else {
+                    snprintf( err, errSize, "%s:%d: unknown loop joint type '%s'", path, lineNo, type );
+                    goto fail;
+                }
+                if ( curLoop->jtype == JOINT_SPHERICAL ) {
+                    curLoop->axis = 0;
+                } else {
+                    if ( n < 2 || axis[1] != 0 || ( axis[0] != 'x' && axis[0] != 'y' && axis[0] != 'z' ) ) {
+                        snprintf( err, errSize, "%s:%d: loop joint '%s' needs an axis of x, y, or z", path, lineNo, type );
+                        goto fail;
+                    }
+                    curLoop->axis = axis[0];
+                }
+            } else if ( !strcmp( key, "ptree" ) ) {
+                if ( sscanf( rest, "%lf %lf %lf", &curLoop->ptree[0], &curLoop->ptree[1], &curLoop->ptree[2] ) != 3 ) goto badArgs;
+            } else if ( !strcmp( key, "stree" ) ) {
+                if ( sscanf( rest, "%lf %lf %lf", &curLoop->stree[0], &curLoop->stree[1], &curLoop->stree[2] ) != 3 ) goto badArgs;
+            } else {
+                snprintf( err, errSize, "%s:%d: unknown keyword '%s' in loop block", path, lineNo, key );
+                goto fail;
+            }
             continue;
         }
 
@@ -231,6 +351,27 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
                       path, i );
             return 1;
         }
+        if ( b->jtype == JOINT_POINTONLINE ) {
+            snprintf( err, errSize, "%s: body %d: point-on-line is a loop joint type, not a tree joint",
+                      path, i );
+            return 1;
+        }
+    }
+    for ( int l = 0 ; l < m->nloop ; l++ ) {
+        ModelLoop *lp = &m->loop[ l ];
+        if ( lp->pred < -1 || lp->pred >= m->nbod || lp->succ < -1 || lp->succ >= m->nbod ) {
+            snprintf( err, errSize, "%s: loop %d: predecessor/successor must both be set, to -1 (base) or a body index 0..%d",
+                      path, l, m->nbod - 1 );
+            return 1;
+        }
+        if ( lp->pred == lp->succ ) {
+            snprintf( err, errSize, "%s: loop %d: predecessor and successor must differ", path, l );
+            return 1;
+        }
+    }
+    if ( m->stab <= 0 ) {
+        snprintf( err, errSize, "%s: stab must be positive", path );
+        return 1;
     }
 
     // Position/velocity coordinate layout: floating bodies take 7 q slots
@@ -247,6 +388,15 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
     }
     m->nq = qi;
     m->nv = vi;
+
+    // Constraint-row layout: loop l owns rows cidx[l] .. cidx[l]+nc-1 of K.
+    int ci;
+    ci = 0;
+    for ( int l = 0 ; l < m->nloop ; l++ ) {
+        m->cidx[ l ] = ci;
+        ci += modelLoopNc( &m->loop[ l ] );
+    }
+    m->nc = ci;
     return 0;
 
 fail:

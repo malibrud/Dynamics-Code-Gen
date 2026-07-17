@@ -269,15 +269,120 @@ static void crf( const double v[6], double M[6][6] ) {
 }
 
 // ---------------------------------------------------------------------------
+// Loop-joint jcalc (RBDA Table 8.1 / sec 8.3): given the measured
+// predecessor->successor transform X = sXp of a loop joint (canonical axis =
+// z; the caller folds any x/y axis into XP/XS as a fixed rotation), returns
+// the constraint-force subspace T (6 x nc columns) and the position error
+// delta = T^T d, where d is the small displacement from where the successor
+// frame ought to be to where it actually is.
+//
+// For every Table 8.1 type, T is constant in SUCCESSOR coordinates and the
+// caller transforms it to base with Xs^T. point-on-line (sphere-in-cylinder,
+// not in Table 8.1) is the exception: its constraint directions follow the
+// predecessor's axis, so T is constant in PREDECESSOR coordinates and the
+// caller must use Xp^T instead (loopTInPred below). The k_l formula (RBDA eq
+// 8.47) is unchanged either way: Tdot = v x* T with v of whichever body T is
+// fixed to, and the cross-product antisymmetry makes both reductions agree.
+//
+// point-on-line's delta is exact, not small-angle: X = [E 0; -E*rho~ E] for
+// some rho (successor origin in predecessor coords), so rho~ = -E^T B
+// recovers the origin position exactly, and the error is its x/y part --
+// insensitive to the joint's free rotations and free z translation.
+// ---------------------------------------------------------------------------
+static int loopJcalc( ModelJointType t, const double X[6][6], double T[6][6], double delta[6] ) {
+    for ( int r = 0 ; r < 6 ; r++ )
+    for ( int c = 0 ; c < 6 ; c++ ) T[r][c] = 0;
+
+    switch ( t ) {
+    case JOINT_REVOLUTE:   // free: rotation z.  T = [e1 e2 e4 e5 e6]
+        T[0][0] = 1; T[1][1] = 1; T[3][2] = 1; T[4][3] = 1; T[5][4] = 1;
+        delta[0] = X[1][2];
+        delta[1] = -X[0][2];
+        delta[2] = X[4][2];
+        delta[3] = -X[3][2];
+        delta[4] = X[3][0]*X[1][0] + X[3][1]*X[1][1];
+        return 5;
+    case JOINT_PRISMATIC:  // free: translation z.  T = [e1 e2 e3 e4 e5]
+        T[0][0] = 1; T[1][1] = 1; T[2][2] = 1; T[3][3] = 1; T[4][4] = 1;
+        delta[0] = 0.5 * ( X[1][2] - X[2][1] );
+        delta[1] = 0.5 * ( X[2][0] - X[0][2] );
+        delta[2] = 0.5 * ( X[0][1] - X[1][0] );
+        delta[3] = X[4][2];
+        delta[4] = -X[3][2];
+        return 5;
+    case JOINT_CYLINDRICAL: // free: rotation z + translation z.  T = [e1 e2 e4 e5]
+        T[0][0] = 1; T[1][1] = 1; T[3][2] = 1; T[4][3] = 1;
+        delta[0] = X[1][2];
+        delta[1] = -X[0][2];
+        delta[2] = X[4][2];
+        delta[3] = -X[3][2];
+        return 4;
+    case JOINT_SPHERICAL:  // free: all rotations.  T = [e4 e5 e6]
+        T[3][0] = 1; T[4][1] = 1; T[5][2] = 1;
+        delta[0] = X[4][0]*X[2][0] + X[4][1]*X[2][1] + X[4][2]*X[2][2];
+        delta[1] = X[5][0]*X[0][0] + X[5][1]*X[0][1] + X[5][2]*X[0][2];
+        delta[2] = X[3][0]*X[1][0] + X[3][1]*X[1][1] + X[3][2]*X[1][2];
+        return 3;
+    default: {             // JOINT_POINTONLINE. free: rotations + translation z.
+        // T = [e4 e5] in PREDECESSOR coordinates (see header comment).
+        T[3][0] = 1; T[4][1] = 1;
+        // X = [E 0; B E] with B = -E*rho~, so rho~ = -E^T B, where rho is the
+        // successor origin in predecessor coords. With
+        // skew(rho) = [[0,-rz,ry],[rz,0,-rx],[-ry,rx,0]] (0-based indices):
+        //   rho_x = (rho~)[2][1] = -(E^T B)[2][1] = -sum_k E[k][2]*B[k][1]
+        //   rho_y = (rho~)[0][2] = -(E^T B)[0][2] = -sum_k E[k][0]*B[k][2]
+        double rx = 0, ry = 0;
+        for ( int k = 0 ; k < 3 ; k++ ) {
+            rx -= X[k][2] * X[k+3][1];
+            ry -= X[k][0] * X[k+3][2];
+        }
+        delta[0] = rx;
+        delta[1] = ry;
+        return 2;
+    }
+    }
+}
+
+// True if this loop type's T is fixed to the predecessor (transform with
+// Xp^T) rather than the successor (Xs^T).
+static int loopTInPred( ModelJointType t ) { return t == JOINT_POINTONLINE; }
+
+// Coordinate rotation E aligning the canonical loop-joint z axis with the
+// declared axis: E = R_axis^T where R_axis maps joint coords to body coords
+// by cyclic permutation (x: jz->bx, y: jz->by, z: identity). Cyclic keeps
+// the frames right-handed.
+static void axisAlignE( char axis, double E[3][3] ) {
+    for ( int r = 0 ; r < 3 ; r++ )
+    for ( int c = 0 ; c < 3 ; c++ ) E[r][c] = 0;
+    if ( axis == 'x' ) {        // R cols: jx->by, jy->bz, jz->bx
+        E[0][1] = 1; E[1][2] = 1; E[2][0] = 1;
+    } else if ( axis == 'y' ) { // R cols: jx->bz, jy->bx, jz->by
+        E[0][2] = 1; E[1][0] = 1; E[2][1] = 1;
+    } else {
+        E[0][0] = 1; E[1][1] = 1; E[2][2] = 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Dense forward dynamics: H*qdd = tau - C, with C from the RNEA (RBDA Table
 // 5.1, aJ = 0) and H from the CRBA (RBDA Table 6.4). Joints may have 1 DOF
 // (revolute/prismatic) or 6 (floating), so H is nv x nv with per-joint
 // blocks; q is addressed through mdl->qidx and qd/tau/qdd through mdl->vidx.
 // The large working arrays are static: fd_dense is not reentrant, but stays
 // comfortably off the stack even at MODEL_MAX_V.
+//
+// With kinematic loops (mdl->nloop > 0) this becomes RBDA ch. 8 method 2:
+// build K, k (Table 8.4, in base coordinates), solve A*lambda = b with
+// A = K H^-1 K^T (eq 8.38), then H qdd = tau - C + K^T lambda. K_out, if
+// non-NULL, receives the nc x nv constraint matrix (row-major) so callers
+// can rank-check it -- the pipeline requires properly constrained loops,
+// rank(K) = nc. delta_out, if non-NULL, receives the nc position errors
+// (Table 8.1's delta, stacked per loop): K is d(delta)/dq to first order,
+// so the pair supports Newton-projecting a state onto the closure manifold.
 // ---------------------------------------------------------------------------
-static void fd_dense( const Model *mdl, const double *q, const double *qd,
-                      const double *tau, const double *fext, double *qdd_out ) {
+static void fd_dense_full( const Model *mdl, const double *q, const double *qd,
+                           const double *tau, const double *fext, double *qdd_out,
+                           double *K_out, double *delta_out ) {
     int nb = mdl->nbod;
     int nv = mdl->nv;
     double Xup[ MODEL_MAX_BODIES ][6][6]; // i_X_lambda(i)
@@ -426,7 +531,7 @@ static void fd_dense( const Model *mdl, const double *q, const double *qd,
         }
     }
 
-    // Solve H qdd = tau - C.
+    // Solve H qdd0 = tau - C (the tree solution; final answer if no loops).
     static double A[ MODEL_MAX_V * MODEL_MAX_V ];
     double rhs[ MODEL_MAX_V ];
     for ( int r = 0 ; r < nv ; r++ ) {
@@ -434,6 +539,164 @@ static void fd_dense( const Model *mdl, const double *q, const double *qd,
         for ( int c = 0 ; c < nv ; c++ ) A[ r*nv + c ] = H[r][c];
     }
     linsolve( nv, A, rhs, qdd_out );
+
+    if ( mdl->nloop == 0 ) return;
+
+    // ---- Kinematic loops: RBDA Table 8.4, everything in base coordinates. --
+    int nc = mdl->nc;
+    double alpha = 1.0 / mdl->stab, beta = 1.0 / mdl->stab;
+    static double K[ MODEL_MAX_NC ][ MODEL_MAX_V ];
+    double kfull[ MODEL_MAX_NC ]; // k + kstab, i.e. the RHS of eq 8.35
+    for ( int r = 0 ; r < nc ; r++ )
+    for ( int c = 0 ; c < nv ; c++ ) K[r][c] = 0;
+
+    for ( int l = 0 ; l < mdl->nloop ; l++ ) {
+        const ModelLoop *lp = &mdl->loop[ l ];
+        int row = mdl->cidx[ l ];
+
+        // Xp = XP * p(k)_X_0, Xs = XS * s(k)_X_0; XP/XS fold the declared
+        // axis into a fixed rotation so the canonical jcalc axis is z.
+        double Eax[3][3], XP[6][6], XS[6][6], Xp[6][6], Xs[6][6];
+        axisAlignE( lp->axis, Eax );
+        plux( Eax, lp->ptree, XP );
+        plux( Eax, lp->stree, XS );
+        if ( lp->pred == -1 ) { for ( int r = 0 ; r < 6 ; r++ ) for ( int c = 0 ; c < 6 ; c++ ) Xp[r][c] = XP[r][c]; }
+        else                  m6_mul( XP, Xa[ lp->pred ], Xp );
+        if ( lp->succ == -1 ) { for ( int r = 0 ; r < 6 ; r++ ) for ( int c = 0 ; c < 6 ; c++ ) Xs[r][c] = XS[r][c]; }
+        else                  m6_mul( XS, Xa[ lp->succ ], Xs );
+
+        // Body velocity / velocity-product acceleration in base coordinates:
+        // v0 = (i_X_0)^-1 v_i, solved rather than inverted. The fixed base
+        // has v = 0 and avp = -a_grav (the RNEA seed) -- NOT zero, or the
+        // -ag offset fails to cancel in as - ap.
+        double vp6[6] = {0,0,0,0,0,0}, vs6[6] = {0,0,0,0,0,0}, ap6[6], as6[6];
+        for ( int k = 0 ; k < 6 ; k++ ) { ap6[k] = gravNeg[k]; as6[k] = gravNeg[k]; }
+        if ( lp->pred != -1 ) {
+            double M[36], b6[6];
+            for ( int r = 0 ; r < 6 ; r++ ) for ( int c = 0 ; c < 6 ; c++ ) M[ r*6 + c ] = Xa[ lp->pred ][r][c];
+            for ( int k = 0 ; k < 6 ; k++ ) b6[k] = v[ lp->pred ][k];
+            linsolve( 6, M, b6, vp6 );
+            for ( int r = 0 ; r < 6 ; r++ ) for ( int c = 0 ; c < 6 ; c++ ) M[ r*6 + c ] = Xa[ lp->pred ][r][c];
+            for ( int k = 0 ; k < 6 ; k++ ) b6[k] = avp[ lp->pred ][k];
+            linsolve( 6, M, b6, ap6 );
+        }
+        if ( lp->succ != -1 ) {
+            double M[36], b6[6];
+            for ( int r = 0 ; r < 6 ; r++ ) for ( int c = 0 ; c < 6 ; c++ ) M[ r*6 + c ] = Xa[ lp->succ ][r][c];
+            for ( int k = 0 ; k < 6 ; k++ ) b6[k] = v[ lp->succ ][k];
+            linsolve( 6, M, b6, vs6 );
+            for ( int r = 0 ; r < 6 ; r++ ) for ( int c = 0 ; c < 6 ; c++ ) M[ r*6 + c ] = Xa[ lp->succ ][r][c];
+            for ( int k = 0 ; k < 6 ; k++ ) b6[k] = avp[ lp->succ ][k];
+            linsolve( 6, M, b6, as6 );
+        }
+
+        // sXp of the loop joint, then [delta, T] = jcalc(type, Xs * Xp^-1).
+        double XpInv[6][6], sXp[6][6], Tloc[6][6], delta[6];
+        {
+            double M[36], col[6], e[6];
+            for ( int c = 0 ; c < 6 ; c++ ) {
+                for ( int r = 0 ; r < 36 ; r++ ) M[r] = 0;
+                for ( int r = 0 ; r < 6 ; r++ ) for ( int cc = 0 ; cc < 6 ; cc++ ) M[ r*6 + cc ] = Xp[r][cc];
+                for ( int k = 0 ; k < 6 ; k++ ) e[k] = ( k == c );
+                linsolve( 6, M, e, col );
+                for ( int r = 0 ; r < 6 ; r++ ) XpInv[r][c] = col[r];
+            }
+        }
+        m6_mul( Xs, XpInv, sXp );
+        int ncl = loopJcalc( lp->jtype, sXp, Tloc, delta );
+        if ( delta_out )
+            for ( int c = 0 ; c < ncl ; c++ ) delta_out[ row + c ] = delta[ c ];
+
+        // T to base coordinates: force vectors move with X^T, using the frame
+        // this joint type's T is fixed to.
+        double Tb[6][6]; // columns = constraint force directions, base coords
+        for ( int c = 0 ; c < ncl ; c++ ) {
+            double tcol[6], tb[6];
+            for ( int r = 0 ; r < 6 ; r++ ) tcol[r] = Tloc[r][c];
+            m6_tmulvec( loopTInPred( lp->jtype ) ? Xp : Xs, tcol, tb );
+            for ( int r = 0 ; r < 6 ; r++ ) Tb[r][c] = tb[r];
+        }
+
+        // kfull = -T^T (as - ap + vs x vp) - kstab_local (Table 8.4; its
+        // kstab local variable is the NEGATIVE of eq 8.22's kstab, and this
+        // difference IS k + kstab of eq 8.35).
+        double crmVs[6][6], vsxvp[6], resid[6], vrel[6];
+        crm( vs6, crmVs );
+        m6_mulvec( crmVs, vp6, vsxvp );
+        for ( int k = 0 ; k < 6 ; k++ ) {
+            resid[k] = as6[k] - ap6[k] + vsxvp[k];
+            vrel[k]  = vs6[k] - vp6[k];
+        }
+        for ( int c = 0 ; c < ncl ; c++ ) {
+            double tcol[6];
+            for ( int r = 0 ; r < 6 ; r++ ) tcol[r] = Tb[r][c];
+            double kstab = 2.0 * alpha * dot6( tcol, vrel ) + beta * beta * delta[c];
+            kfull[ row + c ] = -dot6( tcol, resid ) - kstab;
+        }
+
+        // K blocks: walk both paths to the common ancestor; -T^T 0X_i S_i on
+        // the predecessor side, + on the successor side (Table 8.4). Parents
+        // always have smaller indices and the base is -1, so stepping the
+        // larger index meets at the nearest common ancestor.
+        int i = lp->pred, j = lp->succ;
+        while ( i != j ) {
+            int onPred = i > j;
+            int bidx = onPred ? i : j;
+            double sign = onPred ? -1.0 : 1.0;
+            for ( int col = 0 ; col < ndof[ bidx ] ; col++ ) {
+                double scol[6], s0[6], M[36], b6[6];
+                for ( int r = 0 ; r < 6 ; r++ ) { scol[r] = S[ bidx ][r][col]; }
+                for ( int r = 0 ; r < 6 ; r++ ) for ( int cc = 0 ; cc < 6 ; cc++ ) M[ r*6 + cc ] = Xa[ bidx ][r][cc];
+                for ( int k = 0 ; k < 6 ; k++ ) b6[k] = scol[k];
+                linsolve( 6, M, b6, s0 );
+                for ( int c = 0 ; c < ncl ; c++ ) {
+                    double tcol[6];
+                    for ( int r = 0 ; r < 6 ; r++ ) tcol[r] = Tb[r][c];
+                    K[ row + c ][ mdl->vidx[ bidx ] + col ] += sign * dot6( tcol, s0 );
+                }
+            }
+            if ( onPred ) i = mdl->body[ i ].parent;
+            else          j = mdl->body[ j ].parent;
+        }
+    }
+
+    if ( K_out )
+        for ( int r = 0 ; r < nc ; r++ )
+        for ( int c = 0 ; c < nv ; c++ ) K_out[ r*nv + c ] = K[r][c];
+
+    // Method 2 (RBDA sec 8.5): Y = H^-1 K^T column by column, A_c = K Y,
+    // b = kfull - K qdd0, solve A_c lambda = b, qdd = qdd0 + Y lambda.
+    static double Y[ MODEL_MAX_V ][ MODEL_MAX_NC ];
+    for ( int c = 0 ; c < nc ; c++ ) {
+        double col[ MODEL_MAX_V ], sol[ MODEL_MAX_V ];
+        for ( int r = 0 ; r < nv ; r++ ) {
+            col[r] = K[c][r];
+            for ( int cc = 0 ; cc < nv ; cc++ ) A[ r*nv + cc ] = H[r][cc];
+        }
+        linsolve( nv, A, col, sol );
+        for ( int r = 0 ; r < nv ; r++ ) Y[r][c] = sol[r];
+    }
+    double Ac[ MODEL_MAX_NC * MODEL_MAX_NC ], bc[ MODEL_MAX_NC ], lambda[ MODEL_MAX_NC ];
+    for ( int r = 0 ; r < nc ; r++ ) {
+        bc[r] = kfull[r];
+        for ( int c = 0 ; c < nv ; c++ ) bc[r] -= K[r][c] * qdd_out[c];
+        for ( int c = 0 ; c < nc ; c++ ) {
+            double s = 0;
+            for ( int k = 0 ; k < nv ; k++ ) s += K[r][k] * Y[k][c];
+            Ac[ r*nc + c ] = s;
+        }
+    }
+    linsolve( nc, Ac, bc, lambda );
+    for ( int r = 0 ; r < nv ; r++ ) {
+        double s = 0;
+        for ( int c = 0 ; c < nc ; c++ ) s += Y[r][c] * lambda[c];
+        qdd_out[r] += s;
+    }
+}
+
+static void fd_dense( const Model *mdl, const double *q, const double *qd,
+                      const double *tau, const double *fext, double *qdd_out ) {
+    fd_dense_full( mdl, q, qd, tau, fext, qdd_out, NULL, NULL );
 }
 
 // ---------------------------------------------------------------------------
