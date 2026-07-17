@@ -50,6 +50,9 @@ directly, rather than shelling out to a C compiler.
   - `rrrs` — spatial RRRS loop: four revolute tree joints with mixed axes
     and 3D offsets, closed by a `spherical` loop joint; properly
     constrained with nc = 3 = rank(K), mobility 1
+  - `slidercrank` — crank and slider as separate branches off the base,
+    tied by a rigid rod modeled as a `distance` loop joint (nc = 1); the
+    only model whose two loop paths meet at the base with both nonempty
 - `src/model` — the shared model-file parser (plain C, header-only), used
   by the generator, the validator, and the benchmark, so all three always
   agree on the mechanism.
@@ -156,7 +159,8 @@ same structural-sparsity treatment as the tree dynamics.
 
 Loop joint types and the constraints they impose: `revolute`/`prismatic`
 (5), `cylindrical` (4), `spherical` (3), `point-on-line` (2, the book's
-sphere-in-cylinder). Two properties worth knowing:
+sphere-in-cylinder), `distance` (1, a rigid rod of given `length` between
+an anchor point on each body). Two properties worth knowing:
 
 - **Loops must be properly constrained: rank(K) = nc.** Any planar loop
   closed by a revolute is overconstrained (nc = 5, rank 2 — RBDA sec 8.10),
@@ -180,12 +184,27 @@ either way by cross-product antisymmetry — see `loopJcalc` in
 `src/validate/dense.h`, whose header comment carries the derivation. Its
 position error is exact (recovered from rho~ = -E^T B), not small-angle.
 
+`distance` is fixed to *neither* body — its constraint direction
+rho = p_s − p_p turns with the mechanism — yet it still fits the single-T
+machinery: the constraint force is a pure force along the line through both
+anchor points, so the one spatial force T = (p_p × rho; rho) =
+(p_s × rho; rho) serves predecessor and successor alike and the K path walk
+is unchanged. Its position error is carried in the squared form
+delta = (|rho|² − d²)/2, which is polynomial in the state (no square roots
+in the generated code) and whose gradient is exactly the K row, so closure
+projection works unchanged; the acceleration RHS replaces Table 8.4's
+vs × vp term with the rod's own direction rate,
+rho·(w_s × ṗ_s − w_p × ṗ_p) + |ρ̇|². Both forms of the derivation (direct
+differentiation of ½ rho·rho and Ṫ·(v_s − v_p)) agree — see the branch in
+`gen_loops.h` / `fd_dense_full`.
+
 The Chrono cross-check builds loop joints as Chrono constraint links
-(point-on-line's free axis is marker x there, not z) and Newton-projects
-each random trial state onto the closure manifold first — comparing
-constrained dynamics at torn-open states would just compare stabilization
-schemes. Both loop models agree with Chrono to ~1e-9 on accelerations and
-track its trajectories with the expected first-order truncation ratio.
+(point-on-line's free axis is marker x there, not z; `distance` maps to
+`ChLinkDistance`) and Newton-projects each random trial state onto the
+closure manifold first — comparing constrained dynamics at torn-open states
+would just compare stabilization schemes. All three loop models agree with
+Chrono to ~1e-9 on accelerations and track its trajectories with the
+expected first-order truncation ratio.
 
 ## Conventions
 

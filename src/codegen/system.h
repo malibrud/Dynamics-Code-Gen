@@ -56,10 +56,11 @@ struct System{
     // into the method-2 solve.
     struct SysLoop {
         int pred, succ;        // body indices; -1 = fixed base
-        uint8_t jtype;         // J_REVOLUTE .. J_POINTONLINE
-        char axis;             // 'x' | 'y' | 'z'; unused for spherical
+        uint8_t jtype;         // J_REVOLUTE .. J_DISTANCE
+        char axis;             // 'x' | 'y' | 'z'; unused for spherical and distance
         double ptree[3];       // predecessor body frame -> loop joint frame
         double stree[3];       // successor body frame -> loop joint frame
+        double length;         // distance joints: imposed anchor-to-anchor distance
     };
     vector<SysLoop> loops;
     double stab = 0.1;             // Baumgarte Tstab; alpha = beta = 1/stab

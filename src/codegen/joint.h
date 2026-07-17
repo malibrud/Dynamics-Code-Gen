@@ -12,6 +12,7 @@
 #define J_CYLINDRICAL 3
 #define J_SPHERICAL   4
 #define J_POINTONLINE 5  // sphere-in-cylinder: 2 constraints, closes planar loops without redundancy
+#define J_DISTANCE    6  // rigid rod between two anchor points: 1 constraint
 
 // typedef struct {
 //     uint8_t type;

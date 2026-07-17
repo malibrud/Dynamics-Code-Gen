@@ -86,12 +86,14 @@ int main( int argc, char **argv ) {
             case JOINT_PRISMATIC:   sl.jtype = J_PRISMATIC;   break;
             case JOINT_CYLINDRICAL: sl.jtype = J_CYLINDRICAL; break;
             case JOINT_SPHERICAL:   sl.jtype = J_SPHERICAL;   break;
+            case JOINT_DISTANCE:    sl.jtype = J_DISTANCE;    break;
             default:                sl.jtype = J_POINTONLINE; break;
         }
         for ( int k = 0 ; k < 3 ; k++ ) {
             sl.ptree[ k ] = lp->ptree[ k ];
             sl.stree[ k ] = lp->stree[ k ];
         }
+        sl.length = lp->length;
         sys.loops.push_back( sl );
     }
 

@@ -39,6 +39,7 @@
 #include "chrono/physics/ChSystemNSC.h"
 #include "chrono/physics/ChBody.h"
 #include "chrono/physics/ChLinkLock.h"
+#include "chrono/physics/ChLinkDistance.h"
 #include "chrono/solver/ChDirectSolverLS.h"
 
 #include <Eigen/Dense>
@@ -318,6 +319,16 @@ static void buildChronoModel( const Model *mdl, ChronoModel &cm ) {
         std::shared_ptr<ChBody> sb = lp->succ == -1 ? cm.ground : cm.bod[ lp->succ ].body;
         ChVector3d pCg = lp->pred == -1 ? ChVector3d( 0, 0, 0 ) : cm.bod[ lp->pred ].cg;
         ChVector3d sCg = lp->succ == -1 ? ChVector3d( 0, 0, 0 ) : cm.bod[ lp->succ ].cg;
+
+        // distance is not a ChLinkLock: ChLinkDistance takes the two anchor
+        // points (local coords) and the imposed distance directly.
+        if ( lp->jtype == JOINT_DISTANCE ) {
+            auto rod = chrono_types::make_shared<ChLinkDistance>();
+            rod->Initialize( sb, pb, true, v3( lp->stree ) - sCg, v3( lp->ptree ) - pCg,
+                             false, lp->length );
+            cm.sys.AddLink( rod );
+            continue;
+        }
 
         ChQuaterniond A = lp->jtype == JOINT_POINTONLINE ? xToAxis( lp->axis ) : zToAxis( lp->axis );
         ChFramed frameSucc( v3( lp->stree ) - sCg, A );

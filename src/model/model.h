@@ -88,20 +88,31 @@
 //   predecessor <p>              body index, or -1 for the fixed base
 //   successor <s>                body index, or -1 for the fixed base
 //   joint <type> [axis]          type: revolute | prismatic | cylindrical |
-//                                spherical | point-on-line
-//                                axis: x | y | z (all types except spherical)
+//                                spherical | point-on-line | distance
+//                                axis: x | y | z (all types except spherical
+//                                and distance)
 //   ptree <x> <y> <z>            translation, predecessor body frame -> loop
 //                                joint frame (RBDA's XP)
 //   stree <x> <y> <z>            translation, successor body frame -> loop
 //                                joint frame (RBDA's XS)
+//   length <d>                   distance joints only: the imposed distance
+//                                between the ptree and stree anchor points
+//                                (must be positive)
 //
 // A loop joint imposes nc constraints: revolute/prismatic 5, cylindrical 4,
-// spherical 3, point-on-line 2. point-on-line is RBDA sec 8.10's
+// spherical 3, point-on-line 2, distance 1. point-on-line is RBDA sec 8.10's
 // sphere-in-cylinder: it constrains only the two translations perpendicular
 // to the axis, and exists so planar loops can be closed WITHOUT redundant
 // constraints -- a planar loop closed by a revolute has rank(K) = 2 < nc = 5,
 // which this pipeline rejects (the validator checks rank(K) = nc and fails
 // the build; see README). Close planar loops with point-on-line.
+//
+// distance is a rigid massless rod of length d between the ptree point on
+// the predecessor and the stree point on the successor (ball joints at both
+// ends): the single scalar constraint |p_s - p_p| = d. Its position error is
+// carried in the squared form delta = (|rho|^2 - d^2)/2, rho = p_s - p_p,
+// which is polynomial in the state (no square roots anywhere) and whose
+// gradient is exactly the K row, so closure projection works unchanged.
 //
 // All joint types parse; which ones a given consumer implements is up to it
 // (see modelUnsupported below for the current single-DOF pipeline).
@@ -122,6 +133,7 @@ typedef enum {
     JOINT_SPHERICAL,
     JOINT_FLOATING,    // genuine 6-DOF joint, quaternion orientation
     JOINT_POINTONLINE, // sphere-in-cylinder; loop joints only
+    JOINT_DISTANCE,    // rigid rod between two anchor points; loop joints only
 } ModelJointType;
 
 typedef struct {
@@ -142,9 +154,10 @@ typedef struct {
     int pred;              // predecessor body index; -1 = base
     int succ;              // successor body index; -1 = base
     ModelJointType jtype;  // constraint pattern only; a loop joint has no q/qd
-    char axis;             // 'x' | 'y' | 'z'; 0 for spherical
+    char axis;             // 'x' | 'y' | 'z'; 0 for spherical and distance
     double ptree[3];       // translation, predecessor body frame -> loop joint frame (XP)
     double stree[3];       // translation, successor body frame -> loop joint frame (XS)
+    double length;         // distance joints: the imposed anchor-to-anchor distance
 } ModelLoop;
 
 typedef struct {
@@ -173,6 +186,7 @@ static int modelLoopNc( const ModelLoop *l ) {
         case JOINT_CYLINDRICAL: return 4;
         case JOINT_SPHERICAL:   return 3;
         case JOINT_POINTONLINE: return 2;
+        case JOINT_DISTANCE:    return 1;
         default:                return 0; // unreachable; floating rejected at parse
     }
 }
@@ -254,11 +268,12 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
                 else if ( !strcmp( type, "cylindrical" ) )   curLoop->jtype = JOINT_CYLINDRICAL;
                 else if ( !strcmp( type, "spherical" ) )     curLoop->jtype = JOINT_SPHERICAL;
                 else if ( !strcmp( type, "point-on-line" ) ) curLoop->jtype = JOINT_POINTONLINE;
+                else if ( !strcmp( type, "distance" ) )      curLoop->jtype = JOINT_DISTANCE;
                 else {
                     snprintf( err, errSize, "%s:%d: unknown loop joint type '%s'", path, lineNo, type );
                     goto fail;
                 }
-                if ( curLoop->jtype == JOINT_SPHERICAL ) {
+                if ( curLoop->jtype == JOINT_SPHERICAL || curLoop->jtype == JOINT_DISTANCE ) {
                     curLoop->axis = 0;
                 } else {
                     if ( n < 2 || axis[1] != 0 || ( axis[0] != 'x' && axis[0] != 'y' && axis[0] != 'z' ) ) {
@@ -271,6 +286,8 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
                 if ( sscanf( rest, "%lf %lf %lf", &curLoop->ptree[0], &curLoop->ptree[1], &curLoop->ptree[2] ) != 3 ) goto badArgs;
             } else if ( !strcmp( key, "stree" ) ) {
                 if ( sscanf( rest, "%lf %lf %lf", &curLoop->stree[0], &curLoop->stree[1], &curLoop->stree[2] ) != 3 ) goto badArgs;
+            } else if ( !strcmp( key, "length" ) ) {
+                if ( sscanf( rest, "%lf", &curLoop->length ) != 1 ) goto badArgs;
             } else {
                 snprintf( err, errSize, "%s:%d: unknown keyword '%s' in loop block", path, lineNo, key );
                 goto fail;
@@ -351,9 +368,9 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
                       path, i );
             return 1;
         }
-        if ( b->jtype == JOINT_POINTONLINE ) {
-            snprintf( err, errSize, "%s: body %d: point-on-line is a loop joint type, not a tree joint",
-                      path, i );
+        if ( b->jtype == JOINT_POINTONLINE || b->jtype == JOINT_DISTANCE ) {
+            snprintf( err, errSize, "%s: body %d: %s is a loop joint type, not a tree joint",
+                      path, i, b->jtype == JOINT_POINTONLINE ? "point-on-line" : "distance" );
             return 1;
         }
     }
@@ -366,6 +383,10 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
         }
         if ( lp->pred == lp->succ ) {
             snprintf( err, errSize, "%s: loop %d: predecessor and successor must differ", path, l );
+            return 1;
+        }
+        if ( lp->jtype == JOINT_DISTANCE && lp->length <= 0 ) {
+            snprintf( err, errSize, "%s: loop %d: a distance joint needs 'length <d>' with d > 0", path, l );
             return 1;
         }
     }

@@ -1,0 +1,43 @@
+# Slider-crank driven through a rigid rod (distance loop joint): crank
+# (revolute z) and slider (prismatic x) are separate branches off the base,
+# tied by a rod of length 1.0 between a pin on the crank and a pin on the
+# slider -- the classic mechanism, connecting rod modeled as the massless
+# distance constraint. Out-of-plane pin offsets and tilted gravity keep the
+# geometry generic so no symbolic term dies to planar sparsity.
+#
+# nc = 1 = rank(K), mobility = 2 tree DOF - 1 = 1. Also the only model whose
+# two loop paths meet at the BASE with both paths nonempty (fourbar and rrrs
+# close a body back to the base), exercising that side of the K path walk.
+#
+# Rod length 1.0 comfortably exceeds the worst-case transverse gap
+# (~0.36 m), so the crank turns fully and a slider position exists at every
+# crank angle.
+
+gravity 0.5 -2.0 -9.81
+stab 0.05
+
+body                     # 0: crank, spins about base z
+parent -1
+joint revolute z
+tree 0 0 0
+mass 1.2
+cg 0.15 0 0.05
+inertia 0.02 0.03 0.03 0.005 0 0
+fext 1
+
+body                     # 1: slider, slides along base x, raised bed
+parent -1
+joint prismatic x
+tree 0.9 0 0.25
+mass 0.8
+cg 0.02 0 0
+inertia 0.01 0.015 0.015 0 0 0
+fext 1
+
+loop                     # rod: crank pin to slider pin, both off the plane
+predecessor 0
+successor 1
+joint distance
+ptree 0.3 0 0.1
+stree 0 0.05 -0.1
+length 1.0

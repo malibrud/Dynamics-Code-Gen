@@ -27,6 +27,14 @@
 // predecessor coordinates; RBDA eq 8.47 is unchanged either way -- see
 // loopJcalc in src/validate/dense.h for the full argument).
 //
+// distance (a rigid rod between two anchor points, nc = 1) is fixed to
+// NEITHER body: its constraint direction rho = p_s - p_p turns with the
+// mechanism. It still fits the single-T machinery because the constraint
+// force is a pure force along the line through BOTH anchors, so
+// T = (p_p x rho; rho) = (p_s x rho; rho) serves predecessor and successor
+// alike -- but its acceleration RHS carries the rod's own direction rate
+// instead of Table 8.4's vs x vp term (see the branch below).
+//
 // Must run after gen_rnea_C(): it uses sys->v[] / sys->a[] (the RNEA's
 // aJ = 0 acceleration IS Table 8.4's avp; the -a_grav seed offset cancels
 // in the successor-minus-predecessor difference, RBDA sec 8.6 footnote) and
@@ -39,6 +47,7 @@ static int loopNc( uint8_t jtype ) {
         case J_CYLINDRICAL: return 4;
         case J_SPHERICAL:   return 3;
         case J_POINTONLINE: return 2;
+        case J_DISTANCE:    return 1;
         default:            return 0;
     }
 }
@@ -65,7 +74,8 @@ static Xform loopFrameXform( string name, char axis, const double t[3] ) {
 // RBDA Table 8.1 (X is the measured sXp as a 6x6 of expressions, 0-based
 // indices). point-on-line is not in the table; its delta is the exact
 // in-plane position of the successor origin, recovered from rho~ = -E^T B
-// (see the dense reference). Returns nc and fills delta[0..nc-1].
+// (see the dense reference). distance never comes here (no loop-joint frame
+// at all). Returns nc and fills delta[0..nc-1].
 static int loopDelta( uint8_t jtype, array<array<string,6>,6> &X, string delta[6] ) {
     switch ( jtype ) {
     case J_REVOLUTE:
@@ -124,6 +134,37 @@ static int loopTrows( uint8_t jtype, int rows[6] ) {
     }
 }
 
+// Emits each element of a 3-vector of expressions as a named temp, then
+// replaces the element with the temp's name (the Svec::emit convention:
+// literals 0 and 1 stay as-is to preserve sparsity).
+static void emitVec3( string name, string v[3] ) {
+    for ( int k = 0 ; k < 3 ; k++ ) {
+        prln( "double %s%d = %s;", name.c_str(), k, v[k].c_str() );
+        if ( v[k] != "0" && v[k] != "1" ) v[k] = format( "{}{}", name, k );
+    }
+}
+
+static string dot3( const string a[3], const string b[3] ) {
+    string s = "0";
+    for ( int k = 0 ; k < 3 ; k++ ) s = addTerms( s, multFactors( a[k], b[k] ) );
+    return s;
+}
+
+// A loop end's anchor point in base coordinates: p = r + E^T p_local for a
+// body end (X = xFromBase maps base->body, so E rotates base coords into
+// body coords and r is the body origin in base coords), or the numeric
+// anchor itself for a base end.
+static void loopAnchorBase( System *sys, int body, const double t[3], string p[3] ) {
+    for ( int k = 0 ; k < 3 ; k++ ) {
+        if ( body == -1 ) { p[k] = numStr( t[k] ); continue; }
+        Xform &X = sys->xFromBase[ body ];
+        string s = X.r[k];
+        for ( int i = 0 ; i < 3 ; i++ )
+            s = addTerms( s, multFactors( X.E[i][k], numStr( t[i] ) ) );
+        p[k] = s;
+    }
+}
+
 void gen_loops( FILE *f, System *sys ) {
     if ( sys->loops.empty() ) return;
     prln_file = f;
@@ -150,16 +191,6 @@ void gen_loops( FILE *f, System *sys ) {
         int ncl = loopNc( lp.jtype );
         prln( "// Loop %d: predecessor %d, successor %d, %d constraints", l, lp.pred, lp.succ, ncl );
 
-        // Xp = XP * pred_X_base, Xs = XS * succ_X_base (Table 8.4's Xp/Xs).
-        Xform XP = loopFrameXform( format( "XPf{}", l ), lp.axis, lp.ptree );
-        Xform XS = loopFrameXform( format( "XSf{}", l ), lp.axis, lp.stree );
-        Xform Xp = lp.pred == -1 ? XP : compose( format( "Xp{}", l ), XP, sys->xFromBase[ lp.pred ] );
-        Xform Xs = lp.succ == -1 ? XS : compose( format( "Xs{}", l ), XS, sys->xFromBase[ lp.succ ] );
-        Xp.baseName = format( "Xp{}", l );
-        Xs.baseName = format( "Xs{}", l );
-        Xp.emit();
-        Xs.emit();
-
         // Body velocity and velocity-product acceleration in base coords.
         // The fixed base has v = 0 and avp = -a_grav (the RNEA seed): NOT
         // zero, or the -ag offset fails to cancel in as - ap.
@@ -180,48 +211,119 @@ void gen_loops( FILE *f, System *sys ) {
             vs.emit();
             as.emit();
         }
-
-        // sXp = Xs * Xp^-1: the measured predecessor->successor transform of
-        // the loop joint, input to the Table 8.1 position-error formulae.
-        Xform XpInv = invertXform( format( "XpInv{}", l ), Xp );
-        XpInv.emit();
-        Xform sXp = compose( format( "sXp{}", l ), Xs, XpInv );
-        sXp.emit();
-        auto sXp6 = xformTo6x6( sXp );
-
-        string delta[6];
-        loopDelta( lp.jtype, sXp6, delta );
-
-        // T columns in base coordinates: rows of the 6x6 of Xs (successor-
-        // fixed types) or Xp (point-on-line; predecessor-fixed).
-        int rows[6];
-        loopTrows( lp.jtype, rows );
-        Xform &Tsrc = lp.jtype == J_POINTONLINE ? Xp : Xs;
-        auto Tsrc6 = xformTo6x6( Tsrc );
-        vector<Svec> T( ncl );
-        for ( int c = 0 ; c < ncl ; c++ ) {
-            T[c] = Svec( format( "TL{}_{}_", l, c ) );
-            for ( int r = 0 ; r < 6 ; r++ ) T[c].v[r] = Tsrc6[ rows[c] ][ r ];
-            T[c].emit();
-        }
-
-        // kful = -T^T (as - ap + vs x vp) - ( 2*alpha*T^T(vs - vp) + beta^2*delta ),
-        // which is k + kstab of eq 8.35 (Table 8.4's local kstab is the
-        // negative of eq 8.22's, and the table subtracts it).
-        Svec asMinusAp = svecSub( format( "dAvp{}_", l ), as, ap );
-        Svec vsxvp = svCrossMotion( format( "vsxvp{}_", l ), vs, vp );
-        Svec resid = svecAdd( format( "resid{}_", l ), asMinusAp, vsxvp );
-        resid.emit();
         Svec vrel = svecSub( format( "vrel{}_", l ), vs, vp );
         vrel.emit();
 
-        for ( int c = 0 ; c < ncl ; c++ ) {
-            string kstab = addTerms( multFactors( twoAlpha, svecDot( T[c], vrel ) ),
-                                     multFactors( betaSq, delta[c] ) );
-            string kful = subTerms( negate( svecDot( T[c], resid ) ), kstab );
-            string name = format( "kful_{}", row0 + c );
+        vector<Svec> T( ncl ); // constraint-force columns, base coordinates
+
+        if ( lp.jtype == J_DISTANCE ) {
+            // Rod constraint |p_s - p_p| = d, carried as the squared-form
+            // position error delta = (rho.rho - d^2)/2 with rho = p_s - p_p:
+            // polynomial in the state (no square roots), and its gradient is
+            // exactly the K row that T produces, so closure projection works
+            // unchanged. T = (p_p x rho; rho) = (p_s x rho; rho) is one
+            // spatial force along the rod's line, valid for both bodies.
+            // T is fixed to neither body, so instead of Table 8.4's vs x vp
+            // term the acceleration RHS is derived directly:
+            //   deltaddot = T.(as - ap) + rho.(ws x psdot - wp x ppdot)
+            //             + rhodot.rhodot                     (+ K qdd terms)
+            // with pdot = v0 + w x p the anchor point velocities.
+            string pp[3], ps[3], rho[3];
+            loopAnchorBase( sys, lp.pred, lp.ptree, pp );
+            loopAnchorBase( sys, lp.succ, lp.stree, ps );
+            emitVec3( format( "ppL{}_", l ), pp );
+            emitVec3( format( "psL{}_", l ), ps );
+            for ( int k = 0 ; k < 3 ; k++ ) rho[k] = subTerms( ps[k], pp[k] );
+            emitVec3( format( "rhoL{}_", l ), rho );
+
+            // Prefer the base-side anchor for the moment arm (numeric
+            // components); either anchor gives the same T.
+            const string *anchor = ( lp.pred != -1 && lp.succ == -1 ) ? ps : pp;
+            string ang[3];
+            cross3( anchor, rho, ang );
+            T[0] = Svec( format( "TL{}_0_", l ) );
+            for ( int k = 0 ; k < 3 ; k++ ) { T[0].v[k] = ang[k]; T[0].v[3+k] = rho[k]; }
+            T[0].emit();
+
+            // Anchor point velocities and the rod direction rate.
+            string ppd[3], psd[3], rhod[3], wxp[3];
+            cross3( vp.v, pp, wxp );
+            for ( int k = 0 ; k < 3 ; k++ ) ppd[k] = addTerms( vp.v[3+k], wxp[k] );
+            emitVec3( format( "ppdL{}_", l ), ppd );
+            cross3( vs.v, ps, wxp );
+            for ( int k = 0 ; k < 3 ; k++ ) psd[k] = addTerms( vs.v[3+k], wxp[k] );
+            emitVec3( format( "psdL{}_", l ), psd );
+            for ( int k = 0 ; k < 3 ; k++ ) rhod[k] = subTerms( psd[k], ppd[k] );
+            emitVec3( format( "rhodL{}_", l ), rhod );
+
+            string wxpsd[3], wxppd[3];
+            cross3( vs.v, psd, wxpsd );
+            cross3( vp.v, ppd, wxppd );
+            string kvel = dot3( rhod, rhod );
+            for ( int k = 0 ; k < 3 ; k++ )
+                kvel = addTerms( kvel, multFactors( rho[k], subTerms( wxpsd[k], wxppd[k] ) ) );
+
+            Svec dAvp = svecSub( format( "dAvp{}_", l ), as, ap );
+            dAvp.emit();
+
+            string delta = multFactors( "0.5", subTerms( dot3( rho, rho ),
+                                                         numStr( lp.length * lp.length ) ) );
+            string kstab = addTerms( multFactors( twoAlpha, svecDot( T[0], vrel ) ),
+                                     multFactors( betaSq, delta ) );
+            string kful = subTerms( negate( addTerms( svecDot( T[0], dAvp ), kvel ) ), kstab );
+            string name = format( "kful_{}", row0 );
             prln( "double %s = %s;", name.c_str(), kful.c_str() );
-            sys->kfulName[ row0 + c ] = name;
+            sys->kfulName[ row0 ] = name;
+        } else {
+            // Xp = XP * pred_X_base, Xs = XS * succ_X_base (Table 8.4's Xp/Xs).
+            Xform XP = loopFrameXform( format( "XPf{}", l ), lp.axis, lp.ptree );
+            Xform XS = loopFrameXform( format( "XSf{}", l ), lp.axis, lp.stree );
+            Xform Xp = lp.pred == -1 ? XP : compose( format( "Xp{}", l ), XP, sys->xFromBase[ lp.pred ] );
+            Xform Xs = lp.succ == -1 ? XS : compose( format( "Xs{}", l ), XS, sys->xFromBase[ lp.succ ] );
+            Xp.baseName = format( "Xp{}", l );
+            Xs.baseName = format( "Xs{}", l );
+            Xp.emit();
+            Xs.emit();
+
+            // sXp = Xs * Xp^-1: the measured predecessor->successor transform of
+            // the loop joint, input to the Table 8.1 position-error formulae.
+            Xform XpInv = invertXform( format( "XpInv{}", l ), Xp );
+            XpInv.emit();
+            Xform sXp = compose( format( "sXp{}", l ), Xs, XpInv );
+            sXp.emit();
+            auto sXp6 = xformTo6x6( sXp );
+
+            string delta[6];
+            loopDelta( lp.jtype, sXp6, delta );
+
+            // T columns in base coordinates: rows of the 6x6 of Xs (successor-
+            // fixed types) or Xp (point-on-line; predecessor-fixed).
+            int rows[6];
+            loopTrows( lp.jtype, rows );
+            Xform &Tsrc = lp.jtype == J_POINTONLINE ? Xp : Xs;
+            auto Tsrc6 = xformTo6x6( Tsrc );
+            for ( int c = 0 ; c < ncl ; c++ ) {
+                T[c] = Svec( format( "TL{}_{}_", l, c ) );
+                for ( int r = 0 ; r < 6 ; r++ ) T[c].v[r] = Tsrc6[ rows[c] ][ r ];
+                T[c].emit();
+            }
+
+            // kful = -T^T (as - ap + vs x vp) - ( 2*alpha*T^T(vs - vp) + beta^2*delta ),
+            // which is k + kstab of eq 8.35 (Table 8.4's local kstab is the
+            // negative of eq 8.22's, and the table subtracts it).
+            Svec asMinusAp = svecSub( format( "dAvp{}_", l ), as, ap );
+            Svec vsxvp = svCrossMotion( format( "vsxvp{}_", l ), vs, vp );
+            Svec resid = svecAdd( format( "resid{}_", l ), asMinusAp, vsxvp );
+            resid.emit();
+
+            for ( int c = 0 ; c < ncl ; c++ ) {
+                string kstab = addTerms( multFactors( twoAlpha, svecDot( T[c], vrel ) ),
+                                         multFactors( betaSq, delta[c] ) );
+                string kful = subTerms( negate( svecDot( T[c], resid ) ), kstab );
+                string name = format( "kful_{}", row0 + c );
+                prln( "double %s = %s;", name.c_str(), kful.c_str() );
+                sys->kfulName[ row0 + c ] = name;
+            }
         }
 
         // K row block: walk both paths to the common ancestor (parents have

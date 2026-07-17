@@ -347,6 +347,19 @@ static int loopJcalc( ModelJointType t, const double X[6][6], double T[6][6], do
 // Xp^T) rather than the successor (Xs^T).
 static int loopTInPred( ModelJointType t ) { return t == JOINT_POINTONLINE; }
 
+// Origin of the frame a base-to-frame transform X maps into, in base
+// coordinates: X = [E 0; B E] with B = -E*r~, so r~ = -E^T B (the same
+// recovery point-on-line's delta uses, here for all three components).
+static void xformOrigin( const double X[6][6], double p[3] ) {
+    double rx = 0, ry = 0, rz = 0;
+    for ( int k = 0 ; k < 3 ; k++ ) {
+        rx -= X[k][2] * X[k+3][1]; // (r~)[2][1]
+        ry -= X[k][0] * X[k+3][2]; // (r~)[0][2]
+        rz -= X[k][1] * X[k+3][0]; // (r~)[1][0]
+    }
+    p[0] = rx; p[1] = ry; p[2] = rz;
+}
+
 // Coordinate rotation E aligning the canonical loop-joint z axis with the
 // declared axis: E = R_axis^T where R_axis maps joint coords to body coords
 // by cyclic permutation (x: jz->bx, y: jz->by, z: identity). Cyclic keeps
@@ -590,49 +603,97 @@ static void fd_dense_full( const Model *mdl, const double *q, const double *qd,
             linsolve( 6, M, b6, as6 );
         }
 
-        // sXp of the loop joint, then [delta, T] = jcalc(type, Xs * Xp^-1).
-        double XpInv[6][6], sXp[6][6], Tloc[6][6], delta[6];
-        {
-            double M[36], col[6], e[6];
-            for ( int c = 0 ; c < 6 ; c++ ) {
-                for ( int r = 0 ; r < 36 ; r++ ) M[r] = 0;
-                for ( int r = 0 ; r < 6 ; r++ ) for ( int cc = 0 ; cc < 6 ; cc++ ) M[ r*6 + cc ] = Xp[r][cc];
-                for ( int k = 0 ; k < 6 ; k++ ) e[k] = ( k == c );
-                linsolve( 6, M, e, col );
-                for ( int r = 0 ; r < 6 ; r++ ) XpInv[r][c] = col[r];
+        double vrel[6];
+        for ( int k = 0 ; k < 6 ; k++ ) vrel[k] = vs6[k] - vp6[k];
+
+        int ncl;
+        double Tb[6][6], delta[6]; // T columns = constraint force directions, base coords
+
+        if ( lp->jtype == JOINT_DISTANCE ) {
+            // Rod constraint |p_s - p_p| = d, carried as delta = (rho.rho -
+            // d^2)/2 with rho = p_s - p_p (base coords). The constraint force
+            // is a pure force rho along the line through BOTH anchors, so the
+            // single spatial force T = (p_p x rho; rho) = (p_s x rho; rho)
+            // serves predecessor and successor alike, and delta's gradient is
+            // exactly the K row this T produces. T is fixed to neither body,
+            // so instead of Table 8.4's vs x vp term the acceleration RHS
+            // carries the rod's own direction rate:
+            //   deltaddot = T.(as - ap) + rho.(ws x psdot - wp x ppdot)
+            //             + rhodot.rhodot                    (+ K qdd terms)
+            // with pdot = v0 + w x p the anchor point velocities.
+            ncl = 1;
+            double pp[3], ps[3], rho[3];
+            xformOrigin( Xp, pp );
+            xformOrigin( Xs, ps );
+            for ( int k = 0 ; k < 3 ; k++ ) rho[k] = ps[k] - pp[k];
+
+            Tb[0][0] = pp[1]*rho[2] - pp[2]*rho[1];
+            Tb[1][0] = pp[2]*rho[0] - pp[0]*rho[2];
+            Tb[2][0] = pp[0]*rho[1] - pp[1]*rho[0];
+            for ( int k = 0 ; k < 3 ; k++ ) Tb[3+k][0] = rho[k];
+
+            delta[0] = 0.5 * ( rho[0]*rho[0] + rho[1]*rho[1] + rho[2]*rho[2]
+                             - lp->length * lp->length );
+
+            double ppd[3], psd[3], rhod[3], wxpd[3];
+            ppd[0] = vp6[3] + vp6[1]*pp[2] - vp6[2]*pp[1];
+            ppd[1] = vp6[4] + vp6[2]*pp[0] - vp6[0]*pp[2];
+            ppd[2] = vp6[5] + vp6[0]*pp[1] - vp6[1]*pp[0];
+            psd[0] = vs6[3] + vs6[1]*ps[2] - vs6[2]*ps[1];
+            psd[1] = vs6[4] + vs6[2]*ps[0] - vs6[0]*ps[2];
+            psd[2] = vs6[5] + vs6[0]*ps[1] - vs6[1]*ps[0];
+            for ( int k = 0 ; k < 3 ; k++ ) rhod[k] = psd[k] - ppd[k];
+            wxpd[0] = vs6[1]*psd[2] - vs6[2]*psd[1] - ( vp6[1]*ppd[2] - vp6[2]*ppd[1] );
+            wxpd[1] = vs6[2]*psd[0] - vs6[0]*psd[2] - ( vp6[2]*ppd[0] - vp6[0]*ppd[2] );
+            wxpd[2] = vs6[0]*psd[1] - vs6[1]*psd[0] - ( vp6[0]*ppd[1] - vp6[1]*ppd[0] );
+
+            double tcol[6], dAvp[6];
+            for ( int r = 0 ; r < 6 ; r++ ) { tcol[r] = Tb[r][0]; dAvp[r] = as6[r] - ap6[r]; }
+            double kvel = rho[0]*wxpd[0] + rho[1]*wxpd[1] + rho[2]*wxpd[2]
+                        + rhod[0]*rhod[0] + rhod[1]*rhod[1] + rhod[2]*rhod[2];
+            double kstab = 2.0 * alpha * dot6( tcol, vrel ) + beta * beta * delta[0];
+            kfull[ row ] = -( dot6( tcol, dAvp ) + kvel ) - kstab;
+        } else {
+            // sXp of the loop joint, then [delta, T] = jcalc(type, Xs * Xp^-1).
+            double XpInv[6][6], sXp[6][6], Tloc[6][6];
+            {
+                double M[36], col[6], e[6];
+                for ( int c = 0 ; c < 6 ; c++ ) {
+                    for ( int r = 0 ; r < 36 ; r++ ) M[r] = 0;
+                    for ( int r = 0 ; r < 6 ; r++ ) for ( int cc = 0 ; cc < 6 ; cc++ ) M[ r*6 + cc ] = Xp[r][cc];
+                    for ( int k = 0 ; k < 6 ; k++ ) e[k] = ( k == c );
+                    linsolve( 6, M, e, col );
+                    for ( int r = 0 ; r < 6 ; r++ ) XpInv[r][c] = col[r];
+                }
+            }
+            m6_mul( Xs, XpInv, sXp );
+            ncl = loopJcalc( lp->jtype, sXp, Tloc, delta );
+
+            // T to base coordinates: force vectors move with X^T, using the
+            // frame this joint type's T is fixed to.
+            for ( int c = 0 ; c < ncl ; c++ ) {
+                double tcol[6], tb[6];
+                for ( int r = 0 ; r < 6 ; r++ ) tcol[r] = Tloc[r][c];
+                m6_tmulvec( loopTInPred( lp->jtype ) ? Xp : Xs, tcol, tb );
+                for ( int r = 0 ; r < 6 ; r++ ) Tb[r][c] = tb[r];
+            }
+
+            // kfull = -T^T (as - ap + vs x vp) - kstab_local (Table 8.4; its
+            // kstab local variable is the NEGATIVE of eq 8.22's kstab, and
+            // this difference IS k + kstab of eq 8.35).
+            double crmVs[6][6], vsxvp[6], resid[6];
+            crm( vs6, crmVs );
+            m6_mulvec( crmVs, vp6, vsxvp );
+            for ( int k = 0 ; k < 6 ; k++ ) resid[k] = as6[k] - ap6[k] + vsxvp[k];
+            for ( int c = 0 ; c < ncl ; c++ ) {
+                double tcol[6];
+                for ( int r = 0 ; r < 6 ; r++ ) tcol[r] = Tb[r][c];
+                double kstab = 2.0 * alpha * dot6( tcol, vrel ) + beta * beta * delta[c];
+                kfull[ row + c ] = -dot6( tcol, resid ) - kstab;
             }
         }
-        m6_mul( Xs, XpInv, sXp );
-        int ncl = loopJcalc( lp->jtype, sXp, Tloc, delta );
         if ( delta_out )
             for ( int c = 0 ; c < ncl ; c++ ) delta_out[ row + c ] = delta[ c ];
-
-        // T to base coordinates: force vectors move with X^T, using the frame
-        // this joint type's T is fixed to.
-        double Tb[6][6]; // columns = constraint force directions, base coords
-        for ( int c = 0 ; c < ncl ; c++ ) {
-            double tcol[6], tb[6];
-            for ( int r = 0 ; r < 6 ; r++ ) tcol[r] = Tloc[r][c];
-            m6_tmulvec( loopTInPred( lp->jtype ) ? Xp : Xs, tcol, tb );
-            for ( int r = 0 ; r < 6 ; r++ ) Tb[r][c] = tb[r];
-        }
-
-        // kfull = -T^T (as - ap + vs x vp) - kstab_local (Table 8.4; its
-        // kstab local variable is the NEGATIVE of eq 8.22's kstab, and this
-        // difference IS k + kstab of eq 8.35).
-        double crmVs[6][6], vsxvp[6], resid[6], vrel[6];
-        crm( vs6, crmVs );
-        m6_mulvec( crmVs, vp6, vsxvp );
-        for ( int k = 0 ; k < 6 ; k++ ) {
-            resid[k] = as6[k] - ap6[k] + vsxvp[k];
-            vrel[k]  = vs6[k] - vp6[k];
-        }
-        for ( int c = 0 ; c < ncl ; c++ ) {
-            double tcol[6];
-            for ( int r = 0 ; r < 6 ; r++ ) tcol[r] = Tb[r][c];
-            double kstab = 2.0 * alpha * dot6( tcol, vrel ) + beta * beta * delta[c];
-            kfull[ row + c ] = -dot6( tcol, resid ) - kstab;
-        }
 
         // K blocks: walk both paths to the common ancestor; -T^T 0X_i S_i on
         // the predecessor side, + on the successor side (Table 8.4). Parents
