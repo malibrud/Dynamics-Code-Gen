@@ -110,8 +110,16 @@ static void skew( const double v[3], double S[3][3] ) {
     S[2][0] = -v[1]; S[2][1] =  v[0]; S[2][2] = 0;
 }
 
-// Plucker motion transform from rotation E and translation r (RBDA eq 2.24
-// with our generator's parametrization): X = [ E, 0; -E*rx, E ].
+static void transpose3( const double A[3][3], double At[3][3] ) {
+    for ( int i = 0 ; i < 3 ; i++ )
+    for ( int j = 0 ; j < 3 ; j++ )
+        At[i][j] = A[j][i];
+}
+
+// Plucker motion transform from the COORDINATE transform E (child-from-parent)
+// and translation r (RBDA eq 2.24 with our generator's parametrization):
+// X = [ E, 0; -E*rx, E ]. Note E is the transpose of the child's physical
+// rotation -- callers build the ordinary R and transpose it (see jointXS).
 static void plux( const double E[3][3], const double r[3], double X[6][6] ) {
     double rx[3][3], Erx[3][3];
     skew( r, rx );
@@ -138,22 +146,24 @@ static void axisVec( char axis, double a[3] ) {
     else                    a[2] = 1;
 }
 
-// Rotation by q about a canonical axis, in the generator's convention
-// (XFORM_RZ: E = [ c -s 0; s c 0; 0 0 1 ], and the cyclic analogues).
-static void rotAxis( char axis, double q, double E[3][3] ) {
+// The ordinary right-handed rotation matrix R(q) about a canonical axis --
+// the physical rotation the joint applies to its child frame, matching
+// XFORM_RX/RY/RZ in the generator. This is NOT the Plucker E block; callers
+// transpose it (see jointXS).
+static void rotAxis( char axis, double q, double R[3][3] ) {
     double c = cos( q ), s = sin( q );
     if ( axis == 'x' ) {
-        E[0][0] = 1; E[0][1] = 0; E[0][2] =  0;
-        E[1][0] = 0; E[1][1] = c; E[1][2] = -s;
-        E[2][0] = 0; E[2][1] = s; E[2][2] =  c;
+        R[0][0] = 1; R[0][1] = 0; R[0][2] =  0;
+        R[1][0] = 0; R[1][1] = c; R[1][2] = -s;
+        R[2][0] = 0; R[2][1] = s; R[2][2] =  c;
     } else if ( axis == 'y' ) {
-        E[0][0] =  c; E[0][1] = 0; E[0][2] = s;
-        E[1][0] =  0; E[1][1] = 1; E[1][2] = 0;
-        E[2][0] = -s; E[2][1] = 0; E[2][2] = c;
+        R[0][0] =  c; R[0][1] = 0; R[0][2] = s;
+        R[1][0] =  0; R[1][1] = 1; R[1][2] = 0;
+        R[2][0] = -s; R[2][1] = 0; R[2][2] = c;
     } else {
-        E[0][0] = c; E[0][1] = -s; E[0][2] = 0;
-        E[1][0] = s; E[1][1] =  c; E[1][2] = 0;
-        E[2][0] = 0; E[2][1] =  0; E[2][2] = 1;
+        R[0][0] = c; R[0][1] = -s; R[0][2] = 0;
+        R[1][0] = s; R[1][1] =  c; R[1][2] = 0;
+        R[2][0] = 0; R[2][1] =  0; R[2][2] = 1;
     }
 }
 
@@ -163,21 +173,28 @@ static void rotAxis( char axis, double q, double E[3][3] ) {
 // Prismatic: translation along the axis, S = (0; axis). Floating: quaternion
 // orientation plus position, S = identity(6) -- a genuine 6-DOF joint with
 // no gimbal lock.
+//
+// In every case the physical rotation is built as the ordinary right-handed R
+// and transposed into the Plucker E block (child-from-parent coordinates), so
+// q is the true physical joint coordinate and S stays on the positive axis --
+// which is what makes qd = dq/dt. See Xform::setJointRot() in the generator.
 static int jointXS( const ModelBody *b, const double *qseg, double XJ[6][6], double S[6][6] ) {
     double a3[3], Eident[3][3] = { {1,0,0},{0,1,0},{0,0,1} }, r0[3] = { 0, 0, 0 };
     for ( int r = 0 ; r < 6 ; r++ )
     for ( int c = 0 ; c < 6 ; c++ ) S[r][c] = 0;
 
     if ( b->jtype == JOINT_FLOATING ) {
-        // Unit quaternion (w,x,y,z), normalized here; rotation matrix in
-        // this codebase's E convention (transpose of spatial_v2's rq.m).
+        // Unit quaternion (w,x,y,z), normalized here. R is the standard
+        // quaternion rotation matrix, so the quaternion is the usual body
+        // attitude (body-to-base).
         double w = qseg[0], x = qseg[1], y = qseg[2], z = qseg[3];
         double n = 1.0 / sqrt( w*w + x*x + y*y + z*z );
         w *= n; x *= n; y *= n; z *= n;
-        double E[3][3];
-        E[0][0] = 2.0*( w*w + x*x - 0.5 ); E[0][1] = 2.0*( x*y - w*z );       E[0][2] = 2.0*( x*z + w*y );
-        E[1][0] = 2.0*( x*y + w*z );       E[1][1] = 2.0*( w*w + y*y - 0.5 ); E[1][2] = 2.0*( y*z - w*x );
-        E[2][0] = 2.0*( x*z - w*y );       E[2][1] = 2.0*( y*z + w*x );       E[2][2] = 2.0*( w*w + z*z - 0.5 );
+        double R[3][3], E[3][3];
+        R[0][0] = 2.0*( w*w + x*x - 0.5 ); R[0][1] = 2.0*( x*y - w*z );       R[0][2] = 2.0*( x*z + w*y );
+        R[1][0] = 2.0*( x*y + w*z );       R[1][1] = 2.0*( w*w + y*y - 0.5 ); R[1][2] = 2.0*( y*z - w*x );
+        R[2][0] = 2.0*( x*z - w*y );       R[2][1] = 2.0*( y*z + w*x );       R[2][2] = 2.0*( w*w + z*z - 0.5 );
+        transpose3( R, E );
         plux( E, qseg + 4, XJ );
         for ( int k = 0 ; k < 6 ; k++ ) S[k][k] = 1;
         return 6;
@@ -185,8 +202,9 @@ static int jointXS( const ModelBody *b, const double *qseg, double XJ[6][6], dou
 
     axisVec( b->axis, a3 );
     if ( b->jtype == JOINT_REVOLUTE ) {
-        double E[3][3];
-        rotAxis( b->axis, qseg[0], E );
+        double R[3][3], E[3][3];
+        rotAxis( b->axis, qseg[0], R );
+        transpose3( R, E );
         plux( E, r0, XJ );
         for ( int k = 0 ; k < 3 ; k++ ) S[k][0] = a3[k];
     } else { // JOINT_PRISMATIC (spherical/cylindrical rejected upstream)

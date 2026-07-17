@@ -1,3 +1,21 @@
+// Runtime (non-generated) spatial transforms. Part of the legacy src/numeric
+// attempt, which does not currently build -- see README.md.
+//
+// Unlike src/codegen and src/validate, nothing here builds E as a matrix:
+// each transform type hand-codes its sparse application with the sin/cos
+// entries baked straight into the arithmetic (x_mapply_TxRz and friends).
+// The convention is therefore implicit in those expressions, so state it
+// once here: the angular block is
+//
+//     E = [  c  s  0 ;  -s  c  0 ;  0  0  1 ]  =  R(q)^T
+//
+// i.e. the coordinate transform (child-from-parent), which is the transpose
+// of the child's physical rotation R(q) -- and the motion subspace is the
+// positive axis (S.v[2] = 1 for a z revolute, in fwd_dyn_crba.h). That is
+// the same convention the rest of the project uses, so q is the physical
+// joint angle and qd = dq/dt; see the joint-coordinate note in
+// src/model/model.h. Do not "fix" these to R(q): that silently makes q and
+// qd opposite-handed, which forward dynamics cannot detect.
 #pragma once
 #include <math.h>
 #include <assert.h>

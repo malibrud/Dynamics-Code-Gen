@@ -60,9 +60,27 @@ struct Xform {
     std::string E[ 3 ][ 3 ];
     std::string r[ 3 ];
 
+    // Sets this transform to a pure rotation, given the ordinary right-handed
+    // rotation matrix R the joint physically applies to its child frame.
+    //
+    // E is a COORDINATE transform (child-from-parent), not the child's
+    // rotation: a frame physically rotated by R has E = R^T. spatial_v2 folds
+    // that transpose into rotx/roty/rotz, which is why its "rotation" matrices
+    // read as the transpose of the textbook R. Here callers write the ordinary
+    // R and the transpose happens once, at the one place the coordinate
+    // transform is actually formed. Keeping R ordinary is what makes q the
+    // true physical joint angle, so that qd = dq/dt (see the joint-coordinate
+    // note in src/model/model.h).
+    void setJointRot( const std::string R[3][3] ) {
+        for ( int i = 0 ; i < 3 ; i++ )
+        for ( int j = 0 ; j < 3 ; j++ )
+            E[i][j] = R[j][i];
+        r[0] = "0";  r[1] = "0";  r[2] = "0";
+    }
+
     Xform(): Xform( XFORM_IDENT, "", blank ) {}
     Xform( Xtype type, std::string name, std::string q )
-        :baseName( name ) 
+        :baseName( name )
     {
         using namespace std::literals::string_literals;
         using namespace std;
@@ -78,29 +96,37 @@ struct Xform {
             r[0] = "0";  r[1] = "0";  r[2] = "0";
             break;
         
-        case XFORM_RX:
-            E[0][0] = "1"; E[0][1] = "0"; E[0][2] = "0";
-            E[1][0] = "0"; E[1][1] = cq;  E[1][2] = "-"s + sq;
-            E[2][0] = "0"; E[2][1] = sq;  E[2][2] = cq;
-
-            r[0] = "0";  r[1] = "0";  r[2] = "0";
+        // Revolute joints: the ordinary right-handed R(q) about the axis.
+        // setJointRot() transposes it into the coordinate transform E.
+        case XFORM_RX: {
+            string R[3][3] = {
+                { "1", "0", "0"       },
+                { "0", cq,  "-"s + sq },
+                { "0", sq,  cq        },
+            };
+            setJointRot( R );
             break;
+        }
 
-        case XFORM_RY:
-            E[0][0] = cq;        E[0][1] = "0"; E[0][2] = sq;
-            E[1][0] = "0";       E[1][1] = "1"; E[1][2] = "0";
-            E[2][0] = "-"s + sq; E[2][1] = "0"; E[2][2] = cq;
-
-            r[0] = "0";  r[1] = "0";  r[2] = "0";
+        case XFORM_RY: {
+            string R[3][3] = {
+                { cq,        "0", sq  },
+                { "0",       "1", "0" },
+                { "-"s + sq, "0", cq  },
+            };
+            setJointRot( R );
             break;
+        }
 
-        case XFORM_RZ:
-            E[0][0] = cq;  E[0][1] = "-"s + sq; E[0][2] = "0";
-            E[1][0] = sq;  E[1][1] = cq;        E[1][2] = "0";
-            E[2][0] = "0"; E[2][1] = "0";       E[2][2] = "1";
-
-            r[0] = "0";  r[1] = "0";  r[2] = "0";
+        case XFORM_RZ: {
+            string R[3][3] = {
+                { cq,  "-"s + sq, "0" },
+                { sq,  cq,        "0" },
+                { "0", "0",       "1" },
+            };
+            setJointRot( R );
             break;
+        }
 
         // Translations along one axis by a symbolic amount q -- these are
         // the prismatic joint transforms.

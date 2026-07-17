@@ -15,6 +15,29 @@
 //                                axis: x | y | z (required for revolute,
 //                                prismatic, cylindrical)
 //
+// Joint coordinate conventions
+// ----------------------------
+// A joint coordinate q is the ordinary physical coordinate, and qd is its
+// honest time derivative:
+//
+//   revolute:  q is a right-handed rotation of the child frame by +q about
+//              the +axis, qd = dq/dt, and tau is a couple about the +axis.
+//   prismatic: q is the displacement along the +axis, qd = dq/dt, and tau is
+//              a force along the +axis.
+//
+// So a single-DOF joint integrates with plain q += qd*dt. This is worth
+// stating because it is NOT what falls out of Featherstone's formulation for
+// free: the Plucker E block is a coordinate transform (child-from-parent), so
+// a child physically rotated by R has E = R^T. spatial_v2 folds that
+// transpose into rotx/roty/rotz; this project instead writes the ordinary R
+// and transposes it explicitly where the transform is built (see
+// Xform::setJointRot in src/codegen/xform.h and jointXS in
+// src/validate/dense.h). Using R directly as E -- which this project did
+// until the Chrono cross-check caught it -- silently makes q and qd
+// opposite-handed: forward dynamics stays self-consistent, but any
+// integrator stepping q += qd*dt drives the mechanism backwards.
+// src/chrono/main.cpp asserts qd == dq/dt on every model to keep this fixed.
+//
 // A 'floating' joint gives the body all six DOF relative to the fixed base:
 // a genuine free-flying body (RBDA sec 9.4), with the orientation carried as
 // a unit quaternion so there is no gimbal lock anywhere. It must be attached
@@ -22,16 +45,24 @@
 // position and velocity coordinate counts differ (nq != nv):
 //
 //   q  slots (7): [ qw qx qy qz ] unit quaternion (normalized on input, so
-//                 any nonzero quaternion is accepted), then [ x y z ]
-//                 position of the body frame in base coordinates
+//                 any nonzero quaternion is accepted) giving the body's
+//                 ordinary attitude, i.e. it rotates BODY coordinates into
+//                 BASE coordinates; then [ x y z ], the position of the body
+//                 frame in base coordinates
 //   qd slots (6): the body's spatial velocity IN ITS OWN FRAME,
 //                 [ wx wy wz vx vy vz ]
 //
-// out_qdd gets the corresponding 6 spatial-acceleration slots. Integrating
-// a floating state therefore needs the quaternion-rate map qdot = G(q) w;
-// that is the integrator's job, not this function's. Use modelNq()/modelNv()
-// (m->nq, m->nv) and the per-body offsets m->qidx[i], m->vidx[i] to address
-// the packed q/qd vectors.
+// out_qdd gets the corresponding 6 spatial-acceleration slots. Because q and
+// qd are in different frames here, a floating body does NOT integrate with
+// q += qd*dt; the rates are
+//
+//   Qdot = 0.5 * Q x (0, w)      (quaternion product, w = qd[0..2], body frame)
+//   rdot = R(Q) * v              (v = qd[3..5], body frame)
+//
+// which is the integrator's job, not this function's. integrateQ() in
+// src/chrono/main.cpp is a worked reference implementation. Use
+// modelNq()/modelNv() (m->nq, m->nv) and the per-body offsets m->qidx[i],
+// m->vidx[i] to address the packed q/qd vectors.
 //   tree <x> <y> <z>             translation from the parent's frame to this
 //                                joint's frame (no fixed rotation yet)
 //   mass <m>

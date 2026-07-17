@@ -104,26 +104,30 @@ void gen_fwd_dyn_crba( FILE *f, System *sys ) {
             prln( "double Qy%d = quy%d * qnorm%d;", i, i, i );
             prln( "double Qz%d = quz%d * qnorm%d;", i, i, i );
 
-            // Rotation matrix in this codebase's E convention (the transpose
-            // of spatial_v2's rq.m, matching how XFORM_RZ relates to rz.m).
-            prln( "double Efb%d_00 = 2.0*( Qw%d*Qw%d + Qx%d*Qx%d - 0.5 );", i, i, i, i, i );
-            prln( "double Efb%d_01 = 2.0*( Qx%d*Qy%d - Qw%d*Qz%d );", i, i, i, i, i );
-            prln( "double Efb%d_02 = 2.0*( Qx%d*Qz%d + Qw%d*Qy%d );", i, i, i, i, i );
-            prln( "double Efb%d_10 = 2.0*( Qx%d*Qy%d + Qw%d*Qz%d );", i, i, i, i, i );
-            prln( "double Efb%d_11 = 2.0*( Qw%d*Qw%d + Qy%d*Qy%d - 0.5 );", i, i, i, i, i );
-            prln( "double Efb%d_12 = 2.0*( Qy%d*Qz%d - Qw%d*Qx%d );", i, i, i, i, i );
-            prln( "double Efb%d_20 = 2.0*( Qx%d*Qz%d - Qw%d*Qy%d );", i, i, i, i, i );
-            prln( "double Efb%d_21 = 2.0*( Qy%d*Qz%d + Qw%d*Qx%d );", i, i, i, i, i );
-            prln( "double Efb%d_22 = 2.0*( Qw%d*Qw%d + Qz%d*Qz%d - 0.5 );", i, i, i, i, i );
+            // The body's ordinary right-handed attitude matrix R(Q), mapping
+            // body coordinates to base coordinates -- the standard quaternion
+            // rotation matrix, so Q is the usual body attitude quaternion.
+            prln( "double Rfb%d_00 = 2.0*( Qw%d*Qw%d + Qx%d*Qx%d - 0.5 );", i, i, i, i, i );
+            prln( "double Rfb%d_01 = 2.0*( Qx%d*Qy%d - Qw%d*Qz%d );", i, i, i, i, i );
+            prln( "double Rfb%d_02 = 2.0*( Qx%d*Qz%d + Qw%d*Qy%d );", i, i, i, i, i );
+            prln( "double Rfb%d_10 = 2.0*( Qx%d*Qy%d + Qw%d*Qz%d );", i, i, i, i, i );
+            prln( "double Rfb%d_11 = 2.0*( Qw%d*Qw%d + Qy%d*Qy%d - 0.5 );", i, i, i, i, i );
+            prln( "double Rfb%d_12 = 2.0*( Qy%d*Qz%d - Qw%d*Qx%d );", i, i, i, i, i );
+            prln( "double Rfb%d_20 = 2.0*( Qx%d*Qz%d - Qw%d*Qy%d );", i, i, i, i, i );
+            prln( "double Rfb%d_21 = 2.0*( Qy%d*Qz%d + Qw%d*Qx%d );", i, i, i, i, i );
+            prln( "double Rfb%d_22 = 2.0*( Qw%d*Qw%d + Qz%d*Qz%d - 0.5 );", i, i, i, i, i );
             prln( "double rfb%d_0 = q[ %d ];", i, qi + 4 );
             prln( "double rfb%d_1 = q[ %d ];", i, qi + 5 );
             prln( "double rfb%d_2 = q[ %d ];", i, qi + 6 );
 
             Xform XJ;
             XJ.baseName = format( "Xjfb{}", i );
+            // E is the coordinate transform (base-from-body), i.e. R^T -- a
+            // pure index swap on the temps above, free at runtime. Same
+            // reasoning as Xform::setJointRot() for the single-DOF joints.
             for ( int r = 0 ; r < 3 ; r++ )
             for ( int c = 0 ; c < 3 ; c++ )
-                XJ.E[r][c] = format( "Efb{}_{}{}", i, r, c );
+                XJ.E[r][c] = format( "Rfb{}_{}{}", i, c, r );
             for ( int k = 0 ; k < 3 ; k++ )
                 XJ.r[k] = format( "rfb{}_{}", i, k );
             sys->xJoint[ i ] = XJ;
