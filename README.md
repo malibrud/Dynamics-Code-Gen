@@ -53,6 +53,15 @@ directly, rather than shelling out to a C compiler.
   - `slidercrank` — crank and slider as separate branches off the base,
     tied by a rigid rod modeled as a `distance` loop joint (nc = 1); the
     only model whose two loop paths meet at the base with both nonempty
+  - `quartercar` — HMMWV front quarter-car test rig, built from the HMMWV
+    suspension data shipped with Project Chrono: sprung mass on a vertical
+    slider, double-wishbone suspension, and a driven shaker post under the
+    wheel as the vertical position input. The spindle carries ball joints
+    everywhere, so it is a `floating` body pinned by loop constraints —
+    two `spherical` closures to the wishbones, a `distance` radius rod,
+    and a `distance` "tire" rod down to the post (nq = 11, nv = 10,
+    nc = 8, mobility 2) — the first model to combine a floating body with
+    kinematic loops
 - `src/model` — the shared model-file parser (plain C, header-only), used
   by the generator, the validator, and the benchmark, so all three always
   agree on the mechanism.

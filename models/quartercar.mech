@@ -1,0 +1,123 @@
+# Quarter-car test rig, HMMWV front corner: sprung mass on a vertical
+# prismatic joint, double-wishbone suspension, and a shaker post under the
+# wheel acting as the vertical position driver. Hardpoints, masses, and
+# inertias are the HMMWV front suspension data shipped with Project Chrono
+# (data/vehicle/hmmwv/): suspension HMMWV_DoubleWishboneFront.json, chassis
+# 2086.52 kg (quartered), wheel 18.8 kg + tire 37.6 kg, tire radius 0.467.
+#
+# Axes are ISO vehicle: x forward, y outboard, z up. The base frame sits at
+# the DESIGN WHEEL CENTER (Chrono suspension frame minus the wheel-center
+# offset (-0.040, 0.910, -0.026)), so every loop closes exactly at q = 0
+# with the spindle at identity quaternion, zero position.
+#
+# Topology (tree DOF 10, nc 8, mobility 2):
+#   0 chassis  prismatic z   quarter sprung mass, free heave
+#   1 LCA      revolute x    lower wishbone on the chassis; Chrono's pivot
+#                            axis is exactly x (front/back pivots at y=0.307)
+#   2 UCA      revolute x    upper wishbone; the real pivot axis is skewed
+#                            ~13 deg from x (anti-dive), idealized to x here
+#                            since tree joints are axis-aligned; pivot placed
+#                            at the front/back midpoint
+#   3 spindle  floating      upright + spindle + wheel + tire lumped (no
+#                            wheel-spin DOF), located by the loop joints
+#   4 post     prismatic z   shaker pad at the contact patch: THE POSITION
+#                            DRIVER. Drive q[10] through tau[9] (e.g. a stiff
+#                            PD servo tracking the road/post profile)
+#
+# Loop joints (the spindle has ball joints everywhere, so it is a floating
+# body pinned by constraints -- spherical tree joints aren't implemented):
+#   spherical  LCA outer ball  -> spindle lower ball
+#   spherical  UCA outer ball  -> spindle upper ball
+#   distance   radius rod, chassis -> spindle steering arm (Chrono's tie-rod
+#              hardpoints); kills the leftover spin about the kingpin axis
+#   distance   driver rod, post pad -> wheel center, length = tire radius:
+#              a rigid "tire" with balls at patch and hub. It pins spindle
+#              height to post height; lateral scrub during travel just tilts
+#              it (height error is second order, ~s^2/2r)
+#
+# Mobility 2 = chassis heave + post position. Suspension deflection is their
+# difference through the linkage. There are no spring elements in this
+# format: apply spring/shock forces via fext on chassis and LCA (the Chrono
+# spring seats are chassis (0.144, -0.400, 0.223) base frame, LCA
+# (0.097, 0.236, -0.047) LCA frame), tire loads via fext on the spindle.
+#
+# q layout (nq 11, nv 10): q[0] chassis, q[1] LCA, q[2] UCA, q[3..9] spindle
+# quaternion + position, q[10] post. Design pose: q = 0 with q[3] = 1.
+
+gravity 0 0 -9.81
+stab 0.05
+
+body                     # 0: chassis, quarter sprung mass on vertical slider
+parent -1
+joint prismatic z
+tree 0 0 0
+mass 521.6
+cg 0 -0.910 0.283        # vehicle centerline, HMMWV CG height (~0.75 above ground)
+inertia 88 133 150 0 0 0
+fext 1
+
+body                     # 1: lower control arm, pivot y=0.307 z=0 (Chrono, exact x axis)
+parent 0
+joint revolute x
+tree 0.040 -0.603 0.026
+mass 23.965
+cg 0 0.240 -0.059
+inertia 0.4 0.4 0.8938 0 0 0
+fext 1
+
+body                     # 2: upper control arm, pivot at front/back midpoint
+parent 0
+joint revolute x
+tree -0.118 -0.448 0.2465
+mass 5.813
+cg 0.052 0.127 -0.0025
+inertia 0.03 0.03 0.06276 0 0 0
+fext 0
+
+body                     # 3: spindle assembly (upright + spindle + wheel + tire),
+parent -1                #    frame at the wheel center
+joint floating
+tree 0 0 0
+mass 90.555
+cg 0 -0.0342 0           # upright CG sits 0.159 inboard of the wheel center
+inertia 4.896 7.581 4.774 0 0 0
+fext 1
+
+body                     # 4: shaker post pad at the contact patch -- the driver
+parent -1
+joint prismatic z
+tree 0 0 -0.467
+mass 25
+cg 0 0 0
+inertia 0.35 0.35 0.65 0 0 0
+fext 0
+
+loop                     # lower ball joint: LCA outer end to spindle
+predecessor 1
+successor 3
+joint spherical
+ptree -0.036 0.480 -0.118
+stree 0.004 -0.123 -0.092
+
+loop                     # upper ball joint: UCA outer end to spindle
+predecessor 2
+successor 3
+joint spherical
+ptree 0.105 0.254 -0.0055
+stree -0.013 -0.194 0.241
+
+loop                     # radius rod: chassis to the spindle steering arm
+predecessor 0
+successor 3
+joint distance
+ptree -0.210 -0.462 0.080
+stree -0.136 -0.089 0.010
+length 0.3866588
+
+loop                     # driver rod: post pad to wheel center, one tire radius
+predecessor 4
+successor 3
+joint distance
+ptree 0 0 0
+stree 0 0 0
+length 0.467
