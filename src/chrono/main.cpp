@@ -347,76 +347,10 @@ static void buildChronoModel( const Model *mdl, ChronoModel &cm ) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Closure projection for loop models: random states do not satisfy the loop
-// constraints, and comparing constrained dynamics at a torn-open
-// configuration is meaningless (each side would fight the violation with its
-// own stabilization). fd_dense_full exposes delta (the position error, with
-// K = d(delta)/dq to first order), so Newton with minimal-norm updates
-// dq = -K^T (K K^T)^-1 delta pulls q onto the manifold, and the same
-// projector applied to K qd makes the velocity consistent.
-//
-// Coordinate note: the projector indexes q by velocity coordinate, which is
-// only valid while nq == nv. Loop models with floating bodies would need the
-// quaternion tangent map here.
-// ---------------------------------------------------------------------------
-static int projectClosure( const Model *mdl, double *q ) {
-    if ( !mdl->nloop ) return 0;
-    static double K[ MODEL_MAX_NC * MODEL_MAX_V ];
-    double delta[ MODEL_MAX_NC ], qdd[ MODEL_MAX_V ];
-    double zeroV[ MODEL_MAX_V ] = { 0 }, zeroF[ MODEL_MAX_BODIES * 6 ] = { 0 };
-    int nc = mdl->nc, nv = mdl->nv;
-
-    for ( int iter = 0 ; iter < 100 ; iter++ ) {
-        fd_dense_full( mdl, q, zeroV, zeroV, zeroF, qdd, K, delta );
-        double n2 = 0;
-        for ( int c = 0 ; c < nc ; c++ ) n2 += delta[c] * delta[c];
-        if ( sqrt( n2 ) < 1e-12 ) return 0;
-
-        double G[ MODEL_MAX_NC * MODEL_MAX_NC ], rhs[ MODEL_MAX_NC ], lam[ MODEL_MAX_NC ];
-        for ( int r = 0 ; r < nc ; r++ ) {
-            rhs[r] = delta[r];
-            for ( int c = 0 ; c < nc ; c++ ) {
-                double s = 0;
-                for ( int k = 0 ; k < nv ; k++ ) s += K[ r*nv + k ] * K[ c*nv + k ];
-                G[ r*nc + c ] = s;
-            }
-        }
-        linsolve( nc, G, rhs, lam );
-        for ( int k = 0 ; k < nv ; k++ ) {
-            double s = 0;
-            for ( int c = 0 ; c < nc ; c++ ) s += K[ c*nv + k ] * lam[c];
-            q[k] -= s;
-        }
-    }
-    return 1;
-}
-
-static void projectVelocity( const Model *mdl, const double *q, double *qd ) {
-    if ( !mdl->nloop ) return;
-    static double K[ MODEL_MAX_NC * MODEL_MAX_V ];
-    double qdd[ MODEL_MAX_V ];
-    double zeroV[ MODEL_MAX_V ] = { 0 }, zeroF[ MODEL_MAX_BODIES * 6 ] = { 0 };
-    int nc = mdl->nc, nv = mdl->nv;
-    fd_dense_full( mdl, q, zeroV, zeroV, zeroF, qdd, K, NULL );
-
-    double G[ MODEL_MAX_NC * MODEL_MAX_NC ], rhs[ MODEL_MAX_NC ], lam[ MODEL_MAX_NC ];
-    for ( int r = 0 ; r < nc ; r++ ) {
-        rhs[r] = 0;
-        for ( int k = 0 ; k < nv ; k++ ) rhs[r] += K[ r*nv + k ] * qd[k];
-        for ( int c = 0 ; c < nc ; c++ ) {
-            double s = 0;
-            for ( int k = 0 ; k < nv ; k++ ) s += K[ r*nv + k ] * K[ c*nv + k ];
-            G[ r*nc + c ] = s;
-        }
-    }
-    linsolve( nc, G, rhs, lam );
-    for ( int k = 0 ; k < nv ; k++ ) {
-        double s = 0;
-        for ( int c = 0 ; c < nc ; c++ ) s += K[ c*nv + k ] * lam[c];
-        qd[k] -= s;
-    }
-}
+// Closure projection and on-manifold random-walk state generation live in
+// src/validate/dense.h (projectClosure, projectVelocity, manifoldSeed,
+// manifoldStep), shared with the validation harness -- including the
+// quaternion tangent map that lets loop models contain floating bodies.
 
 // Repositions all Chrono bodies to the state (q, qd) and loads the
 // accumulators with tau and fext.
@@ -639,32 +573,42 @@ static int crossCheck( const Model *mdl, const char *path ) {
     int worstTrial = -1;
     std::vector<BodyKin> kin;
 
+    // Loop models compare at on-manifold states from the shared random walk
+    // (see manifoldSeed in dense.h): constrained dynamics is only comparable
+    // at states that satisfy the constraints, and unlike the validation
+    // harness -- which tears its walk states slightly to exercise the
+    // Baumgarte terms -- Chrono gets exactly-assembled states, since its
+    // solver would fight a violation with its own stabilization.
+    double qman[ MODEL_MAX_Q ] = { 0 };
+    if ( mdl->nloop && manifoldSeed( mdl, qman ) ) {
+        fprintf( stderr, "chrono_check: cannot find any state on the closure manifold\n" );
+        return 1;
+    }
+
     for ( int t = 0 ; t < NTRIALS ; t++ ) {
         double q[ MODEL_MAX_Q ], qd[ MODEL_MAX_V ], tau[ MODEL_MAX_V ];
         double fext[ MODEL_MAX_BODIES * 6 ];
 
         // Staging: t0 at rest, then add random q, qd, tau, fext one at a time
         // so a convention mismatch points at the term that introduced it.
-        // Loop models always draw random q (a staged q = 0 can sit at a
-        // variable-mobility singularity -- see src/validate/main.c) and are
-        // then projected onto the closure manifold: constrained dynamics is
-        // only comparable at states that satisfy the constraints.
-        for ( int k = 0 ; k < nq ; k++ ) q[k]   = ( t == 0 && !mdl->nloop ) ? 0 : 3.0 * frand();
+        // Loop models never stage q = 0 itself (a designed pose can sit at a
+        // variable-mobility singularity -- see src/validate/main.c).
+        if ( mdl->nloop ) {
+            manifoldStep( mdl, qman );
+            for ( int k = 0 ; k < nq ; k++ ) q[k] = qman[k];
+        } else {
+            for ( int k = 0 ; k < nq ; k++ ) q[k] = ( t == 0 ) ? 0 : 3.0 * frand();
+        }
         for ( int k = 0 ; k < nv ; k++ ) qd[k]  = ( t <= 1 ) ? 0 : 2.0 * frand();
         for ( int k = 0 ; k < nv ; k++ ) tau[k] = ( t <= 2 ) ? 0 : 5.0 * frand();
         for ( int k = 0 ; k < nb * 6 ; k++ )
             fext[k] = ( t <= 3 ) ? 0 : 5.0 * frand();
-        if ( t == 0 )
+        if ( t == 0 && !mdl->nloop )
             for ( int i = 0 ; i < nb ; i++ )
                 if ( mdl->body[i].jtype == JOINT_FLOATING ) q[ mdl->qidx[i] ] = 1.0;
 
-        if ( mdl->nloop ) {
-            if ( projectClosure( mdl, q ) ) {
-                fprintf( stderr, "chrono_check: closure projection failed to converge at trial %d\n", t );
-                return 1;
-            }
+        if ( mdl->nloop )
             projectVelocity( mdl, q, qd );
-        }
 
         setChronoState( mdl, cm, q, qd, tau, fext, kin );
         if ( !solveAccelerations( cm.sys ) ) {
@@ -866,10 +810,6 @@ int main( int argc, char **argv ) {
     const char *unsup = modelUnsupported( &mdl );
     if ( unsup ) {
         fprintf( stderr, "chrono_check: %s\n", unsup );
-        return 1;
-    }
-    if ( mdl.nloop && mdl.nq != mdl.nv ) {
-        fprintf( stderr, "chrono_check: closure projection does not support floating bodies yet (nq != nv)\n" );
         return 1;
     }
     // This binary links one model's generated dynamics; catch a mismatch

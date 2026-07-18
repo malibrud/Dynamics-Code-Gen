@@ -768,3 +768,184 @@ static double frand( void ) { // uniform in [-1, 1]
     rngState = rngState * 6364136223846793005ULL + 1442695040888963407ULL;
     return ( ( rngState >> 17 ) & 0xFFFFFF ) / (double)0x800000 - 1.0;
 }
+
+// ---------------------------------------------------------------------------
+// Closure projection for loop models, shared by the validation and Chrono
+// harnesses. Random states do not satisfy the loop constraints; these pull a
+// state onto the closure manifold so constrained dynamics is evaluated at a
+// mechanism that is actually assembled. fd_dense_full exposes delta (the
+// position error) and K = d(delta)/dq to first order, so Newton with
+// minimal-norm updates dq = -K^T (K K^T)^-1 delta converges to the manifold,
+// and the same projector applied to K qd makes the velocity consistent.
+//
+// K is indexed by VELOCITY coordinate, so the Newton update lives in the
+// velocity tangent space (nv slots) and must be mapped into q (nq slots).
+// For single-DOF joints that is plain addition; for a floating body the six
+// slots are a body-frame twist [w; v], applied through the quaternion
+// tangent map -- the same rates integrateQ uses:
+//     Q += 0.5 * Q x (0, w)   (then normalize)
+//     r += R(Q) * v
+// ---------------------------------------------------------------------------
+static void tangentStep( const Model *mdl, double *q, const double *dqv, double scale ) {
+    for ( int i = 0 ; i < mdl->nbod ; i++ ) {
+        int qi = mdl->qidx[ i ], vi = mdl->vidx[ i ];
+        if ( mdl->body[ i ].jtype != JOINT_FLOATING ) {
+            q[ qi ] += scale * dqv[ vi ];
+            continue;
+        }
+        double w = q[qi], x = q[qi+1], y = q[qi+2], z = q[qi+3];
+        double n = 1.0 / sqrt( w*w + x*x + y*y + z*z );
+        w *= n; x *= n; y *= n; z *= n;
+        double wx = scale * dqv[vi], wy = scale * dqv[vi+1], wz = scale * dqv[vi+2];
+        double qw = w - 0.5 * ( x*wx + y*wy + z*wz );
+        double qx = x + 0.5 * ( w*wx + y*wz - z*wy );
+        double qy = y + 0.5 * ( w*wy + z*wx - x*wz );
+        double qz = z + 0.5 * ( w*wz + x*wy - y*wx );
+        double nn = 1.0 / sqrt( qw*qw + qx*qx + qy*qy + qz*qz );
+        q[qi] = qw*nn; q[qi+1] = qx*nn; q[qi+2] = qy*nn; q[qi+3] = qz*nn;
+        double R[3][3];
+        R[0][0] = 2*( w*w + x*x - 0.5 ); R[0][1] = 2*( x*y - w*z );       R[0][2] = 2*( x*z + w*y );
+        R[1][0] = 2*( x*y + w*z );       R[1][1] = 2*( w*w + y*y - 0.5 ); R[1][2] = 2*( y*z - w*x );
+        R[2][0] = 2*( x*z - w*y );       R[2][1] = 2*( y*z + w*x );       R[2][2] = 2*( w*w + z*z - 0.5 );
+        double vv[3] = { scale * dqv[vi+3], scale * dqv[vi+4], scale * dqv[vi+5] };
+        for ( int r = 0 ; r < 3 ; r++ )
+            q[ qi + 4 + r ] += R[r][0]*vv[0] + R[r][1]*vv[1] + R[r][2]*vv[2];
+    }
+}
+
+// Damped Gauss-Newton: the raw step is always a descent direction of
+// |delta|^2, but from a badly torn state a full step can overshoot the
+// linearization (rotations especially), so the tangent step norm is capped
+// and the step is backtracked until |delta| actually decreases. Returns
+// nonzero if it stalls -- which happens at genuine local minima of |delta|^2
+// when the target is outside the mechanism's reachable workspace, so callers
+// should treat failure as "state unreachable", not as a numerical mishap.
+static int projectClosure( const Model *mdl, double *q ) {
+    if ( !mdl->nloop ) return 0;
+    static double K[ MODEL_MAX_NC * MODEL_MAX_V ];
+    double delta[ MODEL_MAX_NC ], qdd[ MODEL_MAX_V ];
+    double zeroV[ MODEL_MAX_V ] = { 0 }, zeroF[ MODEL_MAX_BODIES * 6 ] = { 0 };
+    int nc = mdl->nc, nv = mdl->nv;
+
+    fd_dense_full( mdl, q, zeroV, zeroV, zeroF, qdd, K, delta );
+    double n2 = 0;
+    for ( int c = 0 ; c < nc ; c++ ) n2 += delta[c] * delta[c];
+
+    for ( int iter = 0 ; iter < 200 ; iter++ ) {
+        if ( sqrt( n2 ) < 1e-12 ) return 0;
+
+        double G[ MODEL_MAX_NC * MODEL_MAX_NC ], rhs[ MODEL_MAX_NC ], lam[ MODEL_MAX_NC ];
+        for ( int r = 0 ; r < nc ; r++ ) {
+            rhs[r] = delta[r];
+            for ( int c = 0 ; c < nc ; c++ ) {
+                double s = 0;
+                for ( int k = 0 ; k < nv ; k++ ) s += K[ r*nv + k ] * K[ c*nv + k ];
+                G[ r*nc + c ] = s;
+            }
+        }
+        linsolve( nc, G, rhs, lam );
+        double dqv[ MODEL_MAX_V ], step2 = 0;
+        for ( int k = 0 ; k < nv ; k++ ) {
+            double s = 0;
+            for ( int c = 0 ; c < nc ; c++ ) s += K[ c*nv + k ] * lam[c];
+            dqv[k] = -s;
+            step2 += s * s;
+        }
+        double scale = sqrt( step2 ) > 0.5 ? 0.5 / sqrt( step2 ) : 1.0;
+
+        int accepted = 0;
+        for ( int bt = 0 ; bt < 30 ; bt++ ) {
+            double qtry[ MODEL_MAX_Q ];
+            for ( int k = 0 ; k < mdl->nq ; k++ ) qtry[k] = q[k];
+            tangentStep( mdl, qtry, dqv, scale );
+            double dtry[ MODEL_MAX_NC ], n2try = 0;
+            fd_dense_full( mdl, qtry, zeroV, zeroV, zeroF, qdd, K, dtry );
+            for ( int c = 0 ; c < nc ; c++ ) n2try += dtry[c] * dtry[c];
+            if ( n2try < n2 ) {
+                for ( int k = 0 ; k < mdl->nq ; k++ ) q[k] = qtry[k];
+                for ( int c = 0 ; c < nc ; c++ ) delta[c] = dtry[c];
+                n2 = n2try;
+                accepted = 1;
+                break;
+            }
+            scale *= 0.5;
+        }
+        if ( !accepted ) return 1;
+    }
+    return sqrt( n2 ) < 1e-12 ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
+// Random-walk state generation on the closure manifold, shared by the
+// validation and Chrono harnesses (both need many varied assembled states).
+// Fully random q tears the loops open by meters, and at such states the
+// method-2 matrix A = K H^-1 K^T can be almost arbitrarily ill-conditioned
+// -- the quartercar model hits cond(A) ~ 1e10 within 1000 draws, which turns
+// roundoff into 1e-7 noise between implementations that actually agree.
+// Near the manifold cond(A) stays that of the physical mechanism (~1e4
+// there). Direct projection of wild states is also unreliable: Gauss-Newton
+// stalls at local minima of the closure residual whenever the random target
+// is outside the reachable workspace. The walk avoids both problems: seed
+// once, then take a moderate random tangent step each trial and project
+// back -- every projection starts near the manifold, so it is local.
+// ---------------------------------------------------------------------------
+
+// Seeds the walk: q = 0 with identity quaternions first (most models are
+// authored to close there), then random draws. The q = 0 attempt can
+// legitimately fail for a valid model -- fourbar's q = 0 is the
+// all-links-collinear fold, a stationary point of the closure residual.
+// Returns nonzero if no seed projects, i.e. the mechanism never assembles.
+static int manifoldSeed( const Model *mdl, double *qman ) {
+    for ( int a = 0 ; a < 100 ; a++ ) {
+        if ( a == 0 ) {
+            for ( int k = 0 ; k < mdl->nq ; k++ ) qman[k] = 0;
+            for ( int i = 0 ; i < mdl->nbod ; i++ )
+                if ( mdl->body[i].jtype == JOINT_FLOATING ) qman[ mdl->qidx[i] ] = 1.0;
+        } else {
+            for ( int k = 0 ; k < mdl->nq ; k++ ) qman[k] = 3.0 * frand();
+        }
+        if ( !projectClosure( mdl, qman ) ) return 0;
+    }
+    return 1;
+}
+
+// One walk step: random tangent step, projected back. A step can leave the
+// reachable workspace (a genuine local minimum of the closure residual, not
+// a solver failure); the walk then stays at the previous on-manifold state,
+// so qman is always valid on return.
+static void manifoldStep( const Model *mdl, double *qman ) {
+    double dqv[ MODEL_MAX_V ], qprev[ MODEL_MAX_Q ];
+    for ( int k = 0 ; k < mdl->nv ; k++ ) dqv[k] = 0.5 * frand();
+    for ( int k = 0 ; k < mdl->nq ; k++ ) qprev[k] = qman[k];
+    tangentStep( mdl, qman, dqv, 1.0 );
+    if ( projectClosure( mdl, qman ) )
+        for ( int k = 0 ; k < mdl->nq ; k++ ) qman[k] = qprev[k];
+}
+
+// Velocity projection needs no tangent map: it operates on qd directly,
+// which is already indexed by velocity coordinate for every joint type.
+static void projectVelocity( const Model *mdl, const double *q, double *qd ) {
+    if ( !mdl->nloop ) return;
+    static double K[ MODEL_MAX_NC * MODEL_MAX_V ];
+    double qdd[ MODEL_MAX_V ];
+    double zeroV[ MODEL_MAX_V ] = { 0 }, zeroF[ MODEL_MAX_BODIES * 6 ] = { 0 };
+    int nc = mdl->nc, nv = mdl->nv;
+    fd_dense_full( mdl, q, zeroV, zeroV, zeroF, qdd, K, NULL );
+
+    double G[ MODEL_MAX_NC * MODEL_MAX_NC ], rhs[ MODEL_MAX_NC ], lam[ MODEL_MAX_NC ];
+    for ( int r = 0 ; r < nc ; r++ ) {
+        rhs[r] = 0;
+        for ( int k = 0 ; k < nv ; k++ ) rhs[r] += K[ r*nv + k ] * qd[k];
+        for ( int c = 0 ; c < nc ; c++ ) {
+            double s = 0;
+            for ( int k = 0 ; k < nv ; k++ ) s += K[ r*nv + k ] * K[ c*nv + k ];
+            G[ r*nc + c ] = s;
+        }
+    }
+    linsolve( nc, G, rhs, lam );
+    for ( int k = 0 ; k < nv ; k++ ) {
+        double s = 0;
+        for ( int c = 0 ; c < nc ; c++ ) s += K[ c*nv + k ] * lam[c];
+        qd[k] -= s;
+    }
+}
