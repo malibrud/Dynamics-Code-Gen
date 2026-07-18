@@ -307,44 +307,161 @@ scaled error of exactly 2.0.)
 
 ## Building
 
-Requires MSVC (Visual Studio with the C++ workload) on Windows.
+Requires MSVC (Visual Studio with the C++ workload) on Windows. Both build
+scripts locate Visual Studio via `vswhere` automatically, so they work from a
+plain terminal — no Developer Command Prompt needed.
 
 ```
 build.bat
 ```
 
-This builds `build/codegen.exe` from `src/codegen`, runs it on
-`models/threelink.mech` to emit `build/dynamics.c`, builds and runs
-`build/validate.exe` (dense reference vs generated code — the build fails if
-they disagree), repeats generation + validation for `models/fourlink.mech`,
-builds and runs `build/bench.exe` (`/O2` timing of both implementations),
-and attempts to build `build/numeric.exe` from `src/numeric` (currently
-expected to fail — see above).
-
-To generate dynamics for a different mechanism:
+For every model in its list (all twelve above), this builds
+`build\codegen.exe`, generates `build\dynamics_<model>.c`, compiles
+`build\validate_<model>.exe` and `build\bench_<model>.exe` against it, and
+runs both — the build **fails** if any model's generated code disagrees with
+the dense reference. Finally it attempts `build\numeric.exe` from
+`src/numeric` (currently expected to fail — see above).
 
 ```
-build\codegen.exe models\mymodel.mech mydynamics.c
-build\validate.exe models\mymodel.mech      (after compiling it against mydynamics.c)
+build_chrono.bat [model ...]
 ```
 
-### Chrono cross-check
+The Chrono cross-check, separate from `build.bat` so the main build has no
+Chrono dependency. Self-contained: builds the code generator, emits
+`dynamics_<model>.c` for each model, links it into a per-model
+`build\chrono_check_<model>.exe`, and runs the three checks described in
+`src/chrono` above. With no arguments it runs every model; pass model names
+(e.g. `build_chrono.bat fourbar quartercar`) to check just those.
+
+Requires a Project Chrono SDK and Eigen; defaults to `C:\dev\chrono` and
+`C:\dev\eigen-5.0.0`, overridable via the `CHRONO_DIR` and `EIGEN_DIR`
+environment variables. Note the SDK's required consumer flags (encoded in the
+script): `/arch:AVX2` is mandatory because Chrono was built with AVX2 and
+Eigen objects cross the DLL boundary — without it the heap corrupts.
+`Chrono_core.dll` (in the SDK's `bin`) must be on `PATH` at run time; the
+script sets this itself, but see the note under `chrono_check_<model>.exe`
+below for running the binaries by hand.
+
+## Running the executables
+
+Everything lands in `build\`. All commands below are shown from the repo
+root; the executables accept the model path as an argument, so the working
+directory doesn't matter. (If you omit the model path, `validate` and `bench`
+default to `../models/threelink.mech`, which only resolves when run from
+inside `build\`.)
+
+A note on the per-model naming: `validate_<model>.exe`,
+`bench_<model>.exe`, and `chrono_check_<model>.exe` each have that model's
+generated `dynamics_<model>.c` **compiled in**. The `.mech` path on the
+command line tells the harness what to compare against, so it must be the
+same model the binary was built for — a mismatch in nq/nv is caught with an
+error (`... was generated for nq=3 nv=3 but 'models\elbow.mech' has nq=6
+nv=6 -- regenerate`), but a different model with coincidentally equal sizes
+would just fail validation.
+
+### `codegen.exe` — generate specialized dynamics for a mechanism
 
 ```
-build_chrono.bat
+build\codegen.exe <mechanism-file> [output.c]
 ```
 
-Self-contained: builds the code generator, emits `dynamics_<model>.c` for each
-model, links it into a per-model `build\chrono_check_<model>.exe`, and runs the
-three checks above. Requires a Project Chrono SDK and Eigen; defaults to
-`C:\dev\chrono` and `C:\dev\eigen-5.0.0`, overridable via the `CHRONO_DIR` and
-`EIGEN_DIR` environment variables. Note the SDK's required consumer flags
-(encoded in the script): `/arch:AVX2` is mandatory because Chrono was built
-with AVX2 and Eigen objects cross the DLL boundary — without it the heap
-corrupts. `Chrono_core.dll` (in the SDK's `bin`) must be on `PATH` at run time.
+Reads a `.mech` file and writes the specialized, sparsity-exploiting C
+implementation (default output name `dynamics.c`, in the current directory).
+Silent on success; parse errors and unsupported joint types (spherical or
+cylindrical **tree** joints) are reported on stderr with a nonzero exit.
 
-To watch a single model run, with a trajectory table of both sides:
+```
+build\codegen.exe models\elbow.mech build\dynamics_elbow.c
+```
+
+The generated file exports one function and two size constants:
+
+```c
+void fwd_dyn_crba( double *q, double *qd, double *tau, double *fext, double *out_qdd );
+extern const int fwd_dyn_crba_nq;   // length of q
+extern const int fwd_dyn_crba_nv;   // length of qd, tau, out_qdd
+```
+
+`fext` is `6 * nbodies` doubles (base-coordinate spatial force per body; see
+[Conventions](#conventions)). To use a mechanism of your own, drop a
+`.mech` file in `models\` and add its name to the `MODELS` list at the top
+of `build.bat` — it will be generated, validated, and benchmarked like the
+others.
+
+### `validate_<model>.exe` — dense reference vs generated code
+
+```
+build\validate_threelink.exe models\threelink.mech
+```
+
+Runs 1000 random states (near-manifold states for loop models) through both
+the compiled-in generated code and the dense 6x6 reference and compares qdd
+to 1e-9, also checking rank(K) = nc for loop models at every trial. Exit
+code 0 = PASS, 1 = FAIL:
+
+```
+validate: models\threelink.mech: 1000 trials, max scaled |qdd_generated - qdd_dense| = 1.699e-14 (worst at trial 969)
+validate: PASS
+```
+
+### `bench_<model>.exe` — timing, generated vs dense
+
+```
+build\bench_threelink.exe models\threelink.mech
+```
+
+Times both implementations (compiled `/O2`) over a pool of 256 random
+states, batching until the per-call figure is stable, with a running
+checksum to defeat dead-code elimination:
+
+```
+bench: models\threelink.mech (3 bodies, nq 3, nv 3)
+bench: generated sparse      51.2 ns/call  (checksum/call +0.062690)
+bench: dense reference      874.2 ns/call  (checksum/call +0.062686)
+bench: speedup 17.1x
+```
+
+### `chrono_check_<model>.exe` — cross-check against Project Chrono
+
+```
+build\chrono_check_<model>.exe <model.mech>                 all three checks
+build\chrono_check_<model>.exe <model.mech> --sim <T> <dt>  simulation comparison only
+```
+
+Requires `Chrono_core.dll` on `PATH` when run outside `build_chrono.bat`:
+
+```
+set PATH=C:\dev\chrono\bin;%PATH%
+build\chrono_check_threelink.exe models\threelink.mech
+```
+
+The no-flag form runs the qd-vs-dq/dt consistency check, the 200-trial
+acceleration cross-check, and the default simulation comparison
+(T = 0.25 s, dt = 2e-5, repeated at dt/2 to show the gap is integrator
+truncation):
+
+```
+chrono_check: models\threelink.mech: qd-vs-dq/dt consistency, max scaled error = 5.799e-10 (worst at trial 11)
+chrono_check: models\threelink.mech: 200 trials, max scaled |qdd_chrono - qdd_dense| = 9.261e-10 (worst at trial 192)
+chrono_check: models\threelink.mech: 200 trials, max scaled |qdd_chrono - qdd_generated| = 9.261e-10
+chrono_check: PASS
+chrono_check: models\threelink.mech: simulation loop, generated dynamics vs Chrono, T=0.25 dt=2e-05
+    t= 0.031  gen b2( 2.8723  0.7004  0.0000)  chrono b2( 2.8723  0.7004 -0.0000)  max|dp|=1.07e-08
+    ...
+    t= 0.250  gen b2( 2.9017  0.6093  0.0000)  chrono b2( 2.9017  0.6093 -0.0000)  max|dp|=8.56e-08
+chrono_check: max |position gap| = 8.561e-08 at dt, 4.286e-08 at dt/2  (ratio 2.00 -- shrinks with the step, so the gap is integrator truncation)
+chrono_check: SIM PASS (tolerance 1.0e-02)
+```
+
+`--sim` skips the first two checks and runs just the simulation comparison
+at a chosen horizon and step, printing the trajectory table of both sides —
+useful for watching a single model evolve:
 
 ```
 build\chrono_check_elbow.exe models\elbow.mech --sim 0.25 2e-5
 ```
+
+### `numeric.exe` — legacy runtime implementation
+
+Not currently runnable: `src/numeric` doesn't build (see the layout notes
+above). `build.bat` attempts it and reports the failure without stopping.
