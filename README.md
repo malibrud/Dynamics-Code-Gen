@@ -319,8 +319,7 @@ For every model in its list (all twelve above), this builds
 `build\codegen.exe`, generates `build\dynamics_<model>.c`, compiles
 `build\validate_<model>.exe` and `build\bench_<model>.exe` against it, and
 runs both — the build **fails** if any model's generated code disagrees with
-the dense reference. Finally it attempts `build\numeric.exe` from
-`src/numeric` (currently expected to fail — see above).
+the dense reference.
 
 ```
 build_chrono.bat [model ...]
@@ -460,8 +459,3 @@ useful for watching a single model evolve:
 ```
 build\chrono_check_elbow.exe models\elbow.mech --sim 0.25 2e-5
 ```
-
-### `numeric.exe` — legacy runtime implementation
-
-Not currently runnable: `src/numeric` doesn't build (see the layout notes
-above). `build.bat` attempts it and reports the failure without stopping.
