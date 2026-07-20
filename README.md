@@ -234,6 +234,53 @@ it adds no tear. All four loop models agree with Chrono to ~1e-9 on
 accelerations and track its trajectories with the expected first-order
 truncation ratio.
 
+## Force elements and points of interest (planned)
+
+Designed but not yet implemented — the full implementation plan lives in
+[PLAN-force-elements.md](PLAN-force-elements.md). The design was settled
+around two principles the project already follows: **declare what you pay
+for** (nothing appears in the generated code that the `.mech` file didn't
+ask for — the `fext 1` contract, extended), and **the dynamics API stays
+the stable contract** while new machinery grows alongside it.
+
+The decisions:
+
+- **Points of interest (POIs)** — named points fixed to a body, declared in
+  the `.mech` file (`poi <name> <body> <x y z>`); the generator emits their
+  world kinematics. A TSDA anchor *is* a POI, so anchors and observation
+  points share one declaration and one symbolic treatment.
+- **Force elements are first-class** — `tsda <name>` blocks (translational
+  spring-damper-actuator between two named POIs) and `rsda <name>` blocks
+  (rotational, acting on a named tree joint). A TSDA is generated
+  symbolically by the same machinery as the `distance` loop joint: the
+  applied generalized force `Q = -(f/l) * row` reuses the path-walk row, so
+  it touches only the joints on the path between the two anchors — no
+  6-vector spatial-force detour. An RSDA on a tree joint is a torque into
+  that joint's `tau` slot with the angle being `q[i]` itself (RSDA across a
+  loop-closing revolute is deferred; it needs an atan2 relative angle).
+- **`fext` unchanged** — stays opt-in per body for genuinely external loads
+  (tire contact, validation probes); elements never route through it.
+- **Element inputs are opt-in** — every element carries a baked linear law
+  (`k`, `c`, and a reference `l0`/`q0`) from the `.mech` file; elements
+  additionally declared `input` get a slot in a compact `act[]` array, and
+  the total force is `baked law + act[slot]`. Passive elements compile to
+  pure expressions with no runtime input surface. The dynamics signature
+  becomes `fwd_dyn_crba( q, qd, tau, fext, act, out_qdd )`, with `act`
+  NULL-able exactly like `fext`. Caller-side nonlinear laws (real damper
+  curves) use the pattern `k 0 c 0 input`: compute the force outside from
+  the element's observed state, feed it through `act`.
+- **Name lookup via runtime tables** — the generated file exports
+  `fwd_dyn_find( kind, name )` (`kind` one of `"poi"`, `"tsda"`, `"rsda"`,
+  `"act"`) backed by const string tables, resolved once at caller init.
+  Runtime lookup rather than a generated header because the eventual JIT
+  consumer is a fixed host program that cannot recompile per model.
+- **Observation function** — generated `fwd_dyn_observe( q, qd, out_obs )`
+  exposes POI world positions and velocities plus each element's state
+  (`l`, `ldot` for TSDAs; angle, rate for RSDAs), indexed through the same
+  lookup. The temporaries already exist inside the element generation, so
+  the marginal cost is writes to an output array — and it keeps geometry
+  out of every caller's force-law code.
+
 ## Conventions
 
 These are the contract between a `.mech` file, the generated
