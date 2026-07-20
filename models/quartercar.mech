@@ -36,10 +36,24 @@
 #              it (height error is second order, ~s^2/2r)
 #
 # Mobility 2 = chassis heave + post position. Suspension deflection is their
-# difference through the linkage. There are no spring elements in this
-# format: apply spring/shock forces via fext on chassis and LCA (the Chrono
-# spring seats are chassis (0.144, -0.400, 0.223) base frame, LCA
-# (0.097, 0.236, -0.047) LCA frame), tire loads via fext on the spindle.
+# difference through the linkage. Tire loads apply via fext on the spindle.
+#
+# The real HMMWV coil spring and shock (data/vehicle/hmmwv/suspension/
+# HMMWV_DoubleWishboneFront.json) are modeled as two separate TSDAs sharing
+# the LCA mount point but not the chassis mount point (real geometry: the
+# shock is seated further up than the spring). Coordinates converted to this
+# file's base/LCA frames the same way every other hardpoint here was (Chrono
+# chassis-relative point minus the wheel-center offset (-0.040, 0.910,
+# -0.026); the LCA-frame point additionally minus the LCA pivot (0, 0.307,
+# 0) in that same Chrono frame):
+#   spring: chassis (0.104, 0.510, 0.197) -> base (0.144, -0.400, 0.223)
+#           arm     (0.097, 0.543, -0.047) -> LCA (0.097, 0.236, -0.047)
+#   shock:  chassis (0.104, 0.498, 0.323) -> base (0.144, -0.412, 0.349)
+#           arm     same point as the spring's
+# The JSON spring is a nonlinear curve (progressive, free length 0.339 m);
+# this format only has a linear TSDA, so k is the curve's slope at zero
+# deflection (3629.923 N / 0.02 m). The shock's damping coefficient is
+# already linear and used directly. Both are passive (no 'input').
 #
 # q layout (nq 11, nv 10): q[0] chassis, q[1] LCA, q[2] UCA, q[3..9] spindle
 # quaternion + position, q[10] post. Design pose: q = 0 with q[3] = 1.
@@ -121,3 +135,22 @@ joint distance
 ptree 0 0 0
 stree 0 0 0
 length 0.467
+
+poi springChassis -1 0.144 -0.400 0.223
+poi springArm 1 0.097 0.236 -0.047
+poi shockChassis -1 0.144 -0.412 0.349
+poi shockArm 1 0.097 0.236 -0.047
+
+tsda spring                # HMMWV front coil spring, linearized (see header)
+from springChassis
+to springArm
+k 181496.15
+c 0
+l0 0.339
+
+tsda shock                 # HMMWV front shock absorber
+from shockChassis
+to shockArm
+k 0
+c 19015.5692
+l0 0.339

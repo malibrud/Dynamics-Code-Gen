@@ -40,6 +40,7 @@
 #include "chrono/physics/ChBody.h"
 #include "chrono/physics/ChLinkLock.h"
 #include "chrono/physics/ChLinkDistance.h"
+#include "chrono/physics/ChLinkTSDA.h"
 #include "chrono/solver/ChDirectSolverLS.h"
 
 #include <Eigen/Dense>
@@ -227,10 +228,19 @@ struct ChronoBody {
     ChVector3d cg;         // mech body origin is at local -cg in the ChBody frame
 };
 
+// One force element (TSDA/RSDA, src/model/model.h). TSDA maps onto
+// ChLinkTSDA; RSDA has no Chrono link object (see buildChronoModel()) and is
+// applied as an ordinary joint force in setChronoState() instead.
+struct ChronoElem {
+    std::shared_ptr<ChLinkTSDA> tsda;   // null for RSDA
+    int actIdx;                          // -1 if !hasInput
+};
+
 struct ChronoModel {
     ChSystemNSC sys;
     std::shared_ptr<ChBody> ground;
     std::vector<ChronoBody> bod;
+    std::vector<ChronoElem> elem;
 };
 
 // Rotation mapping local z onto the joint axis, so ChLinkLock joints (which
@@ -346,6 +356,50 @@ static void buildChronoModel( const Model *mdl, ChronoModel &cm ) {
         link->Initialize( sb, pb, true, frameSucc, framePred );
         cm.sys.AddLink( link );
     }
+
+    // Force elements (TSDA/RSDA, src/model/model.h). Chrono ships as headers
+    // and prebuilt binaries only (no .cpp source to read the default force
+    // law from), so the TSDA mapping below was verified empirically -- see
+    // PLAN-force-elements.md's stage 6 notes -- rather than trusted from the
+    // header comments alone: SetSpringCoefficient/SetDampingCoefficient/
+    // SetRestLength match this project's k/c/l0 directly (Chrono's
+    // GetForce() reports the negative of our tension f, but the physically
+    // APPLIED force, checked via the resulting acceleration on a trivial
+    // one-body model, is identical). SetActuatorForce needs NEGATING to
+    // match this project's "positive act pulls together" convention (a
+    // positive Chrono actuator force is repulsive).
+    //
+    // RSDA has no Chrono link object at all: ChLinkRSDA's own GetAngle() is
+    // only reliable across a step-by-step simulation (it tracks continuity
+    // internally, see SetNumInitRevolutions); placing a body directly at an
+    // arbitrary q -- as every trial here does -- can land Chrono's angle a
+    // multiple of 2*pi away from q with no way to tell it which branch is
+    // physically correct (caught by a >2 magnitude cross-check error on
+    // springpend once random states exceeded +-pi; the trivial arithmetic
+    // -k*(q-q0)-c*qd needs no external validation anyway). Applied instead
+    // as an ordinary joint force in setChronoState(), exactly like tau[].
+    cm.elem.resize( mdl->nelem );
+    for ( int e = 0 ; e < mdl->nelem ; e++ ) {
+        const ModelElem *el = &mdl->elem[ e ];
+        ChronoElem &ce = cm.elem[ e ];
+        ce.actIdx = el->hasInput ? el->actIdx : -1;
+        if ( el->type != ELEM_TSDA ) continue;
+
+        const ModelPoi *pf = &mdl->poi[ el->poi1 ];
+        const ModelPoi *pt = &mdl->poi[ el->poi2 ];
+        std::shared_ptr<ChBody> b1 = pf->body == -1 ? cm.ground : cm.bod[ pf->body ].body;
+        std::shared_ptr<ChBody> b2 = pt->body == -1 ? cm.ground : cm.bod[ pt->body ].body;
+        ChVector3d loc1 = pf->body == -1 ? v3( pf->p ) : v3( pf->p ) - cm.bod[ pf->body ].cg;
+        ChVector3d loc2 = pt->body == -1 ? v3( pt->p ) : v3( pt->p ) - cm.bod[ pt->body ].cg;
+
+        auto tsda = chrono_types::make_shared<ChLinkTSDA>();
+        tsda->Initialize( b1, b2, true, loc1, loc2 );
+        tsda->SetRestLength( el->ref );
+        tsda->SetSpringCoefficient( el->k );
+        tsda->SetDampingCoefficient( el->c );
+        cm.sys.AddLink( tsda );
+        ce.tsda = tsda;
+    }
 }
 
 // Closure projection and on-manifold random-walk state generation live in
@@ -354,12 +408,30 @@ static void buildChronoModel( const Model *mdl, ChronoModel &cm ) {
 // quaternion tangent map that lets loop models contain floating bodies.
 
 // Repositions all Chrono bodies to the state (q, qd) and loads the
-// accumulators with tau and fext.
+// accumulators with tau and fext. act refreshes each element's actuator
+// value (k/c/rest length/angle are fixed at construction, buildChronoModel);
+// pass NULL only when every element is passive (mdl->nact == 0).
 static void setChronoState( const Model *mdl, ChronoModel &cm,
                             const double *q, const double *qd,
-                            const double *tau, const double *fext,
+                            const double *tau, const double *fext, const double *act,
                             std::vector<BodyKin> &kin ) {
     fk( mdl, q, qd, kin );
+
+    // RSDA (src/model/model.h) has no Chrono link object (see
+    // buildChronoModel()); fold its law into an effective tau instead, so
+    // the ordinary per-joint force application below carries it exactly
+    // like a user torque/force.
+    double tauEff[ MODEL_MAX_V ];
+    for ( int k = 0 ; k < mdl->nv ; k++ ) tauEff[k] = tau[k];
+    for ( int e = 0 ; e < mdl->nelem ; e++ ) {
+        const ModelElem *el = &mdl->elem[ e ];
+        if ( el->type != ELEM_RSDA ) continue;
+        double qq  = q[ mdl->qidx[ el->joint ] ];
+        double qqd = qd[ mdl->vidx[ el->joint ] ];
+        double tau_e = -el->k * ( qq - el->ref ) - el->c * qqd;
+        if ( el->hasInput ) tau_e += act[ el->actIdx ];
+        tauEff[ mdl->vidx[ el->joint ] ] += tau_e;
+    }
 
     for ( int i = 0 ; i < mdl->nbod ; i++ ) {
         const ModelBody *b = &mdl->body[ i ];
@@ -374,9 +446,10 @@ static void setChronoState( const Model *mdl, ChronoModel &cm,
 
         cb.body->EmptyAccumulator( cb.accum );
 
-        // Joint generalized force tau: an equal-and-opposite wrench pair
-        // between child and parent, conjugate to this joint's coordinate.
-        const double *ts = tau + mdl->vidx[ i ];
+        // Joint generalized force tau (plus any RSDA on this joint, folded
+        // into tauEff above): an equal-and-opposite wrench pair between
+        // child and parent, conjugate to this joint's coordinate.
+        const double *ts = tauEff + mdl->vidx[ i ];
         std::shared_ptr<ChBody> parent = b->parent == -1 ? cm.ground : cm.bod[ b->parent ].body;
         if ( b->jtype == JOINT_FLOATING ) {
             // tau = [ moment about body origin ; force ], in body coords.
@@ -406,6 +479,17 @@ static void setChronoState( const Model *mdl, ChronoModel &cm,
             cb.body->AccumulateForce ( cb.accum, f, ChVector3d( 0, 0, 0 ), false );
             cb.body->AccumulateTorque( cb.accum, n0, false );
         }
+    }
+
+    // TSDA actuator: refresh the per-trial value (passive TSDAs just get 0,
+    // same as never calling SetActuatorForce). k/c/rest length are fixed at
+    // construction, buildChronoModel(). RSDA was already folded into tauEff
+    // above.
+    for ( int e = 0 ; e < mdl->nelem ; e++ ) {
+        ChronoElem &ce = cm.elem[ e ];
+        if ( !ce.tsda ) continue;
+        double actVal = ce.actIdx >= 0 ? act[ ce.actIdx ] : 0.0;
+        ce.tsda->SetActuatorForce( -actVal ); // negated -- see buildChronoModel()
     }
 }
 
@@ -589,11 +673,12 @@ static int crossCheck( const Model *mdl, const char *path ) {
     for ( int t = 0 ; t < NTRIALS ; t++ ) {
         double q[ MODEL_MAX_Q ], qd[ MODEL_MAX_V ], tau[ MODEL_MAX_V ];
         double fext[ MODEL_MAX_BODIES * 6 ];
+        double act[ MODEL_MAX_ELEM ];
 
-        // Staging: t0 at rest, then add random q, qd, tau, fext one at a time
-        // so a convention mismatch points at the term that introduced it.
-        // Loop models never stage q = 0 itself (a designed pose can sit at a
-        // variable-mobility singularity -- see src/validate/main.c).
+        // Staging: t0 at rest, then add random q, qd, tau, fext, act one at a
+        // time so a convention mismatch points at the term that introduced
+        // it. Loop models never stage q = 0 itself (a designed pose can sit
+        // at a variable-mobility singularity -- see src/validate/main.c).
         if ( mdl->nloop ) {
             manifoldStep( mdl, qman );
             for ( int k = 0 ; k < nq ; k++ ) q[k] = qman[k];
@@ -604,6 +689,8 @@ static int crossCheck( const Model *mdl, const char *path ) {
         for ( int k = 0 ; k < nv ; k++ ) tau[k] = ( t <= 2 ) ? 0 : 5.0 * frand();
         for ( int k = 0 ; k < nb * 6 ; k++ )
             fext[k] = ( t <= 3 ) ? 0 : 5.0 * frand();
+        for ( int k = 0 ; k < mdl->nact ; k++ )
+            act[k] = ( t <= 4 ) ? 0 : 5.0 * frand();
         if ( t == 0 && !mdl->nloop )
             for ( int i = 0 ; i < nb ; i++ )
                 if ( mdl->body[i].jtype == JOINT_FLOATING ) q[ mdl->qidx[i] ] = 1.0;
@@ -611,7 +698,7 @@ static int crossCheck( const Model *mdl, const char *path ) {
         if ( mdl->nloop )
             projectVelocity( mdl, q, qd );
 
-        setChronoState( mdl, cm, q, qd, tau, fext, kin );
+        setChronoState( mdl, cm, q, qd, tau, fext, act, kin );
         if ( !solveAccelerations( cm.sys ) ) {
             fprintf( stderr, "chrono_check: singular KKT system at trial %d\n", t );
             return 1;
@@ -619,8 +706,8 @@ static int crossCheck( const Model *mdl, const char *path ) {
 
         double qddCh[ MODEL_MAX_V ], qddRef[ MODEL_MAX_V ], qddGen[ MODEL_MAX_V ];
         extractQdd( mdl, cm, qd, kin, qddCh );
-        fd_dense( mdl, q, qd, tau, fext, NULL, qddRef );
-        fwd_dyn_crba( q, qd, tau, fext, NULL, qddGen );
+        fd_dense( mdl, q, qd, tau, fext, act, qddRef );
+        fwd_dyn_crba( q, qd, tau, fext, act, qddGen );
 
         double trialErr = 0;
         for ( int k = 0 ; k < nv ; k++ ) {
@@ -704,13 +791,15 @@ static void initialState( const Model *mdl, double *q, double *qd ) {
 // One semi-implicit (symplectic) Euler step of the .mech state, driven by the
 // generated dynamics: qdd = f(q, qd); qd += qdd*dt; then advance q with the
 // new qd via the documented rule. Free motion -- no joint torques, no
-// external forces, gravity only.
+// external forces, gravity only, and act held at zero (see runSim) so any
+// passive element force is the only one at play and both sides agree by
+// construction.
 static void stepGenerated( const Model *mdl, double *q, double *qd, double dt ) {
-    double tau[ MODEL_MAX_V ] = { 0 }, fext[ MODEL_MAX_BODIES * 6 ] = { 0 };
+    double tau[ MODEL_MAX_V ] = { 0 }, fext[ MODEL_MAX_BODIES * 6 ] = { 0 }, act[ MODEL_MAX_ELEM ] = { 0 };
     double qdd[ MODEL_MAX_V ];
     double qNext[ MODEL_MAX_Q ];
 
-    fwd_dyn_crba( q, qd, tau, fext, NULL, qdd );
+    fwd_dyn_crba( q, qd, tau, fext, act, qdd );
     for ( int k = 0 ; k < mdl->nv ; k++ ) qd[k] += qdd[k] * dt;
     integrateQ( mdl, q, qd, dt, qNext );
     for ( int k = 0 ; k < mdl->nq ; k++ ) q[k] = qNext[k];
@@ -725,12 +814,14 @@ static double runSim( const Model *mdl, double T, double dt, int printRows ) {
     double q[ MODEL_MAX_Q ], qd[ MODEL_MAX_V ];
     initialState( mdl, q, qd );
 
-    // Place Chrono at the same initial state. tau and fext are zero, so the
-    // force accumulators stay empty for the whole run and gravity comes from
-    // the Chrono system itself.
-    double tau0[ MODEL_MAX_V ] = { 0 }, fext0[ MODEL_MAX_BODIES * 6 ] = { 0 };
+    // Place Chrono at the same initial state. tau, fext and act are zero, so
+    // the force accumulators stay empty for the whole run (and every
+    // element's actuator stays at 0 for the whole run too, since nothing
+    // calls setChronoState again inside the stepping loop below) -- gravity
+    // and any passive element forces come from the Chrono system itself.
+    double tau0[ MODEL_MAX_V ] = { 0 }, fext0[ MODEL_MAX_BODIES * 6 ] = { 0 }, act0[ MODEL_MAX_ELEM ] = { 0 };
     std::vector<BodyKin> kin;
-    setChronoState( mdl, cm, q, qd, tau0, fext0, kin );
+    setChronoState( mdl, cm, q, qd, tau0, fext0, act0, kin );
 
     int nsteps = (int)( T / dt + 0.5 );
     int rowEvery = printRows > 0 ? nsteps / printRows : 0;
@@ -815,9 +906,9 @@ int main( int argc, char **argv ) {
     }
     // This binary links one model's generated dynamics; catch a mismatch
     // rather than letting it read past the end of q.
-    if ( fwd_dyn_crba_nq != mdl.nq || fwd_dyn_crba_nv != mdl.nv ) {
-        fprintf( stderr, "chrono_check: linked dynamics.c is for nq=%d nv=%d but '%s' has nq=%d nv=%d -- regenerate\n",
-                 fwd_dyn_crba_nq, fwd_dyn_crba_nv, argv[ 1 ], mdl.nq, mdl.nv );
+    if ( fwd_dyn_crba_nq != mdl.nq || fwd_dyn_crba_nv != mdl.nv || fwd_dyn_crba_nact != mdl.nact ) {
+        fprintf( stderr, "chrono_check: linked dynamics.c is for nq=%d nv=%d nact=%d but '%s' has nq=%d nv=%d nact=%d -- regenerate\n",
+                 fwd_dyn_crba_nq, fwd_dyn_crba_nv, fwd_dyn_crba_nact, argv[ 1 ], mdl.nq, mdl.nv, mdl.nact );
         return 1;
     }
 

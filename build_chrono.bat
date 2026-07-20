@@ -25,7 +25,7 @@ if not exist "%EIGEN_DIR%\Eigen" (
     exit /b 1
 )
 
-set MODELS=threelink fourlink elbow stanford gantry pendulums bintree satellite fourbar rrrs slidercrank quartercar
+set MODELS=threelink fourlink elbow stanford gantry pendulums bintree satellite fourbar rrrs slidercrank quartercar springpend
 rem Optional: pass model names as arguments to check just those.
 if not "%~1"=="" set MODELS=%*
 
