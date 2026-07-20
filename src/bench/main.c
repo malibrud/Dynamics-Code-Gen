@@ -27,20 +27,21 @@ static double qs[ NSTATES ][ MODEL_MAX_Q ];
 static double qds[ NSTATES ][ MODEL_MAX_V ];
 static double taus[ NSTATES ][ MODEL_MAX_V ];
 static double fexts[ NSTATES ][ MODEL_MAX_BODIES * 6 ];
+static double acts[ NSTATES ][ MODEL_MAX_ELEM ];
 
 typedef void (*FdFn)( const double *q, const double *qd, const double *tau,
-                      const double *fext, double *qdd );
+                      const double *fext, const double *act, double *qdd );
 
 // The generated function's signature is non-const; the inputs are never
 // written, so adapting via cast is safe here.
 static void genAdapter( const double *q, const double *qd, const double *tau,
-                        const double *fext, double *qdd ) {
-    fwd_dyn_crba( (double*)q, (double*)qd, (double*)tau, (double*)fext, NULL, qdd );
+                        const double *fext, const double *act, double *qdd ) {
+    fwd_dyn_crba( (double*)q, (double*)qd, (double*)tau, (double*)fext, (double*)act, qdd );
 }
 
 static void denseAdapter( const double *q, const double *qd, const double *tau,
-                          const double *fext, double *qdd ) {
-    fd_dense( &g_mdl, q, qd, tau, fext, qdd );
+                          const double *fext, const double *act, double *qdd ) {
+    fd_dense( &g_mdl, q, qd, tau, fext, act, qdd );
 }
 
 // Runs fn in batches until minSeconds has elapsed; returns ns per call.
@@ -57,7 +58,7 @@ static double benchOne( FdFn fn, double minSeconds, double *checksumPerCall ) {
     do {
         for ( int b = 0 ; b < 10000 ; b++ ) {
             int s = (int)( calls & ( NSTATES - 1 ) );
-            fn( qs[s], qds[s], taus[s], fexts[s], qdd );
+            fn( qs[s], qds[s], taus[s], fexts[s], acts[s], qdd );
             checksum += qdd[ 0 ] + qdd[ g_mdl.nv - 1 ];
             calls++;
         }
@@ -81,9 +82,9 @@ int main( int argc, char **argv ) {
         fprintf( stderr, "bench: %s\n", unsup );
         return 1;
     }
-    if ( fwd_dyn_crba_nq != g_mdl.nq || fwd_dyn_crba_nv != g_mdl.nv ) {
-        fprintf( stderr, "bench: dynamics.c was generated for nq=%d nv=%d but '%s' has nq=%d nv=%d -- regenerate\n",
-                 fwd_dyn_crba_nq, fwd_dyn_crba_nv, path, g_mdl.nq, g_mdl.nv );
+    if ( fwd_dyn_crba_nq != g_mdl.nq || fwd_dyn_crba_nv != g_mdl.nv || fwd_dyn_crba_nact != g_mdl.nact ) {
+        fprintf( stderr, "bench: dynamics.c was generated for nq=%d nv=%d nact=%d but '%s' has nq=%d nv=%d nact=%d -- regenerate\n",
+                 fwd_dyn_crba_nq, fwd_dyn_crba_nv, fwd_dyn_crba_nact, path, g_mdl.nq, g_mdl.nv, g_mdl.nact );
         return 1;
     }
 
@@ -92,6 +93,7 @@ int main( int argc, char **argv ) {
         for ( int k = 0 ; k < g_mdl.nv ; k++ )     qds[s][k]  = 2.0 * frand();
         for ( int k = 0 ; k < g_mdl.nv ; k++ )     taus[s][k] = 5.0 * frand();
         for ( int k = 0 ; k < g_mdl.nbod * 6 ; k++ ) fexts[s][k] = 5.0 * frand();
+        for ( int k = 0 ; k < g_mdl.nact ; k++ )     acts[s][k]  = 5.0 * frand();
     }
 
     // Warm-up (page in code, settle clocks), then measure.

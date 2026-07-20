@@ -7,7 +7,7 @@ set SRC=%ROOT%src
 
 rem Every model in this list is generated, validated against the dense
 rem reference, and benchmarked. The build fails on any disagreement.
-set MODELS=threelink fourlink elbow stanford gantry pendulums bintree satellite fourbar rrrs slidercrank quartercar
+set MODELS=threelink fourlink elbow stanford gantry pendulums bintree satellite fourbar rrrs slidercrank quartercar springpend
 
 if not exist "%BUILD%" mkdir "%BUILD%"
 

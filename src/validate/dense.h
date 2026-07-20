@@ -376,6 +376,35 @@ static void axisAlignE( char axis, double E[3][3] ) {
     }
 }
 
+// World position of a poi's local point, from the array of base->body
+// transforms fd_dense_full already built (Xa[i] = i_X_0): p = r + E^T*t,
+// with r the frame's origin (xformOrigin) and E the transform's upper-left
+// 3x3 block -- mirrors the generator's loopAnchorBase (gen_loops.h), but
+// deliberately kept as separate, independent code (see fd_dense_full's
+// header comment on why elements are applied via a different route there).
+static void poiWorldPos( const ModelPoi *poi, double Xa[][6][6], double p[3] ) {
+    if ( poi->body == -1 ) { p[0] = poi->p[0]; p[1] = poi->p[1]; p[2] = poi->p[2]; return; }
+    double r[3];
+    xformOrigin( Xa[ poi->body ], r );
+    for ( int k = 0 ; k < 3 ; k++ ) {
+        double s = r[k];
+        for ( int i = 0 ; i < 3 ; i++ ) s += Xa[ poi->body ][i][k] * poi->p[i];
+        p[k] = s;
+    }
+}
+
+// A poi's body's base-coordinate spatial velocity [w; vO] (vO = velocity of
+// the point instantaneously coincident with the base origin), solved rather
+// than inverted -- same recipe fd_dense_full already uses for loop anchors.
+// Zero for a poi fixed to the base.
+static void poiWorldVel( const ModelPoi *poi, double Xa[][6][6], double v[][6], double vout[6] ) {
+    if ( poi->body == -1 ) { for ( int k = 0 ; k < 6 ; k++ ) vout[k] = 0; return; }
+    double M[36], b6[6];
+    for ( int r = 0 ; r < 6 ; r++ ) for ( int c = 0 ; c < 6 ; c++ ) M[ r*6 + c ] = Xa[ poi->body ][r][c];
+    for ( int k = 0 ; k < 6 ; k++ ) b6[k] = v[ poi->body ][k];
+    linsolve( 6, M, b6, vout );
+}
+
 // ---------------------------------------------------------------------------
 // Dense forward dynamics: H*qdd = tau - C, with C from the RNEA (RBDA Table
 // 5.1, aJ = 0) and H from the CRBA (RBDA Table 6.4). Joints may have 1 DOF
@@ -392,10 +421,20 @@ static void axisAlignE( char axis, double E[3][3] ) {
 // rank(K) = nc. delta_out, if non-NULL, receives the nc position errors
 // (Table 8.1's delta, stacked per loop): K is d(delta)/dq to first order,
 // so the pair supports Newton-projecting a state onto the closure manifold.
+//
+// Force elements (TSDA/RSDA, src/model/model.h) are applied via a route
+// deliberately DIFFERENT from the generator's: the generator's Q is the
+// TSDA tension projected through the distance loop joint's path-walk row
+// (gen_elems.h); here each TSDA becomes an explicit equal-and-opposite
+// spatial force at its two anchors in base coordinates, folded into the
+// per-body bias force exactly like fext (but always on, not opt-in). RSDA
+// is a direct torque into its own coordinate either way, since there is no
+// second formulation of "torque on your own joint" -- act is NULL-able
+// exactly like fext, and only read when some element actually has 'input'.
 // ---------------------------------------------------------------------------
 static void fd_dense_full( const Model *mdl, const double *q, const double *qd,
-                           const double *tau, const double *fext, double *qdd_out,
-                           double *K_out, double *delta_out ) {
+                           const double *tau, const double *fext, const double *act,
+                           double *qdd_out, double *K_out, double *delta_out ) {
     int nb = mdl->nbod;
     int nv = mdl->nv;
     double Xup[ MODEL_MAX_BODIES ][6][6]; // i_X_lambda(i)
@@ -470,6 +509,94 @@ static void fd_dense_full( const Model *mdl, const double *q, const double *qd,
             linsolve( 6, XaT, bvec, fb );
             for ( int k = 0 ; k < 6 ; k++ ) fvp[i][k] -= fb[k];
         }
+    }
+
+    // Force elements: TSDA becomes equal-and-opposite spatial forces at its
+    // two anchors, base coordinates -- deliberately not the generator's
+    // path-walk row (see the header comment above). Runs after every body's
+    // Xa/v is known, since an element's anchors can be on any two bodies,
+    // not just parent-child (unlike fext, which only ever needs its own
+    // body's Xa and so lives inside the loop above).
+    static double elemForceBase[ MODEL_MAX_BODIES ][6];
+    static double elemQ[ MODEL_MAX_V ];
+    for ( int i = 0 ; i < nb ; i++ ) for ( int k = 0 ; k < 6 ; k++ ) elemForceBase[i][k] = 0;
+    for ( int k = 0 ; k < nv ; k++ ) elemQ[k] = 0;
+
+    for ( int e = 0 ; e < mdl->nelem ; e++ ) {
+        const ModelElem *el = &mdl->elem[ e ];
+
+        if ( el->type == ELEM_RSDA ) {
+            // Direct torque into its own coordinate: tau_e = -k*(q - q0) -
+            // c*qd + act[slot]. No second formulation exists for "a torque
+            // on your own joint", so this matches the generator exactly.
+            int b = el->joint;
+            double qq  = q[ mdl->qidx[ b ] ];
+            double qqd = qd[ mdl->vidx[ b ] ];
+            double tau_e = -el->k * ( qq - el->ref ) - el->c * qqd;
+            if ( el->hasInput ) tau_e += act[ el->actIdx ];
+            elemQ[ mdl->vidx[ b ] ] += tau_e;
+            continue;
+        }
+
+        // TSDA: tension f = k*(l - l0) + c*ldot + act[slot], positive f
+        // pulls the anchors together. Force on "to" points back toward
+        // "from"; equal and opposite on "from".
+        const ModelPoi *pf = &mdl->poi[ el->poi1 ];
+        const ModelPoi *pt = &mdl->poi[ el->poi2 ];
+        double pp[3], ps[3], rho[3];
+        poiWorldPos( pf, Xa, pp );
+        poiWorldPos( pt, Xa, ps );
+        for ( int k = 0 ; k < 3 ; k++ ) rho[k] = ps[k] - pp[k];
+        double l = sqrt( rho[0]*rho[0] + rho[1]*rho[1] + rho[2]*rho[2] );
+        double linv = 1.0 / l;
+
+        double vp6[6], vs6[6];
+        poiWorldVel( pf, Xa, v, vp6 );
+        poiWorldVel( pt, Xa, v, vs6 );
+        double ppd[3], psd[3], rhod[3];
+        ppd[0] = vp6[3] + vp6[1]*pp[2] - vp6[2]*pp[1];
+        ppd[1] = vp6[4] + vp6[2]*pp[0] - vp6[0]*pp[2];
+        ppd[2] = vp6[5] + vp6[0]*pp[1] - vp6[1]*pp[0];
+        psd[0] = vs6[3] + vs6[1]*ps[2] - vs6[2]*ps[1];
+        psd[1] = vs6[4] + vs6[2]*ps[0] - vs6[0]*ps[2];
+        psd[2] = vs6[5] + vs6[0]*ps[1] - vs6[1]*ps[0];
+        for ( int k = 0 ; k < 3 ; k++ ) rhod[k] = psd[k] - ppd[k];
+        double ldot = ( rho[0]*rhod[0] + rho[1]*rhod[1] + rho[2]*rhod[2] ) * linv;
+
+        double ff = el->k * ( l - el->ref ) + el->c * ldot;
+        if ( el->hasInput ) ff += act[ el->actIdx ];
+
+        double Fto[3] = { -ff * rho[0] * linv, -ff * rho[1] * linv, -ff * rho[2] * linv };
+        if ( pt->body != -1 ) {
+            double mom[3];
+            mom[0] = ps[1]*Fto[2] - ps[2]*Fto[1];
+            mom[1] = ps[2]*Fto[0] - ps[0]*Fto[2];
+            mom[2] = ps[0]*Fto[1] - ps[1]*Fto[0];
+            for ( int k = 0 ; k < 3 ; k++ ) { elemForceBase[ pt->body ][k] += mom[k]; elemForceBase[ pt->body ][3+k] += Fto[k]; }
+        }
+        if ( pf->body != -1 ) {
+            double Ffrom[3] = { -Fto[0], -Fto[1], -Fto[2] };
+            double mom[3];
+            mom[0] = pp[1]*Ffrom[2] - pp[2]*Ffrom[1];
+            mom[1] = pp[2]*Ffrom[0] - pp[0]*Ffrom[2];
+            mom[2] = pp[0]*Ffrom[1] - pp[1]*Ffrom[0];
+            for ( int k = 0 ; k < 3 ; k++ ) { elemForceBase[ pf->body ][k] += mom[k]; elemForceBase[ pf->body ][3+k] += Ffrom[k]; }
+        }
+    }
+
+    // Fold elemForceBase into fvp exactly like fext (i_X*_0 = (Xa^T)^-1),
+    // but always on -- elements are not opt-in per body -- and done here,
+    // after every body's Xa is known, rather than inside the loop above.
+    for ( int i = 0 ; i < nb ; i++ ) {
+        int hasForce = 0;
+        for ( int k = 0 ; k < 6 ; k++ ) if ( elemForceBase[i][k] != 0 ) hasForce = 1;
+        if ( !hasForce ) continue;
+        double XaT[36], bvec[6], fb[6];
+        for ( int r = 0 ; r < 6 ; r++ )
+        for ( int c = 0 ; c < 6 ; c++ ) XaT[ r*6 + c ] = Xa[i][c][r];
+        for ( int k = 0 ; k < 6 ; k++ ) bvec[k] = elemForceBase[i][k];
+        linsolve( 6, XaT, bvec, fb );
+        for ( int k = 0 ; k < 6 ; k++ ) fvp[i][k] -= fb[k];
     }
 
     // Inward pass: C block = S_i^T fvp_i; fvp_parent += Xup^T fvp_i.
@@ -548,7 +675,7 @@ static void fd_dense_full( const Model *mdl, const double *q, const double *qd,
     static double A[ MODEL_MAX_V * MODEL_MAX_V ];
     double rhs[ MODEL_MAX_V ];
     for ( int r = 0 ; r < nv ; r++ ) {
-        rhs[r] = tau[r] - C[r];
+        rhs[r] = tau[r] - C[r] + elemQ[r];
         for ( int c = 0 ; c < nv ; c++ ) A[ r*nv + c ] = H[r][c];
     }
     linsolve( nv, A, rhs, qdd_out );
@@ -756,8 +883,8 @@ static void fd_dense_full( const Model *mdl, const double *q, const double *qd,
 }
 
 static void fd_dense( const Model *mdl, const double *q, const double *qd,
-                      const double *tau, const double *fext, double *qdd_out ) {
-    fd_dense_full( mdl, q, qd, tau, fext, qdd_out, NULL, NULL );
+                      const double *tau, const double *fext, const double *act, double *qdd_out ) {
+    fd_dense_full( mdl, q, qd, tau, fext, act, qdd_out, NULL, NULL );
 }
 
 // ---------------------------------------------------------------------------
@@ -827,7 +954,9 @@ static int projectClosure( const Model *mdl, double *q ) {
     double zeroV[ MODEL_MAX_V ] = { 0 }, zeroF[ MODEL_MAX_BODIES * 6 ] = { 0 };
     int nc = mdl->nc, nv = mdl->nv;
 
-    fd_dense_full( mdl, q, zeroV, zeroV, zeroF, qdd, K, delta );
+    // Geometry-only call: K/delta don't depend on forces at all, so a zero
+    // act (reusing the already-zeroed zeroV buffer) is exact, not a stand-in.
+    fd_dense_full( mdl, q, zeroV, zeroV, zeroF, zeroV, qdd, K, delta );
     double n2 = 0;
     for ( int c = 0 ; c < nc ; c++ ) n2 += delta[c] * delta[c];
 
@@ -859,7 +988,7 @@ static int projectClosure( const Model *mdl, double *q ) {
             for ( int k = 0 ; k < mdl->nq ; k++ ) qtry[k] = q[k];
             tangentStep( mdl, qtry, dqv, scale );
             double dtry[ MODEL_MAX_NC ], n2try = 0;
-            fd_dense_full( mdl, qtry, zeroV, zeroV, zeroF, qdd, K, dtry );
+            fd_dense_full( mdl, qtry, zeroV, zeroV, zeroF, zeroV, qdd, K, dtry );
             for ( int c = 0 ; c < nc ; c++ ) n2try += dtry[c] * dtry[c];
             if ( n2try < n2 ) {
                 for ( int k = 0 ; k < mdl->nq ; k++ ) q[k] = qtry[k];
@@ -930,7 +1059,7 @@ static void projectVelocity( const Model *mdl, const double *q, double *qd ) {
     double qdd[ MODEL_MAX_V ];
     double zeroV[ MODEL_MAX_V ] = { 0 }, zeroF[ MODEL_MAX_BODIES * 6 ] = { 0 };
     int nc = mdl->nc, nv = mdl->nv;
-    fd_dense_full( mdl, q, zeroV, zeroV, zeroF, qdd, K, NULL );
+    fd_dense_full( mdl, q, zeroV, zeroV, zeroF, zeroV, qdd, K, NULL );
 
     double G[ MODEL_MAX_NC * MODEL_MAX_NC ], rhs[ MODEL_MAX_NC ], lam[ MODEL_MAX_NC ];
     for ( int r = 0 ; r < nc ; r++ ) {

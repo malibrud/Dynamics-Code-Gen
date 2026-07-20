@@ -56,9 +56,9 @@ int main( int argc, char **argv ) {
         fprintf( stderr, "validate: %s\n", unsup );
         return 1;
     }
-    if ( fwd_dyn_crba_nq != mdl.nq || fwd_dyn_crba_nv != mdl.nv ) {
-        fprintf( stderr, "validate: dynamics.c was generated for nq=%d nv=%d but '%s' has nq=%d nv=%d -- regenerate\n",
-                 fwd_dyn_crba_nq, fwd_dyn_crba_nv, path, mdl.nq, mdl.nv );
+    if ( fwd_dyn_crba_nq != mdl.nq || fwd_dyn_crba_nv != mdl.nv || fwd_dyn_crba_nact != mdl.nact ) {
+        fprintf( stderr, "validate: dynamics.c was generated for nq=%d nv=%d nact=%d but '%s' has nq=%d nv=%d nact=%d -- regenerate\n",
+                 fwd_dyn_crba_nq, fwd_dyn_crba_nv, fwd_dyn_crba_nact, path, mdl.nq, mdl.nv, mdl.nact );
         return 1;
     }
     int nb = mdl.nbod, nq = mdl.nq, nv = mdl.nv;
@@ -88,6 +88,7 @@ int main( int argc, char **argv ) {
     for ( int t = 0 ; t < NTRIALS ; t++ ) {
         double q[ MODEL_MAX_Q ], qd[ MODEL_MAX_V ], tau[ MODEL_MAX_V ];
         double fext[ MODEL_MAX_BODIES * 6 ];
+        double act[ MODEL_MAX_ELEM ];
 
         // First trials pin down special cases; the rest are fully random.
         // Loop models never stage q = 0 itself: a designed pose can sit at a
@@ -109,6 +110,8 @@ int main( int argc, char **argv ) {
         for ( int k = 0 ; k < nv ; k++ ) tau[k] = ( t <= 2 ) ? 0 : 5.0 * frand();
         for ( int k = 0 ; k < nb * 6 ; k++ )
             fext[k] = ( t <= 3 ) ? 0 : 5.0 * frand();
+        for ( int k = 0 ; k < mdl.nact ; k++ )
+            act[k] = ( t <= 4 ) ? 0 : 5.0 * frand();
 
         // An all-zero quaternion is not a pose; the at-rest trial needs the
         // identity quaternion for every floating body. Random trials keep
@@ -122,8 +125,8 @@ int main( int argc, char **argv ) {
 
         double qddGen[ MODEL_MAX_V ], qddRef[ MODEL_MAX_V ];
         static double K[ MODEL_MAX_NC * MODEL_MAX_V ];
-        fwd_dyn_crba( q, qd, tau, fext, NULL, qddGen );
-        fd_dense_full( &mdl, q, qd, tau, fext, qddRef, mdl.nloop ? K : NULL, NULL );
+        fwd_dyn_crba( q, qd, tau, fext, act, qddGen );
+        fd_dense_full( &mdl, q, qd, tau, fext, act, qddRef, mdl.nloop ? K : NULL, NULL );
 
         if ( mdl.nloop ) {
             int r = rankK( mdl.nc, nv, K );

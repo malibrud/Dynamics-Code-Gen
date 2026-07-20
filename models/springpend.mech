@@ -1,0 +1,43 @@
+# Two independent pendulums off the base -- loop-free, cheap -- carrying a
+# TSDA from a fixed base point to a point on body 0's rod, and an RSDA on
+# body 1's joint, both declared 'input'. Exercises every force-element code
+# path (POI kinematics, TSDA path-walk with a and c and act, RSDA with k, c
+# and act) without the added complexity of a kinematic loop; see
+# slidercrank.mech for a model combining elements with a loop.
+
+gravity 0 0 -9.81
+
+body                     # 0: pendulum swinging about y, TSDA attaches here
+parent -1
+joint revolute y
+tree 0 0 0
+mass 1
+cg 0 0 -0.5
+inertia 0.08 0.08 0.01 0 0 0
+fext 1
+
+body                     # 1: pendulum swinging about x, RSDA acts on this joint
+parent -1
+joint revolute x
+tree 1 0 0
+mass 0.7
+cg 0 0 -0.4
+inertia 0.05 0.05 0.008 0 0 0
+
+poi topAnchor -1 0 0 0.5    # fixed point above body 0's pivot
+poi bob 0 0 0 -1             # bottom of body 0's rod
+
+tsda spring
+from topAnchor
+to bob
+k 40
+c 2
+l0 1.0
+input
+
+rsda damper
+joint 1
+k 5
+c 0.5
+q0 0
+input

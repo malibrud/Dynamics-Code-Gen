@@ -619,7 +619,7 @@ static int crossCheck( const Model *mdl, const char *path ) {
 
         double qddCh[ MODEL_MAX_V ], qddRef[ MODEL_MAX_V ], qddGen[ MODEL_MAX_V ];
         extractQdd( mdl, cm, qd, kin, qddCh );
-        fd_dense( mdl, q, qd, tau, fext, qddRef );
+        fd_dense( mdl, q, qd, tau, fext, NULL, qddRef );
         fwd_dyn_crba( q, qd, tau, fext, NULL, qddGen );
 
         double trialErr = 0;

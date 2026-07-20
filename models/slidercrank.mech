@@ -12,6 +12,11 @@
 # Rod length 1.0 comfortably exceeds the worst-case transverse gap
 # (~0.36 m), so the crank turns fully and a slider position exists at every
 # crank angle.
+#
+# A passive return-spring TSDA from a fixed base point to a point on the
+# crank combines a force element with a kinematic loop: its path-walk row
+# touches body 0's joint, one of the two loop-path bodies (see PLAN and
+# README's "Force elements and points of interest").
 
 gravity 0.5 -2.0 -9.81
 stab 0.05
@@ -41,3 +46,13 @@ joint distance
 ptree 0.3 0 0.1
 stree 0 0.05 -0.1
 length 1.0
+
+poi baseSpring -1 0.3 0 0.3
+poi crankSpring 0 0.15 0.1 -0.05
+
+tsda returnSpring        # passive: no 'input', a fixed linear return spring
+from baseSpring
+to crankSpring
+k 15
+c 1
+l0 0.4
