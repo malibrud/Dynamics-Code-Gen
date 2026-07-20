@@ -13,6 +13,7 @@ void gen_prelude( FILE *f, int withLoops ) {
     prln_file = f;
 
     prln( "#include <math.h>" );
+    prln( "#include <string.h>" );
     prln( "" );
 
     if ( withLoops ) {

@@ -12,6 +12,7 @@
 #include "gen_elems.h"
 #include "gen_loops.h"
 #include "gen_solve_qdd.h"
+#include "gen_observe.h"
 
 int main( int argc, char **argv ) {
     if ( argc < 2 ) {
@@ -104,13 +105,16 @@ int main( int argc, char **argv ) {
     for ( int p = 0 ; p < mdl.npoi ; p++ ) {
         ModelPoi *mp = &mdl.poi[ p ];
         System::SysPoi sp;
+        sp.name = mp->name;
         sp.body = mp->body;
         for ( int k = 0 ; k < 3 ; k++ ) sp.p[ k ] = mp->p[ k ];
+        sp.obsIdx = mp->obsIdx;
         sys.pois.push_back( sp );
     }
     for ( int e = 0 ; e < mdl.nelem ; e++ ) {
         ModelElem *me = &mdl.elem[ e ];
         System::SysElem se;
+        se.name = me->name;
         se.type = me->type == ELEM_TSDA ? System::SysElem::TSDA : System::SysElem::RSDA;
         se.poi1 = me->poi1;
         se.poi2 = me->poi2;
@@ -120,6 +124,7 @@ int main( int argc, char **argv ) {
         se.ref = me->ref;
         se.hasInput = me->hasInput;
         se.actIdx = me->actIdx;
+        se.obsIdx = me->obsIdx;
         sys.elems.push_back( se );
     }
     sys.nact = mdl.nact;
@@ -142,6 +147,7 @@ int main( int argc, char **argv ) {
     gen_elems( f, &sys );
     gen_loops( f, &sys );
     gen_solve_qdd( f, &sys );
+    gen_observe( f, &sys );
     fclose( f );
 
     return 0;

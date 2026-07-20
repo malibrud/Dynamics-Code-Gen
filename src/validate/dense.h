@@ -888,6 +888,85 @@ static void fd_dense( const Model *mdl, const double *q, const double *qd,
 }
 
 // ---------------------------------------------------------------------------
+// Kinematics-only pass -- Xa[i] (i_X_0) and v[i] (body-frame spatial
+// velocity) for every body -- mirroring the first loop of fd_dense_full but
+// stopping there (no inertia, no bias force). Feeds denseObserveTsda below,
+// the cross-check for the generator's fwd_dyn_observe().
+// ---------------------------------------------------------------------------
+static void denseKinematics( const Model *mdl, const double *q, const double *qd,
+                             double Xa[][6][6], double v[][6] ) {
+    int nb = mdl->nbod;
+    for ( int i = 0 ; i < nb ; i++ ) {
+        const ModelBody *b = &mdl->body[ i ];
+        int par = b->parent;
+        int vi = mdl->vidx[ i ];
+
+        double Eident[3][3] = { {1,0,0},{0,1,0},{0,0,1} };
+        double XJ[6][6], XT[6][6], Xup[6][6], S[6][6];
+        int ndof = jointXS( b, q + mdl->qidx[ i ], XJ, S );
+        plux( Eident, b->tree, XT );
+        m6_mul( XJ, XT, Xup );
+
+        if ( par == -1 ) {
+            for ( int r = 0 ; r < 6 ; r++ ) for ( int c = 0 ; c < 6 ; c++ ) Xa[i][r][c] = Xup[r][c];
+        } else {
+            m6_mul( Xup, Xa[par], Xa[i] );
+        }
+
+        double vJ[6] = { 0, 0, 0, 0, 0, 0 };
+        for ( int r = 0 ; r < 6 ; r++ )
+            for ( int k = 0 ; k < ndof ; k++ ) vJ[r] += S[r][k] * qd[ vi + k ];
+        if ( par == -1 ) {
+            for ( int k = 0 ; k < 6 ; k++ ) v[i][k] = vJ[k];
+        } else {
+            m6_mulvec( Xup, v[par], v[i] );
+            for ( int k = 0 ; k < 6 ; k++ ) v[i][k] += vJ[k];
+        }
+    }
+}
+
+// Independent recomputation of every TSDA's l/ldot straight from the state
+// (via denseKinematics + the same poiWorldPos/poiWorldVel the element-force
+// block above uses), for cross-checking the generator's fwd_dyn_observe().
+// Indexed by TSDA declaration order, matching fwd_dyn_find's "tsda" table.
+static void denseObserveTsda( const Model *mdl, const double *q, const double *qd,
+                              double *out_l, double *out_ldot ) {
+    static double Xa[ MODEL_MAX_BODIES ][6][6];
+    static double v[ MODEL_MAX_BODIES ][6];
+    denseKinematics( mdl, q, qd, Xa, v );
+
+    int t = 0;
+    for ( int e = 0 ; e < mdl->nelem ; e++ ) {
+        const ModelElem *el = &mdl->elem[ e ];
+        if ( el->type != ELEM_TSDA ) continue;
+        const ModelPoi *pf = &mdl->poi[ el->poi1 ];
+        const ModelPoi *pt = &mdl->poi[ el->poi2 ];
+        double pp[3], ps[3], rho[3];
+        poiWorldPos( pf, Xa, pp );
+        poiWorldPos( pt, Xa, ps );
+        for ( int k = 0 ; k < 3 ; k++ ) rho[k] = ps[k] - pp[k];
+        double l = sqrt( rho[0]*rho[0] + rho[1]*rho[1] + rho[2]*rho[2] );
+
+        double vp6[6], vs6[6];
+        poiWorldVel( pf, Xa, v, vp6 );
+        poiWorldVel( pt, Xa, v, vs6 );
+        double ppd[3], psd[3], rhod[3];
+        ppd[0] = vp6[3] + vp6[1]*pp[2] - vp6[2]*pp[1];
+        ppd[1] = vp6[4] + vp6[2]*pp[0] - vp6[0]*pp[2];
+        ppd[2] = vp6[5] + vp6[0]*pp[1] - vp6[1]*pp[0];
+        psd[0] = vs6[3] + vs6[1]*ps[2] - vs6[2]*ps[1];
+        psd[1] = vs6[4] + vs6[2]*ps[0] - vs6[0]*ps[2];
+        psd[2] = vs6[5] + vs6[0]*ps[1] - vs6[1]*ps[0];
+        for ( int k = 0 ; k < 3 ; k++ ) rhod[k] = psd[k] - ppd[k];
+        double ldot = ( rho[0]*rhod[0] + rho[1]*rhod[1] + rho[2]*rhod[2] ) / l;
+
+        out_l[t] = l;
+        out_ldot[t] = ldot;
+        t++;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Deterministic pseudo-random state generator, shared by the harnesses.
 // ---------------------------------------------------------------------------
 static unsigned long long rngState = 0x853c49e6748fea9bULL;

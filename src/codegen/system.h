@@ -72,17 +72,21 @@ struct System{
     // point fixed to a body ("body" -1 = fixed base); a TSDA anchor *is* a
     // poi. See src/model/model.h for the grammar and force-law signs.
     struct SysPoi {
+        string name;
         int body;           // -1 = fixed base
         double p[3];
+        int obsIdx;          // offset into out_obs (6 doubles)
     };
     struct SysElem {
         enum Kind { TSDA, RSDA };
+        string name;
         Kind type;
         int poi1, poi2;     // TSDA: indices into pois[] ("from"/"to")
         int joint;           // RSDA: body index owning the tree joint
         double k, c, ref;    // ref = l0 (TSDA) or q0 (RSDA)
         int hasInput;
         int actIdx;           // slot in act[], -1 if !hasInput
+        int obsIdx;            // offset into out_obs (2 doubles)
     };
     vector<SysPoi> pois;
     vector<SysElem> elems;

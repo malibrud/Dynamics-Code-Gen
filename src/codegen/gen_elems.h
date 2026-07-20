@@ -7,6 +7,71 @@
 #include "inertia.h"
 #include "gen_loops.h"
 
+// Shared TSDA kinematics -- anchor world positions, rho, l, 1/l, ldot --
+// needed by both gen_elems() (which continues into the force law and
+// path-walk) and gen_observe() (stage 5, which only needs l/ldot for the
+// observation array). Must run after gen_rnea_C() (needs sys->v[] and
+// sys->xFromBase[]); emits into whatever function body is currently open, so
+// it works identically in either generated function's own scope (temp names
+// may repeat safely across functions). Fills pf3/pt3/rho with the emitted
+// anchor/rho temp names and lname/linvname/ldotname with the l/1/l/ldot temp
+// names.
+static void gen_tsda_kinematics( FILE *f, System *sys, int e,
+                                  string pf3[3], string pt3[3], string rho[3],
+                                  string &lname, string &linvname, string &ldotname ) {
+    prln_file = f;
+    System::SysElem &el = sys->elems[ e ];
+    System::SysPoi &pf = sys->pois[ el.poi1 ]; // "from" plays the distance
+    System::SysPoi &pt = sys->pois[ el.poi2 ]; // loop's predecessor role, "to" the successor role
+
+    loopAnchorBase( sys, pf.body, pf.p, pf3 );
+    loopAnchorBase( sys, pt.body, pt.p, pt3 );
+    emitVec3( format( "elemPf{}_", e ), pf3 );
+    emitVec3( format( "elemPt{}_", e ), pt3 );
+    for ( int k = 0 ; k < 3 ; k++ ) rho[k] = subTerms( pt3[k], pf3[k] );
+    emitVec3( format( "elemRho{}_", e ), rho );
+
+    string l2 = dot3( rho, rho );
+    prln( "double elemL2_%d = %s;", e, l2.c_str() );
+    lname = format( "elemL_{}", e );
+    prln( "double %s = sqrt( elemL2_%d );", lname.c_str(), e );
+    linvname = format( "elemLinv_{}", e );
+    prln( "double %s = 1.0 / %s;", linvname.c_str(), lname.c_str() );
+
+    // Anchor body velocities in base coordinates (no acceleration term:
+    // elements carry no constraint, so no Baumgarte/avp machinery).
+    Svec vp( format( "elemVp{}_", e ) ), vs( format( "elemVs{}_", e ) );
+    if ( pf.body != -1 ) {
+        Xform inv = invertXform( format( "elemXbinvF{}", e ), sys->xFromBase[ pf.body ] );
+        inv.emit();
+        vp = fwdXformMotion( format( "elemVp{}_", e ), inv, sys->v[ pf.body ] );
+        vp.emit();
+    }
+    if ( pt.body != -1 ) {
+        Xform inv = invertXform( format( "elemXbinvT{}", e ), sys->xFromBase[ pt.body ] );
+        inv.emit();
+        vs = fwdXformMotion( format( "elemVs{}_", e ), inv, sys->v[ pt.body ] );
+        vs.emit();
+    }
+
+    // Anchor point velocities (pdot = v0 + w x p; the spatial-velocity
+    // convention where p is measured from the BASE origin makes this valid
+    // for any point, not just the body's own origin) and the rod direction
+    // rate.
+    string wxp[3], pfd[3], ptd[3], rhod[3];
+    cross3( vp.v, pf3, wxp );
+    for ( int k = 0 ; k < 3 ; k++ ) pfd[k] = addTerms( vp.v[3+k], wxp[k] );
+    emitVec3( format( "elemPfd{}_", e ), pfd );
+    cross3( vs.v, pt3, wxp );
+    for ( int k = 0 ; k < 3 ; k++ ) ptd[k] = addTerms( vs.v[3+k], wxp[k] );
+    emitVec3( format( "elemPtd{}_", e ), ptd );
+    for ( int k = 0 ; k < 3 ; k++ ) rhod[k] = subTerms( ptd[k], pfd[k] );
+    emitVec3( format( "elemRhod{}_", e ), rhod );
+
+    ldotname = format( "elemLdot_{}", e );
+    prln( "double %s = %s;", ldotname.c_str(), multFactors( dot3( rho, rhod ), linvname ).c_str() );
+}
+
 // Emits the generalized force Q contributed by each force element (TSDA/RSDA,
 // src/model/model.h), accumulating into sys->Qentry indexed by velocity
 // coordinate -- gen_solve_qdd() adds "+ Q_r" to the rhs wherever an entry is
@@ -24,8 +89,7 @@
 // "to" (successor) path (RBDA eq 8.18-8.20's epsilon structure), producing
 // row[r] = l * dl/dq_r. The generalized force of tension f is then
 // Q[r] = -(f/l) * row[r], f = k*(l - l0) + c*ldot + act[slot] -- exact, not
-// small-angle. No acceleration/Baumgarte machinery is needed here (elements
-// carry no constraint), so only body velocities (not avp) are fetched.
+// small-angle.
 void gen_elems( FILE *f, System *sys ) {
     if ( sys->elems.empty() ) return;
     prln_file = f;
@@ -40,7 +104,7 @@ void gen_elems( FILE *f, System *sys ) {
     prln( "// force-law sign conventions." );
     prln( "" );
 
-    for ( size_t e = 0 ; e < sys->elems.size() ; e++ ) {
+    for ( int e = 0 ; e < (int)sys->elems.size() ; e++ ) {
         System::SysElem &el = sys->elems[ e ];
 
         if ( el.type == System::SysElem::RSDA ) {
@@ -58,58 +122,11 @@ void gen_elems( FILE *f, System *sys ) {
             continue;
         }
 
-        // TSDA. "from" plays the distance loop's predecessor role, "to" the
-        // successor role: rho = p_to - p_from.
         System::SysPoi &pf = sys->pois[ el.poi1 ];
         System::SysPoi &pt = sys->pois[ el.poi2 ];
 
-        string pf3[3], pt3[3], rho[3];
-        loopAnchorBase( sys, pf.body, pf.p, pf3 );
-        loopAnchorBase( sys, pt.body, pt.p, pt3 );
-        emitVec3( format( "elemPf{}_", e ), pf3 );
-        emitVec3( format( "elemPt{}_", e ), pt3 );
-        for ( int k = 0 ; k < 3 ; k++ ) rho[k] = subTerms( pt3[k], pf3[k] );
-        emitVec3( format( "elemRho{}_", e ), rho );
-
-        string l2 = dot3( rho, rho );
-        prln( "double elemL2_%zu = %s;", e, l2.c_str() );
-        string lname = format( "elemL_{}", e );
-        prln( "double %s = sqrt( elemL2_%zu );", lname.c_str(), e );
-        string linvname = format( "elemLinv_{}", e );
-        prln( "double %s = 1.0 / %s;", linvname.c_str(), lname.c_str() );
-
-        // Anchor body velocities in base coordinates (no acceleration term:
-        // elements carry no constraint, so no Baumgarte/avp machinery).
-        Svec vp( format( "elemVp{}_", e ) ), vs( format( "elemVs{}_", e ) );
-        if ( pf.body != -1 ) {
-            Xform inv = invertXform( format( "elemXbinvF{}", e ), sys->xFromBase[ pf.body ] );
-            inv.emit();
-            vp = fwdXformMotion( format( "elemVp{}_", e ), inv, sys->v[ pf.body ] );
-            vp.emit();
-        }
-        if ( pt.body != -1 ) {
-            Xform inv = invertXform( format( "elemXbinvT{}", e ), sys->xFromBase[ pt.body ] );
-            inv.emit();
-            vs = fwdXformMotion( format( "elemVs{}_", e ), inv, sys->v[ pt.body ] );
-            vs.emit();
-        }
-
-        // Anchor point velocities (pdot = v0 + w x p; the spatial-velocity
-        // convention where p is measured from the BASE origin makes this
-        // valid for any point, not just the body's own origin) and the rod
-        // direction rate.
-        string wxp[3], pfd[3], ptd[3], rhod[3];
-        cross3( vp.v, pf3, wxp );
-        for ( int k = 0 ; k < 3 ; k++ ) pfd[k] = addTerms( vp.v[3+k], wxp[k] );
-        emitVec3( format( "elemPfd{}_", e ), pfd );
-        cross3( vs.v, pt3, wxp );
-        for ( int k = 0 ; k < 3 ; k++ ) ptd[k] = addTerms( vs.v[3+k], wxp[k] );
-        emitVec3( format( "elemPtd{}_", e ), ptd );
-        for ( int k = 0 ; k < 3 ; k++ ) rhod[k] = subTerms( ptd[k], pfd[k] );
-        emitVec3( format( "elemRhod{}_", e ), rhod );
-
-        string ldotname = format( "elemLdot_{}", e );
-        prln( "double %s = %s;", ldotname.c_str(), multFactors( dot3( rho, rhod ), linvname ).c_str() );
+        string pf3[3], pt3[3], rho[3], lname, linvname, ldotname;
+        gen_tsda_kinematics( f, sys, e, pf3, pt3, rho, lname, linvname, ldotname );
 
         // Tension law: f = k*(l - l0) + c*ldot + act[slot], positive f pulls
         // the anchors together.
