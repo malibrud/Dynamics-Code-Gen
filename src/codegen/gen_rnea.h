@@ -5,6 +5,7 @@
 #include "prln.h"
 #include "svec.h"
 #include "inertia.h"
+#include "gen_kinematics.h"
 
 // Computes the joint-space bias force C = ID(model, q, qd, 0, fext) via the
 // RNEA outward pass (velocity, acceleration, force) plus inward accumulation
@@ -27,14 +28,7 @@ void gen_rnea_C( FILE *f, System *sys ) {
         auto X6 = xformTo6x6( sys->xFromParent[ i ] );
 
         // v_i = i_X_lambda(i) * v_lambda(i) + vJ_i  (v_lambda(i) = 0 at the base)
-        if ( iParent == -1 ) {
-            sys->v[ i ] = sys->vJ[ i ];
-        } else {
-            Svec vParentInI = smat6MulVec( X6, sys->v[ iParent ] );
-            sys->v[ i ] = svecAdd( "", vParentInI, sys->vJ[ i ] );
-        }
-        sys->v[ i ].baseName = format( "v{}_", i );
-        sys->v[ i ].emit();
+        gen_velocity_body( f, sys, i );
 
         // a_i = i_X_lambda(i) * a_lambda(i) + v_i x vJ_i  (aJ = 0; a_lambda(0) = -a_grav)
         // For a floating joint v_i == vJ_i (root body, S = identity), so the
