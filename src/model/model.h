@@ -114,6 +114,50 @@
 // which is polynomial in the state (no square roots anywhere) and whose
 // gradient is exactly the K row, so closure projection works unchanged.
 //
+// Points of interest and force elements
+// --------------------------------------
+// After the bodies (interleaving with loop blocks is fine; a 'poi', 'tsda',
+// or 'rsda' keyword ends any open body/loop block, exactly as 'body' and
+// 'loop' end each other):
+//
+//   poi <name> <body> <x> <y> <z>   one line; named point at (x y z) in
+//                                   <body>'s frame; body -1 = fixed base
+//
+//   tsda <name>                     translational spring-damper-actuator
+//     from <poi-name>               anchor 1 (order defines rho = p_to - p_from)
+//     to <poi-name>                 anchor 2
+//     k <k>                         spring rate, N/m       (default 0)
+//     c <c>                         damping, N/(m/s)       (default 0)
+//     l0 <l0>                       free length, m         (default 0)
+//     input                         optional: reserve an act[] slot
+//
+//   rsda <name>                     rotational spring-damper-actuator
+//     joint <body>                  acts on the tree joint of body <body>
+//     k <k>                         Nm/rad (or N/m on a prismatic joint)
+//     c <c>
+//     q0 <q0>                       rest coordinate        (default 0)
+//     input
+//
+// Force law (part of the contract):
+//
+//   TSDA: scalar tension f = k*(l - l0) + c*ldot + act[slot], positive f
+//         pulls the two anchors together. l = |rho|, rho = p_to - p_from,
+//         ldot = (rho . rhodot) / l.
+//   RSDA: generalized force on the joint coordinate
+//         tau_e = -k*(q - q0) - c*qd + act[slot], positive act drives +q.
+//
+// A TSDA anchor pair coincident on the same body at the identical local
+// point is a model error: l = 0 for all time and f/l divides by zero.
+//
+// Validation: POI names must be unique; TSDA names unique among TSDAs and
+// RSDA names unique among RSDAs (names are length-limited to
+// MODEL_NAME_LEN - 1 and counts to MODEL_MAX_POI / MODEL_MAX_ELEM). A poi's
+// body must be -1 or a declared body index. A tsda's anchors must resolve
+// to distinct, already-declared POIs. An rsda's joint must be a single-DOF
+// tree joint (revolute or prismatic) -- floating/spherical/cylindrical are
+// rejected. act[] slots are assigned in declaration order across both
+// element kinds.
+//
 // All joint types parse; which ones a given consumer implements is up to it
 // (see modelUnsupported below for the current single-DOF pipeline).
 
@@ -125,6 +169,10 @@
 #define MODEL_MAX_BODIES 32
 #define MODEL_MAX_Q  ( MODEL_MAX_BODIES * 7 ) // worst case: every body floating
 #define MODEL_MAX_V  ( MODEL_MAX_BODIES * 6 )
+
+#define MODEL_NAME_LEN 32
+#define MODEL_MAX_POI 16
+#define MODEL_MAX_ELEM 16
 
 typedef enum {
     JOINT_REVOLUTE,
@@ -160,6 +208,31 @@ typedef struct {
     double length;         // distance joints: the imposed anchor-to-anchor distance
 } ModelLoop;
 
+// A named point fixed to a body's frame ("body" -1 = fixed base). A TSDA
+// anchor *is* a poi, so anchors and observation points share one
+// declaration; see the header comment above for the grammar.
+typedef struct {
+    char name[ MODEL_NAME_LEN ];
+    int body;               // -1 = fixed base
+    double p[3];             // local coordinates in body's frame
+    int obsIdx;              // offset into out_obs (6 doubles: px py pz vx vy vz)
+} ModelPoi;
+
+typedef enum { ELEM_TSDA, ELEM_RSDA } ModelElemType;
+
+// A force element: either a TSDA between two POIs or an RSDA on a tree
+// joint. See the header comment above for the force-law signs.
+typedef struct {
+    char name[ MODEL_NAME_LEN ];
+    ModelElemType type;
+    int poi1, poi2;          // TSDA: 'from'/'to' indices into Model::poi[]
+    int joint;                // RSDA: body index owning the tree joint
+    double k, c, ref;         // ref = l0 (TSDA) or q0 (RSDA)
+    int hasInput;
+    int actIdx;                // slot in act[], -1 if !hasInput
+    int obsIdx;                 // offset into out_obs (2 doubles)
+} ModelElem;
+
 typedef struct {
     int nbod;
     int nq;                // total position coordinates (7 per floating body, 1 otherwise)
@@ -173,6 +246,12 @@ typedef struct {
     int cidx[ MODEL_MAX_LOOPS ];  // loop l's first constraint row in K / lambda
     double stab;           // Baumgarte time constant Tstab (s); alpha = beta = 1/stab
     ModelLoop loop[ MODEL_MAX_LOOPS ];
+    int npoi;
+    ModelPoi poi[ MODEL_MAX_POI ];
+    int nelem;
+    ModelElem elem[ MODEL_MAX_ELEM ];
+    int nact;               // total act[] slots, sum of elem[].hasInput
+    int obsLen;              // fwd_dyn_observe_len = 6*npoi + 2*nelem
 } Model;
 
 static int modelBodyNq( const ModelBody *b ) { return b->jtype == JOINT_FLOATING ? 7 : 1; }
@@ -191,6 +270,13 @@ static int modelLoopNc( const ModelLoop *l ) {
     }
 }
 
+// Index of a poi by name, or -1 if not found.
+static int modelFindPoi( const Model *m, const char *name ) {
+    for ( int i = 0 ; i < m->npoi ; i++ )
+        if ( !strcmp( m->poi[ i ].name, name ) ) return i;
+    return -1;
+}
+
 // Loads a mechanism file. Returns 0 on success; on failure returns nonzero
 // and writes a message (with file/line context) into err.
 static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
@@ -204,6 +290,7 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
     m->stab = 0.1;
     ModelBody *cur = NULL;
     ModelLoop *curLoop = NULL;
+    ModelElem *curElem = NULL;
     char line[ 512 ];
     int lineNo = 0;
 
@@ -232,6 +319,7 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
             }
             cur = &m->body[ m->nbod++ ];
             curLoop = NULL;
+            curElem = NULL;
             memset( cur, 0, sizeof *cur );
             cur->parent = -1;
             cur->jtype = JOINT_REVOLUTE;
@@ -245,11 +333,105 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
             }
             curLoop = &m->loop[ m->nloop++ ];
             cur = NULL;
+            curElem = NULL;
             memset( curLoop, 0, sizeof *curLoop );
             curLoop->pred = -2; // "unset" so validation can insist both ends are given
             curLoop->succ = -2;
             curLoop->jtype = JOINT_REVOLUTE;
             curLoop->axis = 'z';
+            continue;
+        }
+        if ( !strcmp( key, "poi" ) ) {
+            cur = NULL;
+            curLoop = NULL;
+            curElem = NULL;
+            if ( m->npoi >= MODEL_MAX_POI ) {
+                snprintf( err, errSize, "%s:%d: too many pois (max %d)", path, lineNo, MODEL_MAX_POI );
+                goto fail;
+            }
+            char name[ 64 ] = "";
+            int body;
+            double x, y, z;
+            if ( sscanf( rest, "%63s %d %lf %lf %lf", name, &body, &x, &y, &z ) != 5 ) goto badArgs;
+            if ( strlen( name ) >= MODEL_NAME_LEN ) {
+                snprintf( err, errSize, "%s:%d: poi name '%s' too long (max %d chars)", path, lineNo, name, MODEL_NAME_LEN - 1 );
+                goto fail;
+            }
+            ModelPoi *poi = &m->poi[ m->npoi++ ];
+            memset( poi, 0, sizeof *poi );
+            strcpy( poi->name, name );
+            poi->body = body;
+            poi->p[0] = x; poi->p[1] = y; poi->p[2] = z;
+            continue;
+        }
+        if ( !strcmp( key, "tsda" ) || !strcmp( key, "rsda" ) ) {
+            cur = NULL;
+            curLoop = NULL;
+            if ( m->nelem >= MODEL_MAX_ELEM ) {
+                snprintf( err, errSize, "%s:%d: too many elements (max %d)", path, lineNo, MODEL_MAX_ELEM );
+                goto fail;
+            }
+            char name[ 64 ] = "";
+            if ( sscanf( rest, "%63s", name ) != 1 ) goto badArgs;
+            if ( strlen( name ) >= MODEL_NAME_LEN ) {
+                snprintf( err, errSize, "%s:%d: element name '%s' too long (max %d chars)", path, lineNo, name, MODEL_NAME_LEN - 1 );
+                goto fail;
+            }
+            curElem = &m->elem[ m->nelem++ ];
+            memset( curElem, 0, sizeof *curElem );
+            strcpy( curElem->name, name );
+            curElem->type = !strcmp( key, "tsda" ) ? ELEM_TSDA : ELEM_RSDA;
+            curElem->poi1 = curElem->poi2 = -1;
+            curElem->joint = -1;
+            curElem->actIdx = -1;
+            continue;
+        }
+
+        // Element-block keys (tsda/rsda).
+        if ( curElem ) {
+            if ( !strcmp( key, "from" ) || !strcmp( key, "to" ) ) {
+                if ( curElem->type != ELEM_TSDA ) {
+                    snprintf( err, errSize, "%s:%d: '%s' is only valid in a tsda block", path, lineNo, key );
+                    goto fail;
+                }
+                char name[ 64 ];
+                if ( sscanf( rest, "%63s", name ) != 1 ) goto badArgs;
+                int idx = modelFindPoi( m, name );
+                if ( idx < 0 ) {
+                    snprintf( err, errSize, "%s:%d: tsda '%s': unknown poi '%s'", path, lineNo, curElem->name, name );
+                    goto fail;
+                }
+                if ( !strcmp( key, "from" ) ) curElem->poi1 = idx;
+                else                          curElem->poi2 = idx;
+            } else if ( !strcmp( key, "joint" ) ) {
+                if ( curElem->type != ELEM_RSDA ) {
+                    snprintf( err, errSize, "%s:%d: 'joint' is only valid in an rsda block", path, lineNo );
+                    goto fail;
+                }
+                if ( sscanf( rest, "%d", &curElem->joint ) != 1 ) goto badArgs;
+            } else if ( !strcmp( key, "k" ) ) {
+                if ( sscanf( rest, "%lf", &curElem->k ) != 1 ) goto badArgs;
+            } else if ( !strcmp( key, "c" ) ) {
+                if ( sscanf( rest, "%lf", &curElem->c ) != 1 ) goto badArgs;
+            } else if ( !strcmp( key, "l0" ) ) {
+                if ( curElem->type != ELEM_TSDA ) {
+                    snprintf( err, errSize, "%s:%d: 'l0' is only valid in a tsda block", path, lineNo );
+                    goto fail;
+                }
+                if ( sscanf( rest, "%lf", &curElem->ref ) != 1 ) goto badArgs;
+            } else if ( !strcmp( key, "q0" ) ) {
+                if ( curElem->type != ELEM_RSDA ) {
+                    snprintf( err, errSize, "%s:%d: 'q0' is only valid in an rsda block", path, lineNo );
+                    goto fail;
+                }
+                if ( sscanf( rest, "%lf", &curElem->ref ) != 1 ) goto badArgs;
+            } else if ( !strcmp( key, "input" ) ) {
+                curElem->hasInput = 1;
+            } else {
+                snprintf( err, errSize, "%s:%d: unknown keyword '%s' in %s block", path, lineNo, key,
+                          curElem->type == ELEM_TSDA ? "tsda" : "rsda" );
+                goto fail;
+            }
             continue;
         }
 
@@ -394,6 +576,56 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
         snprintf( err, errSize, "%s: stab must be positive", path );
         return 1;
     }
+    for ( int p = 0 ; p < m->npoi ; p++ ) {
+        ModelPoi *poi = &m->poi[ p ];
+        if ( poi->body < -1 || poi->body >= m->nbod ) {
+            snprintf( err, errSize, "%s: poi '%s': body %d out of range (must be -1..%d)",
+                      path, poi->name, poi->body, m->nbod - 1 );
+            return 1;
+        }
+        for ( int q = 0 ; q < p ; q++ )
+            if ( !strcmp( m->poi[ q ].name, poi->name ) ) {
+                snprintf( err, errSize, "%s: poi name '%s' declared more than once", path, poi->name );
+                return 1;
+            }
+    }
+    for ( int e = 0 ; e < m->nelem ; e++ ) {
+        ModelElem *el = &m->elem[ e ];
+        for ( int q = 0 ; q < e ; q++ )
+            if ( m->elem[ q ].type == el->type && !strcmp( m->elem[ q ].name, el->name ) ) {
+                snprintf( err, errSize, "%s: %s name '%s' declared more than once", path,
+                          el->type == ELEM_TSDA ? "tsda" : "rsda", el->name );
+                return 1;
+            }
+        if ( el->type == ELEM_TSDA ) {
+            if ( el->poi1 < 0 || el->poi2 < 0 ) {
+                snprintf( err, errSize, "%s: tsda '%s': needs both 'from' and 'to'", path, el->name );
+                return 1;
+            }
+            if ( el->poi1 == el->poi2 ) {
+                snprintf( err, errSize, "%s: tsda '%s': 'from' and 'to' must differ", path, el->name );
+                return 1;
+            }
+            ModelPoi *p1 = &m->poi[ el->poi1 ], *p2 = &m->poi[ el->poi2 ];
+            if ( p1->body == p2->body && p1->p[0] == p2->p[0] && p1->p[1] == p2->p[1] && p1->p[2] == p2->p[2] ) {
+                snprintf( err, errSize, "%s: tsda '%s': anchors are coincident (same body, same point) -- l is always 0",
+                          path, el->name );
+                return 1;
+            }
+        } else { // ELEM_RSDA
+            if ( el->joint < 0 || el->joint >= m->nbod ) {
+                snprintf( err, errSize, "%s: rsda '%s': joint %d out of range (must be 0..%d)",
+                          path, el->name, el->joint, m->nbod - 1 );
+                return 1;
+            }
+            ModelJointType jt = m->body[ el->joint ].jtype;
+            if ( jt != JOINT_REVOLUTE && jt != JOINT_PRISMATIC ) {
+                snprintf( err, errSize, "%s: rsda '%s': joint on body %d must be revolute or prismatic (single-DOF)",
+                          path, el->name, el->joint );
+                return 1;
+            }
+        }
+    }
 
     // Position/velocity coordinate layout: floating bodies take 7 q slots
     // and 6 qd slots, everything else takes 1 of each. (Declared without
@@ -418,6 +650,27 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
         ci += modelLoopNc( &m->loop[ l ] );
     }
     m->nc = ci;
+
+    // Observation layout: all POIs in declaration order (6 doubles each),
+    // then all TSDAs (2 each: l ldot), then all RSDAs (2 each: angle rate) --
+    // grouped by kind, not interleaved declaration order, so runtime lookup
+    // tables stay contiguous per kind.
+    for ( int p = 0 ; p < m->npoi ; p++ ) m->poi[ p ].obsIdx = 6 * p;
+    int obsIdx;
+    obsIdx = 6 * m->npoi;
+    for ( int e = 0 ; e < m->nelem ; e++ )
+        if ( m->elem[ e ].type == ELEM_TSDA ) { m->elem[ e ].obsIdx = obsIdx; obsIdx += 2; }
+    for ( int e = 0 ; e < m->nelem ; e++ )
+        if ( m->elem[ e ].type == ELEM_RSDA ) { m->elem[ e ].obsIdx = obsIdx; obsIdx += 2; }
+    m->obsLen = obsIdx;
+
+    // act[] slots: assigned in declaration order across both element kinds.
+    int actIdx;
+    actIdx = 0;
+    for ( int e = 0 ; e < m->nelem ; e++ )
+        if ( m->elem[ e ].hasInput ) m->elem[ e ].actIdx = actIdx++;
+    m->nact = actIdx;
+
     return 0;
 
 fail:
