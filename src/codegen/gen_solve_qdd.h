@@ -50,7 +50,11 @@ void gen_solve_qdd( FILE *f, System *sys ) {
     if ( sys->loops.empty() ) {
         prln( "double rhs[ %d ] = {", NV );
         prln_indent_level++;
-        for ( int k = 0 ; k < NV ; k++ ) prln( "tau[ %d ] - C%d,", k, k );
+        for ( int k = 0 ; k < NV ; k++ ) {
+            string rhs = format( "tau[ {} ] - C{}", k, k );
+            if ( !sys->Qentry.empty() && sys->Qentry[ k ] != "0" ) rhs += " + " + sys->Qentry[ k ];
+            prln( "%s,", rhs.c_str() );
+        }
         prln_indent_level--;
         prln( "};" );
 
@@ -77,7 +81,9 @@ void gen_solve_qdd( FILE *f, System *sys ) {
     prln( "double B[ %d ] = {", NV * M );
     prln_indent_level++;
     for ( int r = 0 ; r < NV ; r++ ) {
-        string row = format( "tau[ {} ] - C{}, ", r, r );
+        string row = format( "tau[ {} ] - C{}", r, r );
+        if ( !sys->Qentry.empty() && sys->Qentry[ r ] != "0" ) row += " + " + sys->Qentry[ r ];
+        row += ", ";
         for ( int c = 0 ; c < NC ; c++ ) {
             const string &e = sys->Kentry[ c ][ r ];
             row += ( e == "0" ? "0.0"s : e ) + ", ";

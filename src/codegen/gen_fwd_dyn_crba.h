@@ -69,13 +69,18 @@ void gen_fwd_dyn_crba( FILE *f, System *sys ) {
     prln( "const int fwd_dyn_crba_nbod = %d;", NB );
     prln( "const int fwd_dyn_crba_nq = %d;", sys->nq );
     prln( "const int fwd_dyn_crba_nv = %d;", sys->nv );
+    prln( "const int fwd_dyn_crba_nact = %d;", sys->nact );
     prln( "" );
     prln( "// fext: external spatial forces, one per body, expressed in absolute (base)" );
     prln( "// coordinates: fext[ i*6 + k ] with k = 0..2 the moment about the base origin" );
     prln( "// and k = 3..5 the linear force (RBDA convention). Slots for bodies that were" );
     prln( "// generated without external-force support are never read, so fext may be" );
     prln( "// NULL when no body has it enabled." );
-    prln( "void fwd_dyn_crba( double *q, double *qd, double *tau, double *fext, double *out_qdd ) {" );
+    prln( "// act: force-element inputs, fwd_dyn_crba_nact slots in element" );
+    prln( "// declaration order (src/model/model.h's 'input' keyword); elements" );
+    prln( "// without 'input' never read a slot, so act may be NULL when" );
+    prln( "// fwd_dyn_crba_nact is 0 (same contract as fext)." );
+    prln( "void fwd_dyn_crba( double *q, double *qd, double *tau, double *fext, double *act, double *out_qdd ) {" );
     prln_indent_level++;
 
     prln( "// The outward pass of the computation of C.  This is the first for loop of Table 5.1 in RBDA. ");

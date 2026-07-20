@@ -7,9 +7,10 @@
 #include "dense.h"
 
 // The generated implementation under test (compiled from build/dynamics.c).
-void fwd_dyn_crba( double *q, double *qd, double *tau, double *fext, double *out_qdd );
+void fwd_dyn_crba( double *q, double *qd, double *tau, double *fext, double *act, double *out_qdd );
 extern const int fwd_dyn_crba_nq;
 extern const int fwd_dyn_crba_nv;
+extern const int fwd_dyn_crba_nact;
 
 // Numerical rank of the nc x nv constraint matrix K by Gaussian elimination
 // with full pivoting. The pipeline requires properly constrained loops
@@ -121,7 +122,7 @@ int main( int argc, char **argv ) {
 
         double qddGen[ MODEL_MAX_V ], qddRef[ MODEL_MAX_V ];
         static double K[ MODEL_MAX_NC * MODEL_MAX_V ];
-        fwd_dyn_crba( q, qd, tau, fext, qddGen );
+        fwd_dyn_crba( q, qd, tau, fext, NULL, qddGen );
         fd_dense_full( &mdl, q, qd, tau, fext, qddRef, mdl.nloop ? K : NULL, NULL );
 
         if ( mdl.nloop ) {

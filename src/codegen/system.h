@@ -68,6 +68,32 @@ struct System{
     vector<vector<string>> Kentry; // nc x nv expressions ("0" = structural zero)
     vector<string> kfulName;       // nc RHS temps (k + kstab of RBDA eq 8.35)
 
+    // Points of interest and force elements (TSDA/RSDA). A poi is a named
+    // point fixed to a body ("body" -1 = fixed base); a TSDA anchor *is* a
+    // poi. See src/model/model.h for the grammar and force-law signs.
+    struct SysPoi {
+        int body;           // -1 = fixed base
+        double p[3];
+    };
+    struct SysElem {
+        enum Kind { TSDA, RSDA };
+        Kind type;
+        int poi1, poi2;     // TSDA: indices into pois[] ("from"/"to")
+        int joint;           // RSDA: body index owning the tree joint
+        double k, c, ref;    // ref = l0 (TSDA) or q0 (RSDA)
+        int hasInput;
+        int actIdx;           // slot in act[], -1 if !hasInput
+    };
+    vector<SysPoi> pois;
+    vector<SysElem> elems;
+    int nact = 0;                  // total act[] slots, set by the caller from Model
+
+    // Element-applied generalized force per velocity coordinate, filled in
+    // by gen_elems(): "0" (or an empty vector, when there are no elements at
+    // all) means no element touches that coordinate -- gen_solve_qdd() skips
+    // it entirely so element-free models generate byte-identical rhs code.
+    vector<string> Qentry;
+
     System(): System(0) {}
     System( int N )
         :nBod( N )

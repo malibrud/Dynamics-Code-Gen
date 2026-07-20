@@ -9,6 +9,7 @@
 #include "gen_fwd_dyn_crba.h"
 #include "gen_rnea.h"
 #include "gen_crba.h"
+#include "gen_elems.h"
 #include "gen_loops.h"
 #include "gen_solve_qdd.h"
 
@@ -97,6 +98,32 @@ int main( int argc, char **argv ) {
         sys.loops.push_back( sl );
     }
 
+    // Points of interest and force elements (TSDA/RSDA): the generator only
+    // needs body index + local point for a poi, and the numeric law +
+    // resolved indices for an element -- names/lookup tables are stage 5.
+    for ( int p = 0 ; p < mdl.npoi ; p++ ) {
+        ModelPoi *mp = &mdl.poi[ p ];
+        System::SysPoi sp;
+        sp.body = mp->body;
+        for ( int k = 0 ; k < 3 ; k++ ) sp.p[ k ] = mp->p[ k ];
+        sys.pois.push_back( sp );
+    }
+    for ( int e = 0 ; e < mdl.nelem ; e++ ) {
+        ModelElem *me = &mdl.elem[ e ];
+        System::SysElem se;
+        se.type = me->type == ELEM_TSDA ? System::SysElem::TSDA : System::SysElem::RSDA;
+        se.poi1 = me->poi1;
+        se.poi2 = me->poi2;
+        se.joint = me->joint;
+        se.k = me->k;
+        se.c = me->c;
+        se.ref = me->ref;
+        se.hasInput = me->hasInput;
+        se.actIdx = me->actIdx;
+        sys.elems.push_back( se );
+    }
+    sys.nact = mdl.nact;
+
     // sys.grav seeds the RNEA acceleration recursion with -a_grav, so negate
     // the physical gravity from the file. numStr keeps zero components "0".
     for ( int k = 0 ; k < 3 ; k++ ) sys.grav.v[ 3 + k ] = numStr( -mdl.gravity[ k ] );
@@ -112,6 +139,7 @@ int main( int argc, char **argv ) {
     gen_body_inertias( f, &sys );
     gen_rnea_C( f, &sys );
     gen_crba_H( f, &sys );
+    gen_elems( f, &sys );
     gen_loops( f, &sys );
     gen_solve_qdd( f, &sys );
     fclose( f );

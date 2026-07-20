@@ -51,9 +51,10 @@
 // this project actually ships, rather than reaching it transitively through
 // the dense reference.
 extern "C" {
-    void fwd_dyn_crba( double *q, double *qd, double *tau, double *fext, double *out_qdd );
+    void fwd_dyn_crba( double *q, double *qd, double *tau, double *fext, double *act, double *out_qdd );
     extern const int fwd_dyn_crba_nq;
     extern const int fwd_dyn_crba_nv;
+    extern const int fwd_dyn_crba_nact;
 }
 
 using namespace chrono;
@@ -619,7 +620,7 @@ static int crossCheck( const Model *mdl, const char *path ) {
         double qddCh[ MODEL_MAX_V ], qddRef[ MODEL_MAX_V ], qddGen[ MODEL_MAX_V ];
         extractQdd( mdl, cm, qd, kin, qddCh );
         fd_dense( mdl, q, qd, tau, fext, qddRef );
-        fwd_dyn_crba( q, qd, tau, fext, qddGen );
+        fwd_dyn_crba( q, qd, tau, fext, NULL, qddGen );
 
         double trialErr = 0;
         for ( int k = 0 ; k < nv ; k++ ) {
@@ -709,7 +710,7 @@ static void stepGenerated( const Model *mdl, double *q, double *qd, double dt ) 
     double qdd[ MODEL_MAX_V ];
     double qNext[ MODEL_MAX_Q ];
 
-    fwd_dyn_crba( q, qd, tau, fext, qdd );
+    fwd_dyn_crba( q, qd, tau, fext, NULL, qdd );
     for ( int k = 0 ; k < mdl->nv ; k++ ) qd[k] += qdd[k] * dt;
     integrateQ( mdl, q, qd, dt, qNext );
     for ( int k = 0 ; k < mdl->nq ; k++ ) q[k] = qNext[k];

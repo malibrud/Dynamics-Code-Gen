@@ -15,9 +15,10 @@
 #include "../validate/dense.h"
 
 // The generated implementation (compiled from build/dynamics.c).
-void fwd_dyn_crba( double *q, double *qd, double *tau, double *fext, double *out_qdd );
+void fwd_dyn_crba( double *q, double *qd, double *tau, double *fext, double *act, double *out_qdd );
 extern const int fwd_dyn_crba_nq;
 extern const int fwd_dyn_crba_nv;
+extern const int fwd_dyn_crba_nact;
 
 #define NSTATES 256 // power of two so the index wrap is a mask
 
@@ -34,7 +35,7 @@ typedef void (*FdFn)( const double *q, const double *qd, const double *tau,
 // written, so adapting via cast is safe here.
 static void genAdapter( const double *q, const double *qd, const double *tau,
                         const double *fext, double *qdd ) {
-    fwd_dyn_crba( (double*)q, (double*)qd, (double*)tau, (double*)fext, qdd );
+    fwd_dyn_crba( (double*)q, (double*)qd, (double*)tau, (double*)fext, NULL, qdd );
 }
 
 static void denseAdapter( const double *q, const double *qd, const double *tau,
