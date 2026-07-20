@@ -52,7 +52,9 @@ directly, rather than shelling out to a C compiler.
     constrained with nc = 3 = rank(K), mobility 1
   - `slidercrank` — crank and slider as separate branches off the base,
     tied by a rigid rod modeled as a `distance` loop joint (nc = 1); the
-    only model whose two loop paths meet at the base with both nonempty
+    only model whose two loop paths meet at the base with both nonempty.
+    Also carries a passive return-spring `tsda` from a fixed base point to
+    the crank, combining a force element with a kinematic loop
   - `quartercar` — HMMWV front quarter-car test rig, built from the HMMWV
     suspension data shipped with Project Chrono: sprung mass on a vertical
     slider, double-wishbone suspension, and a driven shaker post under the
@@ -61,7 +63,13 @@ directly, rather than shelling out to a C compiler.
     two `spherical` closures to the wishbones, a `distance` radius rod,
     and a `distance` "tire" rod down to the post (nq = 11, nv = 10,
     nc = 8, mobility 2) — the first model to combine a floating body with
-    kinematic loops
+    kinematic loops. Carries the real HMMWV front coil spring and shock as
+    two `tsda` elements (see [Force elements and points of
+    interest](#force-elements-and-points-of-interest) below)
+  - `springpend` — two independent pendulums off the base, loop-free;
+    carries a `tsda` and an `rsda`, both declared `input`, exercising every
+    force-element code path (POI kinematics, path-walk with `k`/`c`/`act`)
+    without a kinematic loop's added complexity
 - `src/model` — the shared model-file parser (plain C, header-only), used
   by the generator, the validator, and the benchmark, so all three always
   agree on the mechanism.
@@ -73,7 +81,13 @@ directly, rather than shelling out to a C compiler.
   as a named C temporary and rewires later composition to reference that name
   (so expressions never re-expand across pipeline stages). Running the
   generator produces `build/dynamics.c` — the specialized, sparsity-exploiting
-  C implementation for the mechanism it was given.
+  C implementation for the mechanism it was given. `gen_kinematics.h` factors
+  the per-body kinematics/velocity emission out of the main dynamics pass so
+  it can be reused verbatim by a second generated function; `gen_elems.h`
+  emits each force element's generalized force (folded into the solve as
+  `+ Q_r`); `gen_observe.h` emits that second function, `fwd_dyn_observe`,
+  plus the `fwd_dyn_find` name-lookup tables (see [Force elements and points
+  of interest](#force-elements-and-points-of-interest)).
 - `src/validate` — a dense-matrix validation reference. Implements the same
   forward dynamics (RNEA bias force + CRBA mass matrix + solve) with full
   6x6 spatial matrices built straight from the RBDA equations — explicit
@@ -121,6 +135,19 @@ directly, rather than shelling out to a C compiler.
   and step. Built and run by `build_chrono.bat` (needs the Chrono SDK and
   Eigen; see below), separate from `build.bat` so the main build has no
   Chrono dependency.
+
+  Force elements map onto Chrono unevenly, both notes earned empirically
+  since the SDK ships as headers and prebuilt binaries with no `.cpp` source
+  to read the default force law from (see [Force elements and points of
+  interest](#force-elements-and-points-of-interest)): TSDA maps onto
+  `ChLinkTSDA` (its `k`/`c`/rest length match this project's directly; its
+  actuator force needs negating). RSDA does **not** map onto `ChLinkRSDA` —
+  that class's angle only tracks continuity across a stepped simulation, and
+  every cross-check trial here places bodies directly at a random `q`, which
+  can land Chrono's angle a multiple of 2π away from the true one with no way
+  to disambiguate the branch. RSDA is instead computed directly from this
+  project's own `q`/`qd` and applied as an ordinary joint force, exactly like
+  `tau[]`.
 - `src/bench` — benchmark comparing the generated sparse code against the
   dense reference (both built with `/O2`), cycling through a pool of random
   states with a checksum to defeat dead-code elimination. Run by `build.bat`
@@ -234,16 +261,19 @@ it adds no tear. All four loop models agree with Chrono to ~1e-9 on
 accelerations and track its trajectories with the expected first-order
 truncation ratio.
 
-## Force elements and points of interest (planned)
+## Force elements and points of interest
 
-Designed but not yet implemented — the full implementation plan lives in
-[PLAN-force-elements.md](PLAN-force-elements.md). The design was settled
-around two principles the project already follows: **declare what you pay
-for** (nothing appears in the generated code that the `.mech` file didn't
-ask for — the `fext 1` contract, extended), and **the dynamics API stays
-the stable contract** while new machinery grows alongside it.
+Built around two principles the project already followed: **declare what you
+pay for** (nothing appears in the generated code that the `.mech` file didn't
+ask for — the `fext 1` contract, extended) and **the dynamics API stays the
+stable contract** while new machinery grows alongside it. `springpend.mech`
+exercises every element code path in a loop-free model; `slidercrank.mech`
+combines a passive element with a kinematic loop; `quartercar.mech` carries
+the real HMMWV front coil spring and shock as two `tsda` elements (linearized
+from the shipped nonlinear spring curve — this format's TSDA is linear-only —
+at zero deflection; the shock's damping coefficient was already linear).
 
-The decisions:
+The design:
 
 - **Points of interest (POIs)** — named points fixed to a body, declared in
   the `.mech` file (`poi <name> <body> <x y z>`); the generator emits their
@@ -251,35 +281,58 @@ The decisions:
   points share one declaration and one symbolic treatment.
 - **Force elements are first-class** — `tsda <name>` blocks (translational
   spring-damper-actuator between two named POIs) and `rsda <name>` blocks
-  (rotational, acting on a named tree joint). A TSDA is generated
-  symbolically by the same machinery as the `distance` loop joint: the
-  applied generalized force `Q = -(f/l) * row` reuses the path-walk row, so
-  it touches only the joints on the path between the two anchors — no
-  6-vector spatial-force detour. An RSDA on a tree joint is a torque into
-  that joint's `tau` slot with the angle being `q[i]` itself (RSDA across a
-  loop-closing revolute is deferred; it needs an atan2 relative angle).
+  (rotational — or, on a prismatic joint, translational; the name is carried
+  over from vehicle-dynamics terminology — acting on a named tree joint's own
+  coordinate). A TSDA is generated symbolically by the same machinery as the
+  `distance` loop joint: the applied generalized force `Q = -(f/l) * row`
+  reuses the path-walk row (`gen_elems.h`), so it touches only the joints on
+  the path between the two anchors — no 6-vector spatial-force detour. An
+  RSDA on a tree joint is a torque straight into that joint's own coordinate,
+  `tau_e = -k*(q - q0) - c*qd + act[slot]` (RSDA across a loop-closing
+  revolute is deferred; it would need an atan2 relative angle).
 - **`fext` unchanged** — stays opt-in per body for genuinely external loads
   (tire contact, validation probes); elements never route through it.
 - **Element inputs are opt-in** — every element carries a baked linear law
   (`k`, `c`, and a reference `l0`/`q0`) from the `.mech` file; elements
   additionally declared `input` get a slot in a compact `act[]` array, and
   the total force is `baked law + act[slot]`. Passive elements compile to
-  pure expressions with no runtime input surface. The dynamics signature
-  becomes `fwd_dyn_crba( q, qd, tau, fext, act, out_qdd )`, with `act`
-  NULL-able exactly like `fext`. Caller-side nonlinear laws (real damper
-  curves) use the pattern `k 0 c 0 input`: compute the force outside from
-  the element's observed state, feed it through `act`.
+  pure expressions with no runtime input surface. The dynamics signature is
+  `fwd_dyn_crba( q, qd, tau, fext, act, out_qdd )`, with `act` NULL-able
+  exactly like `fext` (and `fwd_dyn_crba_nact` exported alongside `nq`/`nv`).
+  Caller-side nonlinear laws (real damper curves) use the pattern
+  `k 0 c 0 input`: compute the force outside from the element's observed
+  state, feed it through `act`.
 - **Name lookup via runtime tables** — the generated file exports
   `fwd_dyn_find( kind, name )` (`kind` one of `"poi"`, `"tsda"`, `"rsda"`,
-  `"act"`) backed by const string tables, resolved once at caller init.
-  Runtime lookup rather than a generated header because the eventual JIT
-  consumer is a fixed host program that cannot recompile per model.
+  `"act"`) backed by const string tables (`gen_observe.h`), resolved once at
+  caller init. Runtime lookup rather than a generated header because the
+  eventual JIT consumer is a fixed host program that cannot recompile per
+  model. Returns -1 for an unresolved kind or name.
 - **Observation function** — generated `fwd_dyn_observe( q, qd, out_obs )`
   exposes POI world positions and velocities plus each element's state
   (`l`, `ldot` for TSDAs; angle, rate for RSDAs), indexed through the same
-  lookup. The temporaries already exist inside the element generation, so
-  the marginal cost is writes to an output array — and it keeps geometry
-  out of every caller's force-law code.
+  lookup, at the layout `fwd_dyn_observe_len` gives the size of: all POIs (6
+  doubles each), then all TSDAs (2 each), then all RSDAs (2 each). It runs
+  the same per-body kinematics/velocity emission as the dynamics pass
+  (`gen_kinematics.h`) in its own function scope, so it duplicates no
+  dynamics (CRBA `H`, RNEA bias force) — and is skipped entirely, at zero
+  runtime cost beyond the two exported constants, for a model with nothing
+  declared.
+
+Validation follows the same two-routes discipline as everything else in this
+project: `src/validate/dense.h` applies each TSDA as **explicit
+equal-and-opposite spatial forces at its two anchors in base coordinates** —
+deliberately not the generator's path-walk row — so agreement is a real check
+on that row's derivation (RBDA eq 8.18–8.20's epsilon structure), not a
+shared-bug false positive; RSDA has no second formulation (there is no
+alternative way to express "a torque on your own joint"), so both sides use
+the same law there. `fwd_dyn_observe`'s TSDA `l`/`ldot` are cross-checked
+against an independent recomputation from the same `Xa` transforms the
+element-force block uses, and `fwd_dyn_find` is checked to round-trip every
+declared name and reject a bogus one. All of it validates to 1e-9 on
+`build.bat` and to ~1e-6 against Project Chrono on `build_chrono.bat` (see
+`src/chrono` above for how — and how not — force elements map onto Chrono's
+own link types).
 
 ## Conventions
 
@@ -362,7 +415,7 @@ plain terminal — no Developer Command Prompt needed.
 build.bat
 ```
 
-For every model in its list (all twelve above), this builds
+For every model in its list (all thirteen above), this builds
 `build\codegen.exe`, generates `build\dynamics_<model>.c`, compiles
 `build\validate_<model>.exe` and `build\bench_<model>.exe` against it, and
 runs both — the build **fails** if any model's generated code disagrees with
@@ -420,19 +473,30 @@ cylindrical **tree** joints) are reported on stderr with a nonzero exit.
 build\codegen.exe models\elbow.mech build\dynamics_elbow.c
 ```
 
-The generated file exports one function and two size constants:
+The generated file exports the dynamics function, the observation function,
+name lookup, and their size constants:
 
 ```c
-void fwd_dyn_crba( double *q, double *qd, double *tau, double *fext, double *out_qdd );
-extern const int fwd_dyn_crba_nq;   // length of q
-extern const int fwd_dyn_crba_nv;   // length of qd, tau, out_qdd
+void fwd_dyn_crba( double *q, double *qd, double *tau, double *fext, double *act, double *out_qdd );
+extern const int fwd_dyn_crba_nq;    // length of q
+extern const int fwd_dyn_crba_nv;    // length of qd, tau, out_qdd
+extern const int fwd_dyn_crba_nact;  // length of act (force-element input slots)
+
+void fwd_dyn_observe( double *q, double *qd, double *out_obs );
+extern const int fwd_dyn_observe_len; // length of out_obs
+
+int fwd_dyn_find( const char *kind, const char *name ); // "poi"|"tsda"|"rsda"|"act"; -1 if not found
 ```
 
 `fext` is `6 * nbodies` doubles (base-coordinate spatial force per body; see
-[Conventions](#conventions)). To use a mechanism of your own, drop a
-`.mech` file in `models\` and add its name to the `MODELS` list at the top
-of `build.bat` — it will be generated, validated, and benchmarked like the
-others.
+[Conventions](#conventions)). `act` is `fwd_dyn_crba_nact` doubles, one per
+force element declared `input` (in declaration order); NULL-able exactly like
+`fext` when no element has one. `out_obs` is `fwd_dyn_observe_len` doubles;
+see [Force elements and points of
+interest](#force-elements-and-points-of-interest) for the layout and
+`fwd_dyn_find`'s lookup. To use a mechanism of your own, drop a `.mech` file
+in `models\` and add its name to the `MODELS` list at the top of `build.bat`
+— it will be generated, validated, and benchmarked like the others.
 
 ### `validate_<model>.exe` — dense reference vs generated code
 
@@ -440,13 +504,23 @@ others.
 build\validate_threelink.exe models\threelink.mech
 ```
 
-Runs 1000 random states (near-manifold states for loop models) through both
-the compiled-in generated code and the dense 6x6 reference and compares qdd
-to 1e-9, also checking rank(K) = nc for loop models at every trial. Exit
-code 0 = PASS, 1 = FAIL:
+Runs 1000 random states (near-manifold states for loop models, random `act`
+alongside `q`/`qd`/`tau`/`fext` when the model has force elements) through
+both the compiled-in generated code and the dense 6x6 reference and compares
+qdd to 1e-9, also checking rank(K) = nc for loop models at every trial and,
+for models with elements, `fwd_dyn_observe`'s TSDA `l`/`ldot` against an
+independent dense recomputation. `fwd_dyn_find` is checked once, up front, to
+round-trip every declared name and reject a bogus one. Exit code 0 = PASS,
+1 = FAIL:
 
 ```
 validate: models\threelink.mech: 1000 trials, max scaled |qdd_generated - qdd_dense| = 1.699e-14 (worst at trial 969)
+validate: PASS
+```
+
+```
+validate: models\springpend.mech: 1000 trials, max scaled |qdd_generated - qdd_dense| = 8.105e-15 (worst at trial 888)
+validate: models\springpend.mech: 1000 trials, max scaled |observe_generated - observe_dense| = 1.110e-16 (worst at trial 16)
 validate: PASS
 ```
 
@@ -482,9 +556,11 @@ build\chrono_check_threelink.exe models\threelink.mech
 ```
 
 The no-flag form runs the qd-vs-dq/dt consistency check, the 200-trial
-acceleration cross-check, and the default simulation comparison
-(T = 0.25 s, dt = 2e-5, repeated at dt/2 to show the gap is integrator
-truncation):
+acceleration cross-check (staging in random `act` alongside `q`/`qd`/`tau`/
+`fext` for models with force elements), and the default simulation
+comparison (T = 0.25 s, dt = 2e-5, repeated at dt/2 to show the gap is
+integrator truncation; `act` held at zero there, so both sides agree by
+construction):
 
 ```
 chrono_check: models\threelink.mech: qd-vs-dq/dt consistency, max scaled error = 5.799e-10 (worst at trial 11)
