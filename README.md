@@ -70,6 +70,22 @@ directly, rather than shelling out to a C compiler.
     carries a `tsda` and an `rsda`, both declared `input`, exercising every
     force-element code path (POI kinematics, path-walk with `k`/`c`/`act`)
     without a kinematic loop's added complexity
+  - `halfcar` — HMMWV rear half-car: a sprung half-mass free to heave and
+    roll (chained `prismatic z` then `revolute x`, since this format has no
+    combined 2-DOF joint — a massless-ish carrier body realizes the pair,
+    same trick as `elbow`'s wrist chain), carrying left and right
+    double-wishbone corners built the same way as `quartercar`'s (each
+    spindle a `floating` body pinned by two `spherical` closures and a
+    `distance` "tierod", plus a `distance` "tire" rod to its own driven
+    shaker post) — the rear is used rather than the front because its real
+    tierod grounds on the chassis at both ends (no steering rack), so it is
+    an ordinary fixed-length link. Real HMMWV rear coil springs and shocks
+    (two `tsda` per side) connect chassis_roll to each LCA; unlike
+    `quartercar`, both TSDA anchors attach to the body that physically
+    carries them rather than the fixed base, since with a roll DOF present
+    a base-anchored mount would pick up a spurious length change from pure
+    heave/roll (nq = 22, nv = 20, nc = 16, mobility 4 — heave, roll, and the
+    two posts)
 - `src/model` — the shared model-file parser (plain C, header-only), used
   by the generator, the validator, and the benchmark, so all three always
   agree on the mechanism.

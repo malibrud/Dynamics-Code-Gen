@@ -1,0 +1,290 @@
+# Half-car test rig, HMMWV rear axle: sprung mass free to heave and roll,
+# left and right double-wishbone corners, and independent shaker posts under
+# each wheel as the vertical position drivers. Hardpoints, masses, and
+# inertias are the HMMWV rear suspension data shipped with Project Chrono
+# (data/vehicle/hmmwv/): suspension HMMWV_DoubleWishboneRear.json, chassis
+# 2086.52 kg (halved), wheel 18.8 kg + tire 37.6 kg per corner, tire radius
+# 0.467 -- same wheel/tire/control-arm parts as the front (quartercar.mech),
+# only the rear-specific hardpoints, upright, and spring/shock curves differ.
+# The rear is used (rather than the front) because its "tierod" is grounded
+# on the chassis at both ends -- no steering rack -- so it is an ordinary
+# fixed-length link with no actuation to model, unlike the front's tie rod.
+#
+# Axes are ISO vehicle: x forward, y outboard-left, z up. The base frame
+# sits on the VEHICLE CENTERLINE at the DESIGN WHEEL-CENTER HEIGHT and the
+# rear axle's x station (Chrono's rear suspension hardpoints, which are
+# already centerline-relative in y, minus the wheel-center x/z offset
+# (0.036, -, -0.026): the rear Spindle COM in HMMWV_DoubleWishboneRear.json).
+# Left-side hardpoints are used as given; right-side hardpoints are the
+# mirror image (negate y), exactly how Chrono's own template mirrors one
+# side's JSON to build the other. Every loop closes at q = 0 with both
+# spindles at identity quaternion.
+#
+# Topology (tree DOF 20, nc 16, mobility 4):
+#   0 chassis_heave  prismatic z   massless-ish carrier body: exists only so
+#                                  heave and roll can be two chained
+#                                  single-DOF joints (this format has no
+#                                  combined 2-DOF joint). Real inertia is
+#                                  ~zero and lives entirely on body 1 --
+#                                  same pattern as elbow.mech's wrist chain.
+#   1 chassis_roll   revolute x    the actual sprung half-mass: half the full
+#                                  HMMWV chassis mass and roll/pitch/yaw
+#                                  inertia (HMMWV_Chassis.json), on the
+#                                  assumption the front/rear split is even.
+#                                  Wishbones and the anti-roll "tierod" link
+#                                  hang off this body, matching quartercar's
+#                                  chassis (there the single sprung body took
+#                                  that role).
+#   2 LCA_L          revolute x    left lower control arm; Chrono's pivot
+#                                  axis is exactly x (front/back pivots both
+#                                  at y=0.307, z=0)
+#   3 UCA_L          revolute x    left upper control arm; real pivot axis
+#                                  skewed a few deg from x, idealized to x
+#                                  (as in quartercar) since tree joints are
+#                                  axis-aligned; pivot at the front/back
+#                                  midpoint
+#   4 spindle_L      floating      left upright + spindle + wheel + tire
+#                                  lumped (no wheel-spin DOF), positioned by
+#                                  the loop joints below; frame at the wheel
+#                                  center
+#   5 post_L         prismatic z   left shaker pad at the contact patch: a
+#                                  POSITION DRIVER. Drive q[.] through its
+#                                  own tau slot (e.g. a stiff PD servo
+#                                  tracking a road/post profile)
+#   6 LCA_R          revolute x    right lower control arm, mirror of body 2
+#   7 UCA_R          revolute x    right upper control arm, mirror of body 3
+#   8 spindle_R      floating      right corner, mirror of body 4
+#   9 post_R         prismatic z   right shaker pad, mirror of body 5
+#
+# Loop joints (each spindle has ball joints everywhere, so like quartercar
+# it is a floating body pinned by constraints -- spherical tree joints
+# aren't implemented), 4 per side:
+#   spherical  LCA outer ball  -> spindle lower ball
+#   spherical  UCA outer ball  -> spindle upper ball
+#   distance   "tierod" rod, chassis_roll -> spindle steering-arm point
+#              (Chrono's rear Tierod hardpoints -- grounded on the chassis
+#              at both ends since the rear doesn't steer); kills the
+#              leftover spin about the kingpin axis
+#   distance   driver rod, post pad -> wheel center, length = tire radius:
+#              a rigid "tire" with balls at patch and hub, exactly as in
+#              quartercar
+#
+# Mobility 4 = chassis heave + chassis roll + post_L position + post_R
+# position. Left/right suspension deflection is the difference between
+# chassis motion (heave, and roll times half-track) and each post. Tire
+# loads apply via fext on the spindles.
+#
+# The real HMMWV rear coil spring and shock (data/vehicle/hmmwv/suspension/
+# HMMWV_DoubleWishboneRear.json) are modeled as two TSDAs per side, sharing
+# the LCA mount point but not the chassis mount point, same as quartercar.
+# Unlike quartercar, both TSDA anchors here are attached to the body that
+# physically carries them (chassis_roll for the upper mount, the LCA for the
+# lower) rather than the fixed base -- with a roll DOF present, an anchor
+# pinned to the fixed base would pick up a spurious length change from pure
+# heave/roll instead of only the wishbone's rotation relative to the
+# chassis, which is what a real spring mounted between chassis and arm
+# actually measures.
+# Coordinates converted to this file's base/LCA frames the same way as
+# quartercar (Chrono chassis-relative point minus the wheel-center x/z
+# offset (0.036, -0.026); the LCA-frame point additionally minus the LCA
+# pivot (0, 0.307, 0) in that same Chrono frame; mirror y for the right
+# side):
+#   spring: chassis (-0.104, 0.502, 0.256) -> chassis_roll (-0.140, +-0.502, 0.282)
+#           arm     (-0.097, 0.543, -0.047) -> LCA (-0.097, +-0.236, -0.047)
+#   shock:  chassis (-0.104, 0.498, 0.323) -> chassis_roll (-0.140, +-0.498, 0.349)
+#           arm     (-0.097, 0.544, -0.038) -> LCA (-0.097, +-0.237, -0.038)
+# The JSON spring is a nonlinear curve (progressive, free length 0.382 m);
+# this format only has a linear TSDA, so k is the curve's slope at zero
+# deflection (8020.869 N / 0.02 m). The shock's damping coefficient is
+# already linear and used directly. Both are passive (no 'input').
+#
+# q layout (nq 22, nv 20): q[0] chassis_heave, q[1] chassis_roll,
+# q[2] LCA_L, q[3] UCA_L, q[4..10] spindle_L quaternion + position,
+# q[11] post_L, q[12] LCA_R, q[13] UCA_R, q[14..20] spindle_R quaternion +
+# position, q[21] post_R. Design pose: q = 0 with q[4] = q[14] = 1.
+
+gravity 0 0 -9.81
+stab 0.05
+
+body                     # 0: chassis_heave, carrier for the heave DOF (see header)
+parent -1
+joint prismatic z
+tree 0 0 0
+mass 1
+cg 0 0 0
+inertia 0.01 0.01 0.01 0 0 0
+
+body                     # 1: chassis_roll, half the HMMWV sprung mass, free heave+roll
+parent 0
+joint revolute x
+tree 0 0 0
+mass 1043.26
+cg 0 0 0.283             # vehicle centerline, HMMWV CG height (~0.75 above ground)
+inertia 539.26 1477.83 1785.10 0 0 0
+fext 1
+
+body                     # 2: left lower control arm, pivot y=0.307 z=0 (Chrono, exact x axis)
+parent 1
+joint revolute x
+tree -0.036 0.307 0.026
+mass 23.965
+cg 0 0.240 -0.059
+inertia 0.4 0.4 0.8938 0 0 0
+fext 1
+
+body                     # 3: left upper control arm, pivot at front/back midpoint
+parent 1
+joint revolute x
+tree 0.177 0.462 0.252
+mass 5.813
+cg -0.089 0.127 -0.005
+inertia 0.03 0.03 0.06276 0 0 0
+
+body                     # 4: left spindle assembly (upright + spindle + wheel + tire),
+parent -1                #    frame at the wheel center
+joint floating
+tree 0 0.910 0
+mass 90.555
+cg 0 -0.0342 0            # upright CG sits 0.159 inboard of the wheel center
+inertia 4.896 7.581 4.774 0 0 0
+fext 1
+
+body                     # 5: left shaker post pad at the contact patch -- a driver
+parent -1
+joint prismatic z
+tree 0 0.910 -0.467
+mass 25
+cg 0 0 0
+inertia 0.35 0.35 0.65 0 0 0
+
+body                     # 6: right lower control arm, mirror of body 2
+parent 1
+joint revolute x
+tree -0.036 -0.307 0.026
+mass 23.965
+cg 0 -0.240 -0.059
+inertia 0.4 0.4 0.8938 0 0 0
+fext 1
+
+body                     # 7: right upper control arm, mirror of body 3
+parent 1
+joint revolute x
+tree 0.177 -0.462 0.252
+mass 5.813
+cg -0.089 -0.127 -0.005
+inertia 0.03 0.03 0.06276 0 0 0
+
+body                     # 8: right spindle assembly, mirror of body 4
+parent -1
+joint floating
+tree 0 -0.910 0
+mass 90.555
+cg 0 0.0342 0             # upright CG sits 0.159 inboard of the wheel center
+inertia 4.896 7.581 4.774 0 0 0
+fext 1
+
+body                     # 9: right shaker post pad, mirror of body 5
+parent -1
+joint prismatic z
+tree 0 -0.910 -0.467
+mass 25
+cg 0 0 0
+inertia 0.35 0.35 0.65 0 0 0
+
+loop                     # left lower ball joint: LCA_L outer end to spindle_L
+predecessor 2
+successor 4
+joint spherical
+ptree 0.036 0.480 -0.118
+stree 0 -0.123 -0.092
+
+loop                     # left upper ball joint: UCA_L outer end to spindle_L
+predecessor 3
+successor 4
+joint spherical
+ptree -0.177 0.254 -0.010
+stree 0 -0.194 0.242
+
+loop                     # left tierod: chassis_roll to the spindle_L steering-arm point
+predecessor 1
+successor 4
+joint distance
+ptree 0.187 0.416 0.085
+stree 0.134 -0.089 0.017
+length 0.4140749
+
+loop                     # left driver rod: post_L pad to wheel center, one tire radius
+predecessor 5
+successor 4
+joint distance
+ptree 0 0 0
+stree 0 0 0
+length 0.467
+
+loop                     # right lower ball joint: LCA_R outer end to spindle_R
+predecessor 6
+successor 8
+joint spherical
+ptree 0.036 -0.480 -0.118
+stree 0 0.123 -0.092
+
+loop                     # right upper ball joint: UCA_R outer end to spindle_R
+predecessor 7
+successor 8
+joint spherical
+ptree -0.177 -0.254 -0.010
+stree 0 0.194 0.242
+
+loop                     # right tierod: chassis_roll to the spindle_R steering-arm point
+predecessor 1
+successor 8
+joint distance
+ptree 0.187 -0.416 0.085
+stree 0.134 0.089 0.017
+length 0.4140749
+
+loop                     # right driver rod: post_R pad to wheel center, one tire radius
+predecessor 9
+successor 8
+joint distance
+ptree 0 0 0
+stree 0 0 0
+length 0.467
+
+poi springChassis_L 1 -0.140 0.502 0.282
+poi springArm_L 2 -0.097 0.236 -0.047
+poi shockChassis_L 1 -0.140 0.498 0.349
+poi shockArm_L 2 -0.097 0.237 -0.038
+
+poi springChassis_R 1 -0.140 -0.502 0.282
+poi springArm_R 6 -0.097 -0.236 -0.047
+poi shockChassis_R 1 -0.140 -0.498 0.349
+poi shockArm_R 6 -0.097 -0.237 -0.038
+
+tsda spring_L               # HMMWV rear coil spring, linearized (see header)
+from springChassis_L
+to springArm_L
+k 401043.45
+c 0
+l0 0.382
+
+tsda shock_L                # HMMWV rear shock absorber
+from shockChassis_L
+to shockArm_L
+k 0
+c 36725.2201
+l0 0.382
+
+tsda spring_R               # mirror of spring_L
+from springChassis_R
+to springArm_R
+k 401043.45
+c 0
+l0 0.382
+
+tsda shock_R                 # mirror of shock_L
+from shockChassis_R
+to shockArm_R
+k 0
+c 36725.2201
+l0 0.382
