@@ -171,8 +171,8 @@
 #define MODEL_MAX_V  ( MODEL_MAX_BODIES * 6 )
 
 #define MODEL_NAME_LEN 32
-#define MODEL_MAX_POI 16
-#define MODEL_MAX_ELEM 16
+#define MODEL_MAX_POI 24
+#define MODEL_MAX_ELEM 24
 
 typedef enum {
     JOINT_REVOLUTE,
@@ -195,7 +195,7 @@ typedef struct {
     int hasFext;
 } ModelBody;
 
-#define MODEL_MAX_LOOPS 8
+#define MODEL_MAX_LOOPS 20 // a 4-corner car needs 16 (4/corner); +1 for a pitman-arm steering closure
 #define MODEL_MAX_NC ( MODEL_MAX_LOOPS * 5 ) // worst case: every loop revolute/prismatic
 
 typedef struct {

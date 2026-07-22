@@ -1,0 +1,466 @@
+# Full HMMWV: free-flying sprung mass on four independent double-wishbone
+# corners, each on its own shaker post, plus a rack-and-pinion steering rack
+# feeding the two front tie rods. This is the whole vehicle -- the quartercar
+# (front corner) and halfcar (rear axle) test rigs assembled into one body,
+# with the front tierods rerouted from the chassis onto a steerable rack so
+# the front wheels actually turn. Hardpoints, masses, and inertias are the
+# HMMWV data shipped with Project Chrono (data/vehicle/hmmwv/): suspensions
+# HMMWV_DoubleWishboneFront/Rear.json, chassis HMMWV_Chassis.json (2086.52 kg),
+# steering HMMWV_RackPinion.json, wheel 18.8 kg + tire 37.6 kg per corner,
+# tire radius 0.467. Axle stations and the steering rack come from
+# HMMWV_Vehicle.json (wheelbase 3.378, suspension locations +-1.688965).
+#
+# Axes are ISO vehicle: x forward, y outboard-left, z up. The BASE FRAME sits
+# on the VEHICLE CENTERLINE (y=0), at DESIGN WHEEL-CENTER HEIGHT (z=0), at
+# MID-WHEELBASE (x=0, midway between the axles). A Chrono suspension-subsystem
+# hardpoint maps to this frame by adding the axle's suspension location
+# (+-1.688965, 0, 0) and the wheel-center height shift (0, 0, +0.026) that
+# lifts the spindle COM (z=-0.026) onto z=0. Left-side hardpoints are used as
+# given; the right side is the mirror image (negate y), exactly how Chrono
+# mirrors one side's JSON to build the other. Front corners use the FRONT
+# suspension JSON, rear corners the REAR JSON -- same wheel/tire/arm parts,
+# only the axle-specific hardpoints, uprights, and spring/shock curves differ.
+# Every loop closes at the design pose (all q = 0, chassis and spindles at
+# identity quaternion).
+#
+# Topology (18 bodies, tree nv 43, nc 32, mobility 11):
+#   0  chassis   floating   the whole sprung mass, free-flying (RBDA sec 9.4):
+#                           full HMMWV chassis mass 2086.52 kg and centroidal
+#                           inertia, quaternion attitude so no gimbal lock in
+#                           any ride/handling attitude. All eight control arms
+#                           and the steering rack hang off this body. Unlike
+#                           quartercar (chassis on a vertical slider) and
+#                           halfcar (chassis on a heave+roll chain), here the
+#                           sprung mass has all six rigid-body DOF -- heave,
+#                           roll, pitch, yaw, and lateral/longitudinal drift.
+#   1  rack      prismatic y the steering rack (HMMWV_RackPinion steering link),
+#                           sliding laterally on the chassis: a POSITION
+#                           DRIVER. Drive its q through its own tau slot (a
+#                           stiff PD servo tracking the commanded rack travel,
+#                           i.e. the pinion angle times 0.1 m radius). Moving
+#                           the rack pushes/pulls both front tie rods and so
+#                           steers the front wheels about their kingpin axes.
+#
+#   Front-left corner (bodies 2..5), mirror front-right (6..9), then
+#   rear-left (10..13) and rear-right (14..17). Each corner is one quartercar
+#   (front) or halfcar-side (rear):
+#     LCA      revolute x   lower wishbone; Chrono's pivot axis is exactly x
+#                           (front/back chassis pivots share y,z), frame at
+#                           their midpoint
+#     UCA      revolute x   upper wishbone; the real pivot axis is skewed a
+#                           few deg from x, idealized to x (as in quartercar/
+#                           halfcar) since tree joints are axis-aligned; frame
+#                           at the front/back midpoint
+#     spindle  floating     upright + spindle + wheel + tire lumped (no
+#                           wheel-spin DOF), located by the loop joints; frame
+#                           at the wheel center. Parented to the base, not the
+#                           chassis -- it is a floating body pinned entirely by
+#                           constraints, exactly as in quartercar/halfcar
+#                           (spherical tree joints aren't implemented).
+#     post     prismatic z  shaker pad at the contact patch: a POSITION DRIVER,
+#                           one per corner. Drive its q through its own tau slot.
+#
+# Loop joints, 4 per corner x 4 = 16 (each spindle carries ball joints
+# everywhere, so like quartercar it is a floating body held by constraints):
+#   spherical  LCA outer ball  -> spindle lower ball
+#   spherical  UCA outer ball  -> spindle upper ball
+#   distance   tie rod -> spindle steering-arm point.  FRONT: predecessor is
+#              the RACK, so rack travel steers the wheel (this is the steering
+#              geometry).  REAR: predecessor is the CHASSIS (Chrono's rear
+#              tierod is grounded on the chassis at both ends -- the rear
+#              doesn't steer), an ordinary fixed link. Either way it kills the
+#              leftover spin about the kingpin axis.
+#   distance   driver rod, post pad -> wheel center, length = tire radius: a
+#              rigid "tire" with balls at patch and hub, exactly as in
+#              quartercar/halfcar. Pins spindle height to post height; lateral
+#              scrub during travel just tilts it (height error ~ s^2/2r).
+#
+# Mobility 11 = chassis (6, free-flying) + steering rack (1) + four posts (4).
+# Each corner's LCA+UCA+spindle (8 tree DOF) is exactly balanced by its 8 loop
+# constraints, so a corner adds no independent DOF: suspension deflection is
+# the chassis-vs-post motion through the linkage, and steer is the rack. Tire
+# loads (and any longitudinal/lateral force, which the vertical posts and
+# tire rods do NOT supply) apply via fext on the spindles; the free chassis is
+# held up only by the four suspensions, so at q = 0 it sits in vertical
+# equilibrium and is marginally free in x/y/yaw -- the honest behavior of a
+# vehicle that needs applied forces to hold station.
+#
+# Springs and shocks (per corner, two TSDAs sharing the LCA mount but not the
+# chassis mount, as in quartercar/halfcar): the real HMMWV coil spring is a
+# progressive nonlinear curve, linearized to its slope at zero deflection
+# (front 3629.923 N / 0.02 m, rear 8020.869 / 0.02); the shock damping
+# coefficient is already linear and used directly. Both anchors ride on the
+# body that physically carries them -- the chassis for the upper mount, the
+# LCA for the lower -- so with the chassis free the spring measures only the
+# wishbone's rotation relative to the chassis, never a spurious length change
+# from chassis heave/roll (the halfcar lesson). Free lengths are the JSON
+# values (front 0.339, rear 0.382). All passive (no 'input').
+#
+# q layout (nq 48, nv 43): chassis q[0..6] (quat + pos) v[0..5]; rack q[7]
+# v[6]; then each corner LCA(1) UCA(1) spindle(quat+pos 7 / spatial 6) post(1).
+# Design pose: q = 0 with every quaternion at identity (chassis q[0]=1, each
+# spindle's leading quaternion component = 1).
+
+gravity 0 0 -9.81
+stab 0.05
+
+body                     # 0: chassis, full HMMWV sprung mass, free-flying
+parent -1
+joint floating
+tree 0 0 0
+mass 2086.52
+cg 0.056 0 0.239         # HMMWV_Chassis centroid (0.056,0,0.213) lifted +0.026
+inertia 1078.52 2955.66 3570.20 0 0 0
+fext 1
+
+body                     # 1: steering rack, slides laterally on the chassis (driver)
+parent 0
+joint prismatic y
+tree 1.43897 0 0.08      # front tierod inboard point, projected to centerline
+mass 9.072
+cg 0 0 0
+inertia 1 1 1 0 0 0
+
+# ---------------------------------------------------------------- front-left
+body                     # 2: FL lower control arm, pivot y=0.307 z=0.026 (exact x axis)
+parent 0
+joint revolute x
+tree 1.68897 0.307 0.026
+mass 23.965
+cg 0 0.240 -0.059
+inertia 0.4 0.4 0.8938 0 0 0
+fext 1
+
+body                     # 3: FL upper control arm, pivot at front/back midpoint
+parent 0
+joint revolute x
+tree 1.53097 0.462 0.2465
+mass 5.813
+cg 0.052 0.127 -0.0025
+inertia 0.03 0.03 0.06276 0 0 0
+
+body                     # 4: FL spindle assembly (upright+spindle+wheel+tire), at wheel center
+parent -1
+joint floating
+tree 1.64897 0.91 0
+mass 90.555
+cg 0 -0.0342 0           # upright CG sits 0.159 inboard of the wheel center
+inertia 4.896 7.581 4.774 0 0 0
+fext 1
+
+body                     # 5: FL shaker post pad at the contact patch -- a driver
+parent -1
+joint prismatic z
+tree 1.64897 0.91 -0.467
+mass 25
+cg 0 0 0
+inertia 0.35 0.35 0.65 0 0 0
+
+# --------------------------------------------------------------- front-right
+body                     # 6: FR lower control arm, mirror of body 2
+parent 0
+joint revolute x
+tree 1.68897 -0.307 0.026
+mass 23.965
+cg 0 -0.240 -0.059
+inertia 0.4 0.4 0.8938 0 0 0
+fext 1
+
+body                     # 7: FR upper control arm, mirror of body 3
+parent 0
+joint revolute x
+tree 1.53097 -0.462 0.2465
+mass 5.813
+cg 0.052 -0.127 -0.0025
+inertia 0.03 0.03 0.06276 0 0 0
+
+body                     # 8: FR spindle assembly, mirror of body 4
+parent -1
+joint floating
+tree 1.64897 -0.91 0
+mass 90.555
+cg 0 0.0342 0
+inertia 4.896 7.581 4.774 0 0 0
+fext 1
+
+body                     # 9: FR shaker post pad, mirror of body 5
+parent -1
+joint prismatic z
+tree 1.64897 -0.91 -0.467
+mass 25
+cg 0 0 0
+inertia 0.35 0.35 0.65 0 0 0
+
+# ----------------------------------------------------------------- rear-left
+body                     # 10: RL lower control arm, pivot y=0.307 z=0.026 (exact x axis)
+parent 0
+joint revolute x
+tree -1.68897 0.307 0.026
+mass 23.965
+cg 0 0.240 -0.059
+inertia 0.4 0.4 0.8938 0 0 0
+fext 1
+
+body                     # 11: RL upper control arm, pivot at front/back midpoint
+parent 0
+joint revolute x
+tree -1.47596 0.462 0.252
+mass 5.813
+cg -0.089 0.127 -0.005
+inertia 0.03 0.03 0.06276 0 0 0
+
+body                     # 12: RL spindle assembly, at wheel center
+parent -1
+joint floating
+tree -1.65297 0.91 0
+mass 90.555
+cg 0 -0.0342 0
+inertia 4.896 7.581 4.774 0 0 0
+fext 1
+
+body                     # 13: RL shaker post pad, a driver
+parent -1
+joint prismatic z
+tree -1.65297 0.91 -0.467
+mass 25
+cg 0 0 0
+inertia 0.35 0.35 0.65 0 0 0
+
+# ---------------------------------------------------------------- rear-right
+body                     # 14: RR lower control arm, mirror of body 10
+parent 0
+joint revolute x
+tree -1.68897 -0.307 0.026
+mass 23.965
+cg 0 -0.240 -0.059
+inertia 0.4 0.4 0.8938 0 0 0
+fext 1
+
+body                     # 15: RR upper control arm, mirror of body 11
+parent 0
+joint revolute x
+tree -1.47596 -0.462 0.252
+mass 5.813
+cg -0.089 -0.127 -0.005
+inertia 0.03 0.03 0.06276 0 0 0
+
+body                     # 16: RR spindle assembly, mirror of body 12
+parent -1
+joint floating
+tree -1.65297 -0.91 0
+mass 90.555
+cg 0 0.0342 0
+inertia 4.896 7.581 4.774 0 0 0
+fext 1
+
+body                     # 17: RR shaker post pad, mirror of body 13
+parent -1
+joint prismatic z
+tree -1.65297 -0.91 -0.467
+mass 25
+cg 0 0 0
+inertia 0.35 0.35 0.65 0 0 0
+
+# ================================================================ FL loops
+loop                     # FL lower ball: LCA_FL outer end to spindle_FL
+predecessor 2
+successor 4
+joint spherical
+ptree -0.036 0.48 -0.118
+stree 0.004 -0.123 -0.092
+
+loop                     # FL upper ball: UCA_FL outer end to spindle_FL
+predecessor 3
+successor 4
+joint spherical
+ptree 0.105 0.254 -0.0055
+stree -0.013 -0.194 0.241
+
+loop                     # FL tie rod: RACK to spindle_FL steering arm (STEERED)
+predecessor 1
+successor 4
+joint distance
+ptree 0 0.448 0
+stree -0.136 -0.089 0.01
+length 0.3866588
+
+loop                     # FL driver rod: post_FL pad to wheel center, one tire radius
+predecessor 5
+successor 4
+joint distance
+ptree 0 0 0
+stree 0 0 0
+length 0.467
+
+# ================================================================ FR loops
+loop                     # FR lower ball, mirror
+predecessor 6
+successor 8
+joint spherical
+ptree -0.036 -0.48 -0.118
+stree 0.004 0.123 -0.092
+
+loop                     # FR upper ball, mirror
+predecessor 7
+successor 8
+joint spherical
+ptree 0.105 -0.254 -0.0055
+stree -0.013 0.194 0.241
+
+loop                     # FR tie rod: RACK to spindle_FR steering arm (STEERED)
+predecessor 1
+successor 8
+joint distance
+ptree 0 -0.448 0
+stree -0.136 0.089 0.01
+length 0.3866588
+
+loop                     # FR driver rod, mirror
+predecessor 9
+successor 8
+joint distance
+ptree 0 0 0
+stree 0 0 0
+length 0.467
+
+# ================================================================ RL loops
+loop                     # RL lower ball: LCA_RL outer end to spindle_RL
+predecessor 10
+successor 12
+joint spherical
+ptree 0.036 0.48 -0.118
+stree 0 -0.123 -0.092
+
+loop                     # RL upper ball: UCA_RL outer end to spindle_RL
+predecessor 11
+successor 12
+joint spherical
+ptree -0.177 0.254 -0.01
+stree 0 -0.194 0.242
+
+loop                     # RL tie rod: CHASSIS to spindle_RL steering arm (grounded, no steer)
+predecessor 0
+successor 12
+joint distance
+ptree -1.46596 0.416 0.085
+stree 0.134 -0.089 0.017
+length 0.4140749
+
+loop                     # RL driver rod: post_RL pad to wheel center, one tire radius
+predecessor 13
+successor 12
+joint distance
+ptree 0 0 0
+stree 0 0 0
+length 0.467
+
+# ================================================================ RR loops
+loop                     # RR lower ball, mirror
+predecessor 14
+successor 16
+joint spherical
+ptree 0.036 -0.48 -0.118
+stree 0 0.123 -0.092
+
+loop                     # RR upper ball, mirror
+predecessor 15
+successor 16
+joint spherical
+ptree -0.177 -0.254 -0.01
+stree 0 0.194 0.242
+
+loop                     # RR tie rod: CHASSIS to spindle_RR steering arm (grounded, no steer)
+predecessor 0
+successor 16
+joint distance
+ptree -1.46596 -0.416 0.085
+stree 0.134 0.089 0.017
+length 0.4140749
+
+loop                     # RR driver rod, mirror
+predecessor 17
+successor 16
+joint distance
+ptree 0 0 0
+stree 0 0 0
+length 0.467
+
+# ============================================= spring/shock POIs and TSDAs
+# Front chassis anchors on body 0 (chassis); rear too. Arm anchors on each
+# LCA. Front spring/shock share the LCA arm point; rear spring and shock have
+# slightly different arm points (per the rear JSON).
+poi springChassis_FL 0 1.79297 0.51 0.223
+poi springArm_FL 2 0.097 0.236 -0.047
+poi shockChassis_FL 0 1.79297 0.498 0.349
+poi shockArm_FL 2 0.097 0.236 -0.047
+
+poi springChassis_FR 0 1.79297 -0.51 0.223
+poi springArm_FR 6 0.097 -0.236 -0.047
+poi shockChassis_FR 0 1.79297 -0.498 0.349
+poi shockArm_FR 6 0.097 -0.236 -0.047
+
+poi springChassis_RL 0 -1.79297 0.502 0.282
+poi springArm_RL 10 -0.097 0.236 -0.047
+poi shockChassis_RL 0 -1.79297 0.498 0.349
+poi shockArm_RL 10 -0.097 0.237 -0.038
+
+poi springChassis_RR 0 -1.79297 -0.502 0.282
+poi springArm_RR 14 -0.097 -0.236 -0.047
+poi shockChassis_RR 0 -1.79297 -0.498 0.349
+poi shockArm_RR 14 -0.097 -0.237 -0.038
+
+tsda spring_FL              # HMMWV front coil spring, linearized
+from springChassis_FL
+to springArm_FL
+k 181496.15
+c 0
+l0 0.339
+
+tsda shock_FL              # HMMWV front shock absorber
+from shockChassis_FL
+to shockArm_FL
+k 0
+c 19015.5692
+l0 0.339
+
+tsda spring_FR
+from springChassis_FR
+to springArm_FR
+k 181496.15
+c 0
+l0 0.339
+
+tsda shock_FR
+from shockChassis_FR
+to shockArm_FR
+k 0
+c 19015.5692
+l0 0.339
+
+tsda spring_RL             # HMMWV rear coil spring, linearized
+from springChassis_RL
+to springArm_RL
+k 401043.45
+c 0
+l0 0.382
+
+tsda shock_RL              # HMMWV rear shock absorber
+from shockChassis_RL
+to shockArm_RL
+k 0
+c 36725.2201
+l0 0.382
+
+tsda spring_RR
+from springChassis_RR
+to springArm_RR
+k 401043.45
+c 0
+l0 0.382
+
+tsda shock_RR
+from shockChassis_RR
+to shockArm_RR
+k 0
+c 36725.2201
+l0 0.382

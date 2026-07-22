@@ -86,6 +86,35 @@ directly, rather than shelling out to a C compiler.
     a base-anchored mount would pick up a spurious length change from pure
     heave/roll (nq = 22, nv = 20, nc = 16, mobility 4 — heave, roll, and the
     two posts)
+  - `hmmwv` — the whole HMMWV: `quartercar` and `halfcar` assembled into one
+    vehicle. A `floating` chassis (the full 2086.52 kg sprung mass, free-flying
+    with all six rigid-body DOF — heave, roll, pitch, yaw, and lateral/
+    longitudinal drift — quaternion attitude so no gimbal lock) carries four
+    independent double-wishbone corners, each built exactly as `quartercar`'s
+    (a `floating` spindle pinned by two `spherical` closures, a `distance`
+    tierod, and a `distance` "tire" rod to its own driven shaker post). The two
+    front tierods reroute from the chassis onto a laterally-sliding
+    `prismatic y` steering rack (HMMWV rack-and-pinion), so rack travel steers
+    the front wheels about their kingpin axes — the steering geometry; the rear
+    tierods stay grounded on the chassis (the rear doesn't steer). All four
+    real HMMWV coil springs and shocks are carried as two `tsda` per corner
+    (nq = 48, nv = 43, nc = 32, mobility 11 — the free chassis's 6, the
+    steering rack, and the four posts; 16 loops, the first model past the old
+    8-loop cap, which this raised to 20). One of the two largest models here,
+    and among those that most exercise the loop solver — 32 constraints, full
+    rank at every trial
+  - `hmmwv_pitman` — the same full HMMWV, but with the vehicle's REAL steering:
+    a Pitman-arm / idler linkage instead of `hmmwv`'s rack-and-pinion (Chrono's
+    default HMMWV uses `HMMWV_PitmanArm.json`). A `revolute z` Pitman arm on
+    the chassis (the steering input) swings a relay rod — a `revolute z` body
+    hung off the arm's end, idealizing the universal joint — whose far end is
+    held by a `distance` "idler" loop (length = the idler-arm length), so the
+    Pitman and idler arms form a parallelogram and the relay translates to
+    steer both front tie rods. The steering chain is mobility 1 (Pitman 1 +
+    relay 1 − idler distance 1); everything else matches `hmmwv` (nq = 49,
+    nv = 44, nc = 33, mobility 11; 17 loops — the most of any model). Shows the
+    format expressing a genuine spatial steering linkage from tree revolutes
+    plus loop closures
 - `src/model` — the shared model-file parser (plain C, header-only), used
   by the generator, the validator, and the benchmark, so all three always
   agree on the mechanism.
