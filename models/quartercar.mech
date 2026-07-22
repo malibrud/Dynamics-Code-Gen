@@ -136,9 +136,9 @@ ptree 0 0 0
 stree 0 0 0
 length 0.467
 
-poi springChassis -1 0.144 -0.400 0.223
+poi springChassis 0 0.144 -0.400 0.223
 poi springArm 1 0.097 0.236 -0.047
-poi shockChassis -1 0.144 -0.412 0.349
+poi shockChassis 0 0.144 -0.412 0.349
 poi shockArm 1 0.097 0.236 -0.047
 
 tsda spring                # HMMWV front coil spring, linearized (see header)
