@@ -1,0 +1,68 @@
+# Minimal tracked chassis to exercise the 'track' generator block. A floating
+# hull carries a drive sprocket, an idler (the two 'end' pulleys), and two road
+# wheels. The track block expands into a closed band of 12 shoes riding on them.
+# Geometry is placeholder; the point is the expansion, not real HMMWV data.
+
+gravity 0 0 -9.81
+stab 0.05
+
+body                     # 0: hull, free-flying
+parent -1
+joint floating
+tree 0 0 0
+mass 4000
+cg 0 0 0.4
+inertia 2000 6000 6500 0 0 0
+fext 1
+
+body                     # 1: drive sprocket (rear end pulley)
+parent 0
+joint revolute y
+tree -1.0 0.5 0.30
+mass 80
+cg 0 0 0
+inertia 4 7 4 0 0 0
+
+body                     # 2: idler (front end pulley)
+parent 0
+joint revolute y
+tree 1.0 0.5 0.30
+mass 60
+cg 0 0 0
+inertia 3 5 3 0 0 0
+
+body                     # 3: road wheel 1
+parent 0
+joint revolute y
+tree -0.35 0.5 0.0
+mass 50
+cg 0 0 0
+inertia 2 3 2 0 0 0
+fext 1
+
+body                     # 4: road wheel 2
+parent 0
+joint revolute y
+tree 0.35 0.5 0.0
+mass 50
+cg 0 0 0
+inertia 2 3 2 0 0 0
+fext 1
+
+track demo_band
+root 0
+plane xz
+shoes 12
+pitch 0.46
+mass 5.0
+cg 0 0 0
+inertia 0.01 0.03 0.03 0 0 0
+fext 1
+roller 1 0.25 end drive teeth 9    # sprocket
+roller 2 0.25 end                  # idler
+roller 3 0.15                       # road wheel 1
+roller 4 0.15                       # road wheel 2
+ground z 0
+kn 3.5e6
+kt 1.0e6
+mu 0.8

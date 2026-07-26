@@ -20,7 +20,9 @@ int fwd_dyn_find( const char *kind, const char *name );
 // (rank = nc); anything less means redundant constraints and a singular
 // K H^-1 K^T, which the generated method-2 solve cannot handle.
 static int rankK( int nc, int nv, const double *Kin ) {
-    double K[ MODEL_MAX_NC ][ MODEL_MAX_V ];
+    // Static (rankK is not reentrant): MODEL_MAX_NC x MODEL_MAX_V is ~2.5 MB at
+    // the raised limits and would overflow the stack.
+    static double K[ MODEL_MAX_NC ][ MODEL_MAX_V ];
     for ( int r = 0 ; r < nc ; r++ )
     for ( int c = 0 ; c < nv ; c++ ) K[r][c] = Kin[ r*nv + c ];
 
@@ -112,6 +114,19 @@ int main( int argc, char **argv ) {
         return 1;
     }
 
+    // ABA cross-check (RBDA ch. 7) against the CRBA path, on a TREE-ONLY,
+    // ELEMENT-FREE copy of the model: fd_dense_aba does not route force
+    // elements yet, and method 2's loop layer is orthogonal to HOW H^-1 gets
+    // applied. Agreement here is what licenses swapping CRBA for ABA inside
+    // the loop solve, where the 1 + nc right-hand sides all share one O(n)
+    // articulated-inertia factorization -- the property that makes a long
+    // track band affordable.
+    static Model treeMdl;
+    memcpy( &treeMdl, &mdl, sizeof treeMdl );
+    treeMdl.nloop = 0; treeMdl.nc = 0; treeMdl.nelem = 0; treeMdl.nact = 0;
+    double maxAbaErr = 0;
+    int worstAbaTrial = -1;
+
     for ( int t = 0 ; t < NTRIALS ; t++ ) {
         double q[ MODEL_MAX_Q ], qd[ MODEL_MAX_V ], tau[ MODEL_MAX_V ];
         double fext[ MODEL_MAX_BODIES * 6 ];
@@ -175,6 +190,17 @@ int main( int argc, char **argv ) {
             if ( e > maxErr ) { maxErr = e; worstTrial = t; }
         }
 
+        // Propagation method vs inertia-matrix method, same state, tree only.
+        {
+            double qddCrba[ MODEL_MAX_V ], qddAba[ MODEL_MAX_V ];
+            fd_dense( &treeMdl, q, qd, tau, fext, NULL, qddCrba );
+            fd_dense_aba( &treeMdl, q, qd, tau, fext, qddAba );
+            for ( int k = 0 ; k < nv ; k++ ) {
+                double e = fabs( qddAba[k] - qddCrba[k] ) / fmax( 1.0, fabs( qddCrba[k] ) );
+                if ( e > maxAbaErr ) { maxAbaErr = e; worstAbaTrial = t; }
+            }
+        }
+
         // fwd_dyn_observe's TSDA l/ldot against an independent dense
         // recomputation (denseObserveTsda, dense.h) from the same Xa
         // transforms the element-force block above uses.
@@ -204,7 +230,9 @@ int main( int argc, char **argv ) {
     if ( mdl.nelem > 0 )
         printf( "validate: %s: %d trials, max scaled |observe_generated - observe_dense| = %.3e (worst at trial %d)\n",
                 path, NTRIALS, maxObsErr, worstObsTrial );
-    if ( maxErr < TOL && maxObsErr < TOL ) {
+    printf( "validate: %s: %d trials, max scaled |qdd_aba - qdd_crba| (tree only) = %.3e (worst at trial %d)\n",
+            path, NTRIALS, maxAbaErr, worstAbaTrial );
+    if ( maxErr < TOL && maxObsErr < TOL && maxAbaErr < TOL ) {
         printf( "validate: PASS\n" );
         return 0;
     }

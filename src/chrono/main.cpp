@@ -271,12 +271,11 @@ static void buildChronoModel( const Model *mdl, ChronoModel &cm ) {
     cm.ground->SetFixed( true );
     cm.sys.AddBody( cm.ground );
 
-    // Bodies, placed at the zero configuration of the model.
+    // Bodies, placed at the design pose of the model (m->q0: zero / quaternion
+    // identity for hand-written bodies, the curved band pose for track shoes).
     static double q0[ MODEL_MAX_Q ], qd0[ MODEL_MAX_V ];
-    for ( int k = 0 ; k < mdl->nq ; k++ ) q0[k] = 0;
+    for ( int k = 0 ; k < mdl->nq ; k++ ) q0[k] = mdl->q0[k];
     for ( int k = 0 ; k < mdl->nv ; k++ ) qd0[k] = 0;
-    for ( int i = 0 ; i < mdl->nbod ; i++ )
-        if ( mdl->body[i].jtype == JOINT_FLOATING ) q0[ mdl->qidx[i] ] = 1.0;
     std::vector<BodyKin> kin;
     fk( mdl, q0, qd0, kin );
 

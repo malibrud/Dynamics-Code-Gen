@@ -437,12 +437,14 @@ static void fd_dense_full( const Model *mdl, const double *q, const double *qd,
                            double *qdd_out, double *K_out, double *delta_out ) {
     int nb = mdl->nbod;
     int nv = mdl->nv;
-    double Xup[ MODEL_MAX_BODIES ][6][6]; // i_X_lambda(i)
-    double Xa[ MODEL_MAX_BODIES ][6][6];  // i_X_0
-    double I6[ MODEL_MAX_BODIES ][6][6];
-    double S[ MODEL_MAX_BODIES ][6][6];   // motion subspace, ndof[i] columns
-    int ndof[ MODEL_MAX_BODIES ];
-    double v[ MODEL_MAX_BODIES ][6], avp[ MODEL_MAX_BODIES ][6], fvp[ MODEL_MAX_BODIES ][6];
+    // Static (fd_dense_full is not reentrant, per the header above): at the
+    // raised MODEL_MAX_BODIES these would be ~0.5 MB and overflow the stack.
+    static double Xup[ MODEL_MAX_BODIES ][6][6]; // i_X_lambda(i)
+    static double Xa[ MODEL_MAX_BODIES ][6][6];  // i_X_0
+    static double I6[ MODEL_MAX_BODIES ][6][6];
+    static double S[ MODEL_MAX_BODIES ][6][6];   // motion subspace, ndof[i] columns
+    static int ndof[ MODEL_MAX_BODIES ];
+    static double v[ MODEL_MAX_BODIES ][6], avp[ MODEL_MAX_BODIES ][6], fvp[ MODEL_MAX_BODIES ][6];
 
     // -a_grav, the seed of the RNEA acceleration recursion.
     double gravNeg[6] = { 0, 0, 0, -mdl->gravity[0], -mdl->gravity[1], -mdl->gravity[2] };
@@ -616,8 +618,8 @@ static void fd_dense_full( const Model *mdl, const double *q, const double *qd,
         }
     }
 
-    // CRBA: composite inertias, then H blocks.
-    double IC[ MODEL_MAX_BODIES ][6][6];
+    // CRBA: composite inertias, then H blocks. Static for the same reason.
+    static double IC[ MODEL_MAX_BODIES ][6][6];
     for ( int i = 0 ; i < nb ; i++ )
         for ( int r = 0 ; r < 6 ; r++ )
         for ( int c = 0 ; c < 6 ; c++ ) IC[i][r][c] = I6[i][r][c];
@@ -864,7 +866,8 @@ static void fd_dense_full( const Model *mdl, const double *q, const double *qd,
         linsolve( nv, A, col, sol );
         for ( int r = 0 ; r < nv ; r++ ) Y[r][c] = sol[r];
     }
-    double Ac[ MODEL_MAX_NC * MODEL_MAX_NC ], bc[ MODEL_MAX_NC ], lambda[ MODEL_MAX_NC ];
+    static double Ac[ MODEL_MAX_NC * MODEL_MAX_NC ]; // static: 0.3 MB, off the stack
+    double bc[ MODEL_MAX_NC ], lambda[ MODEL_MAX_NC ];
     for ( int r = 0 ; r < nc ; r++ ) {
         bc[r] = kfull[r];
         for ( int c = 0 ; c < nv ; c++ ) bc[r] -= K[r][c] * qdd_out[c];
@@ -885,6 +888,212 @@ static void fd_dense_full( const Model *mdl, const double *q, const double *qd,
 static void fd_dense( const Model *mdl, const double *q, const double *qd,
                       const double *tau, const double *fext, const double *act, double *qdd_out ) {
     fd_dense_full( mdl, q, qd, tau, fext, act, qdd_out, NULL, NULL );
+}
+
+// ---------------------------------------------------------------------------
+// Articulated-body algorithm (RBDA ch. 7): O(n) forward dynamics that never
+// forms H. This is an INDEPENDENT second implementation of the same tree
+// dynamics as fd_dense_full above -- the same spirit as that function's
+// deliberately different force routing: agreement between a propagation
+// method and an inertia-matrix method is a far stronger check than either
+// alone, and it costs O(n) instead of the CRBA's O(n^2) build + O(n^3) solve.
+//
+// Deliberately split into a configuration-only FACTORIZATION and a per-right-
+// hand-side SOLVE, because the articulated inertias depend on q alone. That
+// split is the whole point for a track band: the closed-loop method-2 solve
+// needs H^-1 applied to 1 + nc right-hand sides ([tau - C | K^T], see the loop
+// block in fd_dense_full), and they all share ONE O(n) factorization, each
+// costing just a cheap inward/outward substitution. ABA is in effect an O(n)
+// LTL factorization of H, so "apply H^-1" is exactly what aba_solve does.
+//
+// NOT handled here yet: force elements (TSDA/RSDA). fd_dense_aba is the tree
+// dynamics with gravity, tau and fext only; compare against a model copy with
+// nelem = 0 (see the ABA cross-check in main.c).
+// ---------------------------------------------------------------------------
+static struct {
+    double Xup [ MODEL_MAX_BODIES ][6][6]; // i_X_lambda(i)
+    double Xa  [ MODEL_MAX_BODIES ][6][6]; // i_X_0
+    double S   [ MODEL_MAX_BODIES ][6][6]; // motion subspace, ndof columns
+    double Ia  [ MODEL_MAX_BODIES ][6][6]; // I^A - U D^-1 U^T, folded to parent
+    double U   [ MODEL_MAX_BODIES ][6][6]; // I^A S, ndof columns
+    double Dinv[ MODEL_MAX_BODIES ][6][6]; // (S^T I^A S)^-1, ndof x ndof
+    int    ndof[ MODEL_MAX_BODIES ];
+} aba;
+
+// Configuration-only pass: kinematics plus the articulated-body inertias.
+// Depends on q alone, so one call serves every right-hand side at this state.
+static void aba_factor( const Model *mdl, const double *q ) {
+    int nb = mdl->nbod;
+    static double IA[ MODEL_MAX_BODIES ][6][6];
+
+    for ( int i = 0 ; i < nb ; i++ ) {
+        const ModelBody *b = &mdl->body[ i ];
+        double Eident[3][3] = { {1,0,0},{0,1,0},{0,0,1} };
+        double XJ[6][6], XT[6][6];
+        aba.ndof[i] = jointXS( b, q + mdl->qidx[ i ], XJ, aba.S[i] );
+        plux( Eident, b->tree, XT );
+        m6_mul( XJ, XT, aba.Xup[i] );
+        if ( b->parent == -1 ) {
+            for ( int r = 0 ; r < 6 ; r++ )
+            for ( int c = 0 ; c < 6 ; c++ ) aba.Xa[i][r][c] = aba.Xup[i][r][c];
+        } else {
+            m6_mul( aba.Xup[i], aba.Xa[ b->parent ], aba.Xa[i] );
+        }
+        mcI( b->mass, b->cg, b->inertia, IA[i] ); // seed with own rigid inertia
+    }
+
+    // Inward: project each joint out of its articulated inertia and fold the
+    // remainder onto the parent. I^a = I^A - U D^-1 U^T (RBDA eq. 7.23).
+    for ( int i = nb - 1 ; i >= 0 ; i-- ) {
+        int par = mdl->body[i].parent, nd = aba.ndof[i];
+
+        for ( int k = 0 ; k < nd ; k++ ) {            // U = I^A S
+            double col[6], out[6];
+            for ( int r = 0 ; r < 6 ; r++ ) col[r] = aba.S[i][r][k];
+            m6_mulvec( IA[i], col, out );
+            for ( int r = 0 ; r < 6 ; r++ ) aba.U[i][r][k] = out[r];
+        }
+
+        double D[36], Dcopy[36], e[6], x[6];          // D = S^T U, then D^-1
+        for ( int a = 0 ; a < nd ; a++ )
+        for ( int b2 = 0 ; b2 < nd ; b2++ ) {
+            double s = 0;
+            for ( int r = 0 ; r < 6 ; r++ ) s += aba.S[i][r][a] * aba.U[i][r][b2];
+            D[ a*nd + b2 ] = s;
+        }
+        for ( int c = 0 ; c < nd ; c++ ) {            // linsolve destroys A and b
+            for ( int k = 0 ; k < nd*nd ; k++ ) Dcopy[k] = D[k];
+            for ( int k = 0 ; k < nd ; k++ ) e[k] = ( k == c ) ? 1.0 : 0.0;
+            linsolve( nd, Dcopy, e, x );
+            for ( int r = 0 ; r < nd ; r++ ) aba.Dinv[i][r][c] = x[r];
+        }
+
+        for ( int r = 0 ; r < 6 ; r++ )
+        for ( int c = 0 ; c < 6 ; c++ ) {
+            double s = 0;
+            for ( int a = 0 ; a < nd ; a++ )
+            for ( int b2 = 0 ; b2 < nd ; b2++ )
+                s += aba.U[i][r][a] * aba.Dinv[i][a][b2] * aba.U[i][c][b2];
+            aba.Ia[i][r][c] = IA[i][r][c] - s;
+        }
+
+        if ( par != -1 ) {
+            double folded[6][6];
+            m6_congruence( aba.Xup[i], aba.Ia[i], folded );
+            for ( int r = 0 ; r < 6 ; r++ )
+            for ( int c = 0 ; c < 6 ; c++ ) IA[par][r][c] += folded[r][c];
+        }
+    }
+}
+
+// One solve against the current factorization. pAin[i] is body i's bias force
+// (crf(v) I v minus external forces) in body coordinates, cin[i] the velocity-
+// product term crm(v_i) vJ_i, tauEff the generalized joint force, and aroot the
+// root acceleration seed: -a_grav for a real solve, or ZERO (with pAin and cin
+// zero too) to make this compute exactly qdd = H^-1 tauEff.
+static void aba_solve( const Model *mdl, const double pAin[][6], const double cin[][6],
+                       const double *tauEff, const double aroot[6], double *qdd_out ) {
+    int nb = mdl->nbod;
+    static double pA[ MODEL_MAX_BODIES ][6], acc[ MODEL_MAX_BODIES ][6];
+    static double u[ MODEL_MAX_V ];
+
+    for ( int i = 0 ; i < nb ; i++ )
+        for ( int k = 0 ; k < 6 ; k++ ) pA[i][k] = pAin[i][k];
+
+    // Inward: u = tau - S^T p^A, then fold the reduced bias onto the parent.
+    for ( int i = nb - 1 ; i >= 0 ; i-- ) {
+        int par = mdl->body[i].parent, nd = aba.ndof[i], vi = mdl->vidx[i];
+        for ( int k = 0 ; k < nd ; k++ ) {
+            double s = 0;
+            for ( int r = 0 ; r < 6 ; r++ ) s += aba.S[i][r][k] * pA[i][r];
+            u[ vi + k ] = tauEff[ vi + k ] - s;
+        }
+        if ( par == -1 ) continue;
+        double Iac[6], UDu[6], pa[6], up[6];
+        m6_mulvec( aba.Ia[i], cin[i], Iac );
+        for ( int r = 0 ; r < 6 ; r++ ) {
+            double s = 0;
+            for ( int a = 0 ; a < nd ; a++ )
+            for ( int b2 = 0 ; b2 < nd ; b2++ )
+                s += aba.U[i][r][a] * aba.Dinv[i][a][b2] * u[ vi + b2 ];
+            UDu[r] = s;
+        }
+        for ( int r = 0 ; r < 6 ; r++ ) pa[r] = pA[i][r] + Iac[r] + UDu[r];
+        m6_tmulvec( aba.Xup[i], pa, up );
+        for ( int r = 0 ; r < 6 ; r++ ) pA[par][r] += up[r];
+    }
+
+    // Outward: a' = Xup a_parent + c, qdd = D^-1 (u - U^T a'), a = a' + S qdd.
+    for ( int i = 0 ; i < nb ; i++ ) {
+        int par = mdl->body[i].parent, nd = aba.ndof[i], vi = mdl->vidx[i];
+        double aprime[6], w[6];
+        m6_mulvec( aba.Xup[i], par == -1 ? aroot : acc[par], aprime );
+        for ( int r = 0 ; r < 6 ; r++ ) aprime[r] += cin[i][r];
+        for ( int k = 0 ; k < nd ; k++ ) {
+            double s = 0;
+            for ( int r = 0 ; r < 6 ; r++ ) s += aba.U[i][r][k] * aprime[r];
+            w[k] = u[ vi + k ] - s;
+        }
+        for ( int k = 0 ; k < nd ; k++ ) {
+            double s = 0;
+            for ( int b2 = 0 ; b2 < nd ; b2++ ) s += aba.Dinv[i][k][b2] * w[b2];
+            qdd_out[ vi + k ] = s;
+        }
+        for ( int r = 0 ; r < 6 ; r++ ) {
+            double s = 0;
+            for ( int k = 0 ; k < nd ; k++ ) s += aba.S[i][r][k] * qdd_out[ vi + k ];
+            acc[i][r] = aprime[r] + s;
+        }
+    }
+}
+
+// Tree forward dynamics via ABA: gravity, tau and fext (no force elements).
+static void fd_dense_aba( const Model *mdl, const double *q, const double *qd,
+                          const double *tau, const double *fext, double *qdd_out ) {
+    int nb = mdl->nbod;
+    static double vel[ MODEL_MAX_BODIES ][6], cvp[ MODEL_MAX_BODIES ][6];
+    static double pA[ MODEL_MAX_BODIES ][6];
+    double aroot[6] = { 0, 0, 0, -mdl->gravity[0], -mdl->gravity[1], -mdl->gravity[2] };
+
+    aba_factor( mdl, q );
+
+    for ( int i = 0 ; i < nb ; i++ ) {
+        const ModelBody *b = &mdl->body[i];
+        int par = b->parent, nd = aba.ndof[i], vi = mdl->vidx[i];
+
+        double vJ[6] = { 0, 0, 0, 0, 0, 0 };
+        for ( int r = 0 ; r < 6 ; r++ )
+            for ( int k = 0 ; k < nd ; k++ ) vJ[r] += aba.S[i][r][k] * qd[ vi + k ];
+        if ( par == -1 ) {
+            for ( int k = 0 ; k < 6 ; k++ ) vel[i][k] = vJ[k];
+        } else {
+            m6_mulvec( aba.Xup[i], vel[par], vel[i] );
+            for ( int k = 0 ; k < 6 ; k++ ) vel[i][k] += vJ[k];
+        }
+
+        double crmV[6][6];
+        crm( vel[i], crmV );
+        m6_mulvec( crmV, vJ, cvp[i] );              // c_i = v_i x vJ_i
+
+        // p^A = crf(v) I v. Gravity is NOT here -- it enters through aroot,
+        // unlike the RNEA path above which folds it into avp.
+        double I6b[6][6], Iv[6], crfV[6][6];
+        mcI( b->mass, b->cg, b->inertia, I6b );
+        m6_mulvec( I6b, vel[i], Iv );
+        crf( vel[i], crfV );
+        m6_mulvec( crfV, Iv, pA[i] );
+
+        if ( b->hasFext && fext ) {                 // same i_X*_0 route as fvp
+            double XaT[36], bvec[6], fb[6];
+            for ( int r = 0 ; r < 6 ; r++ )
+            for ( int c = 0 ; c < 6 ; c++ ) XaT[ r*6 + c ] = aba.Xa[i][c][r];
+            for ( int k = 0 ; k < 6 ; k++ ) bvec[k] = fext[ i*6 + k ];
+            linsolve( 6, XaT, bvec, fb );
+            for ( int k = 0 ; k < 6 ; k++ ) pA[i][k] -= fb[k];
+        }
+    }
+
+    aba_solve( mdl, pA, cvp, tau, aroot, qdd_out );
 }
 
 // ---------------------------------------------------------------------------
@@ -1042,7 +1251,8 @@ static int projectClosure( const Model *mdl, double *q ) {
     for ( int iter = 0 ; iter < 200 ; iter++ ) {
         if ( sqrt( n2 ) < 1e-12 ) return 0;
 
-        double G[ MODEL_MAX_NC * MODEL_MAX_NC ], rhs[ MODEL_MAX_NC ], lam[ MODEL_MAX_NC ];
+        static double G[ MODEL_MAX_NC * MODEL_MAX_NC ]; // static: off the stack
+        double rhs[ MODEL_MAX_NC ], lam[ MODEL_MAX_NC ];
         for ( int r = 0 ; r < nc ; r++ ) {
             rhs[r] = delta[r];
             for ( int c = 0 ; c < nc ; c++ ) {
