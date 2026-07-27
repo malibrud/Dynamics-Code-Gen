@@ -158,6 +158,55 @@
 // rejected. act[] slots are assigned in declaration order across both
 // element kinds.
 //
+// Track bands
+// -----------
+// A closed band of identical shoes riding on a set of rollers -- tens of
+// bodies per side, so it is declared once and EXPANDED by modelLoad rather
+// than hand-written:
+//
+//   track <name>                  starts a track block
+//     root <b>                    body whose frame the band geometry is in
+//                                 (the hull); the band lies in its x-z plane
+//     plane xz                    the only supported plane (pin axis y)
+//     shoes <N>                   N >= 3
+//     pitch <p>                   declared pin-to-pin. ADVISORY: the length
+//                                 actually used is perimeter/N (linkLen), so
+//                                 the shoes close on the path exactly
+//     mass <m>                    per shoe
+//     cg <x> <y> <z>              per shoe; the shoe frame is at its own pin,
+//                                 the next pin is at +linkLen on x
+//     inertia <xx> ... <zx>       per shoe, about the CG
+//     fext <0|1>                  per shoe
+//     roller <b> <r> [end] [drive] [teeth <n>]
+//                                 a cylinder of radius r on body b (declared
+//                                 before the track). Exactly TWO must be
+//                                 'end': the sprocket and idler, whose centers
+//                                 define the belt path. 'drive'/'teeth' mark
+//                                 positive tooth engagement. Both ends must be
+//                                 rigidly located in the root frame at the
+//                                 design pose
+//     ground <axis> <offset>      contact plane, e.g. 'ground z -0.55'
+//     kn/kt/mu <v>                contact material
+//
+// Expansion, done before coordinate layout so the shoes are counted into
+// nq/nv: N shoe BODIES -- a floating anchor shoe parented to the base (it is
+// held by contact, not by a mount) plus N-1 revolute-y pins -- and ONE
+// point-on-line closure loop from the last shoe's trailing pin back to the
+// anchor's leading pin. point-on-line, not revolute, for the same reason
+// fourbar uses it: a planar loop closed by a revolute is overconstrained.
+//
+// The path is the taut band around the two END pulleys: two tangent runs plus
+// the two outer wrap arcs, shoes laid evenly by arc length. Other rollers are
+// kept for the contact force engine (which this loader does not implement)
+// and do NOT shape the path, so a roller lying outside that two-pulley belt
+// -- a tracked vehicle's road wheels, which really do push the lower run down
+// onto themselves -- will intersect it at the design pose.
+//
+// A closed band cannot sit at q = 0, so the design pose goes into m->q0
+// (quaternion + position for the anchor shoe, a turn angle per pin) and
+// consumers seed their initial q from there. Every other body's design pose
+// is 0, with quaternion identity for floating bodies.
+//
 // All joint types parse; which ones a given consumer implements is up to it
 // (see modelUnsupported below for the current single-DOF pipeline).
 

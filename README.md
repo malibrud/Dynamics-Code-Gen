@@ -115,6 +115,25 @@ directly, rather than shelling out to a C compiler.
     nv = 44, nc = 33, mobility 11; 17 loops — the most of any model). Shows the
     format expressing a genuine spatial steering linkage from tree revolutes
     plus loop closures
+  - `track_demo` — a minimal tracked chassis (floating hull, sprocket, idler,
+    two road wheels) carrying a 12-shoe band: the smallest model that
+    exercises the `track` block end to end (see [Track bands](#track-bands)
+    below). Placeholder geometry; the point is the expansion
+  - `m113` — the M113 armored personnel carrier, the first tracked vehicle
+    here and by far the largest model: a `floating` hull (7819.24 kg) carrying
+    two track assemblies, each a drive sprocket, a translational idler on a
+    fore/aft-sliding tensioned carrier, five torsion-bar road-wheel stations
+    (trailing arm + road wheel), and a closed band of 63 shoes riding all
+    seven rollers. 27 hand-written bodies expand to 153 once the two bands are
+    generated (nq = 171, nv = 168, nc = 4 — just the two band closures —
+    mobility 164). Real M113 data from Chrono's `data/vehicle/M113/`
+    (single-pin track variant), which the mass total corroborates: 11 325 kg
+    against the real vehicle's ~11 340 kg combat weight. 18 force elements —
+    ten torsion bars as `rsda` on the arm joints, six shocks and two idler
+    tensioners as `tsda` — with Chrono's preloads folded into the rest
+    coordinate (`q0 = preload/k` for the bars, `l0 = free length + preload/k`
+    for the tensioner), which is exact for a linear law. Also the model that
+    made the validator's gate size-aware (see `src/validate` below)
 - `src/model` — the shared model-file parser (plain C, header-only), used
   by the generator, the validator, and the benchmark, so all three always
   agree on the mechanism.
@@ -144,6 +163,26 @@ directly, rather than shelling out to a C compiler.
   every build and fails the build on disagreement. On its first run it
   caught a real sign error in the generator's spatial-inertia lower-left
   block that the earlier hand-picked tests couldn't see.
+
+  It also carries a second, independent forward dynamics: `fd_dense_aba`,
+  Featherstone's ch. 7 articulated-body algorithm, split into a config-only
+  factorization reused across right-hand sides and a cheap per-RHS solve —
+  the property that makes the method-2 loop solve O(n) for a long band, and
+  16x faster than CRBA at 192 shoes. Every trial cross-checks it against the
+  CRBA path on a tree-only, element-free copy of the model.
+
+  **The gate is size-aware above nv = 64**: `1e-9 * (nv/64)^4`. Both
+  implementations end in a Gaussian solve of H, so the noise floor is
+  `eps * cond(H)`, and for a long serial chain cond(H) grows like the fourth
+  power of its length — arithmetic, not correctness. On `m113` the dense CRBA
+  and the dense ABA, which share no code and never touch the generator,
+  disagree by 2.5e-9, and that gap tracks the chain length to the fourth
+  across 15 / 31 / 63 shoes (3.0e-12 / 1.5e-10 / 2.5e-9). Holding a fixed
+  1e-9 there would gate on conditioning, the same mistake near-manifold
+  sampling exists to avoid at the loop level. Every model but `m113` has
+  nv <= 44, so all of them are still gated at exactly 1e-9; and a real bug
+  shows up as a large *relative* error (the metric divides by |qdd|), not as
+  a few ulps of solve noise.
 - `src/chrono` — an external cross-check against Project Chrono. Reads the
   same `.mech` file and rebuilds the mechanism as a Chrono multibody system
   (maximal-coordinate bodies + joint constraints). Unlike `src/validate`,
@@ -170,7 +209,13 @@ directly, rather than shelling out to a C compiler.
     convention bug survived. The two sides use different first-order
     integrators, so the run is repeated at `dt/2` to show the gap halves —
     a real discrepancy would not shrink with the step. Typical result:
-    ~1e-7 to 1e-6 over 0.25 s at dt = 2e-5, with a ratio of 2.00.
+    ~1e-7 to 1e-6 over 0.25 s at dt = 2e-5, with a ratio of 2.00. The gap is
+    the worse of each body's **position** (m) and **attitude** (rad) error;
+    comparing the two on one scale is crude, but both are O(1) here and the
+    metric only has to catch a divergence. Position alone was a blind spot: a
+    body that rotates about its own frame origin — `springpend`'s pendulums,
+    for instance — never moves, so no amount of rotational disagreement
+    registered.
 
   One Chrono-specific note is encoded in its comments: `DoAssembly()` gets
   accelerations by finite-differencing a small step, which is only ~1e-5
@@ -193,6 +238,29 @@ directly, rather than shelling out to a C compiler.
   to disambiguate the branch. RSDA is instead computed directly from this
   project's own `q`/`qd` and applied as an ordinary joint force, exactly like
   `tau[]`.
+
+  That last point has a sharp edge, found by `m113`. A TSDA is a `ChLinkTSDA`,
+  so Chrono re-evaluates its force law every step on its own; an RSDA is a
+  plain accumulator entry, so it stays **frozen** at whatever was last written
+  — and the simulation loop wrote it once, before stepping. Chrono was
+  therefore integrating a constant torque while the generated side applied the
+  real `-k(q - q0) - c*qd`: two different systems, showing up as a trajectory
+  gap that does not shrink with the step (`m113` diverged 0.688 m at a ratio of
+  1.00, worst at a road wheel hanging off a preloaded torsion bar). The loop
+  now recomputes each RSDA torque from **Chrono's own** joint state before
+  every step. Reading a joint coordinate back out of Chrono is exact rather
+  than approximate because a `.mech` tree joint carries no fixed rotation, so
+  the child differs from the parent by a pure rotation (or translation) about
+  the axis; the revolute angle comes back wrapped to (-π, π] and is unwrapped
+  against the previous step, which is legitimate here — the very branch
+  ambiguity that rules `ChLinkRSDA` out of the staged-state checks is harmless
+  in a stepped simulation that moves the joint by a hair per step.
+
+  The bug had been latent since RSDAs landed. `springpend`, the only other
+  RSDA model, hid it twice over: its `q0` is 0, so the frozen torque happened
+  to be the correct one, and its pendulum rotates about its own frame origin,
+  which the then position-only gap metric could not see either way. Both holes
+  are now closed.
 - `src/bench` — benchmark comparing the generated sparse code against the
   dense reference (both built with `/O2`), cycling through a pool of random
   states with a checksum to defeat dead-code elimination. Run by `build.bat`
@@ -305,6 +373,60 @@ states would just compare stabilization schemes, so unlike the validator
 it adds no tear. All four loop models agree with Chrono to ~1e-9 on
 accelerations and track its trajectories with the expected first-order
 truncation ratio.
+
+## Track bands
+
+A tracked vehicle's band is tens of near-identical shoes per side — far too
+many to hand-write, and enough bodies that the algorithm choice starts to
+matter. A `track` block declares the band once and the loader expands it:
+
+```
+track band_L
+root 0                              hull body: the band's geometry frame
+plane xz                            band plane (pin axis y); the only option
+shoes 63                            N
+pitch 0.154                         declared pin-to-pin (advisory, see below)
+mass 18.02                          per shoe
+cg 0.0752 0 0
+inertia 0.22 0.04 0.25 0 0 0
+fext 1                              per shoe, for the contact forces
+roller 1 0.245 end drive teeth 10   sprocket: a path-defining end pulley
+roller 3 0.255 end                  idler: the other one
+roller 5 0.305                      road wheel, rides the band
+ground z -0.55                      contact plane
+kn 2e5   kt 2e5   mu 0.8            contact material
+```
+
+Each block expands into N shoe **bodies** — a `floating` anchor shoe plus a
+chain of N-1 `revolute y` pins — and **one** `point-on-line` closure loop
+tying the last shoe's trailing pin back to the anchor's leading pin. That is
+the planar-loop rule from above: a planar loop closed by a revolute would be
+overconstrained, so the closure constrains only the two in-plane
+translations and leaves the pin rotation free. The chain is parented to the
+**base**, not the hull: like the quartercar's spindle, it is held in place by
+contact rather than by a mount.
+
+The band cannot sit at q = 0 — a closed chain is curved — so the loader
+computes the design pose and writes it to `m->q0` (quaternion + position for
+the anchor shoe, a turn angle per pin), which consumers seed their initial q
+from. Everything else in the format is translation-only at the design pose;
+`q0` exists for the band.
+
+Two things to know:
+
+- **The belt wraps the two `end` pulleys only.** The path is the taut band
+  around the sprocket and idler circles: two tangent runs plus two wrap arcs,
+  with shoes laid evenly by arc length. Other rollers are declared for the
+  contact engine and do not shape the path. For a real tracked vehicle the
+  road wheels push the lower run down onto themselves, so on `m113` they poke
+  ~0.15 m through the design-pose lower run and the perimeter comes out
+  9.474 m rather than 63 x 0.154 = 9.702 (2.3% short — almost exactly the
+  road-wheel wrap the idealization leaves out). The band is dynamically
+  correct either way; it is the initial geometry that is idealized.
+- **`pitch` is advisory.** The link length actually used is perimeter / N,
+  reported as `linkLen`, since the shoes must close on the path exactly.
+- The contact data (`ground`, `kn`, `kt`, `mu`, `teeth`) is parsed and kept
+  for a contact force engine that this loader does not implement.
 
 ## Force elements and points of interest
 
@@ -460,7 +582,7 @@ plain terminal — no Developer Command Prompt needed.
 build.bat
 ```
 
-For every model in its list (all thirteen above), this builds
+For every model in its list (all eighteen above), this builds
 `build\codegen.exe`, generates `build\dynamics_<model>.c`, compiles
 `build\validate_<model>.exe` and `build\bench_<model>.exe` against it, and
 runs both — the build **fails** if any model's generated code disagrees with
@@ -613,10 +735,10 @@ chrono_check: models\threelink.mech: 200 trials, max scaled |qdd_chrono - qdd_de
 chrono_check: models\threelink.mech: 200 trials, max scaled |qdd_chrono - qdd_generated| = 9.261e-10
 chrono_check: PASS
 chrono_check: models\threelink.mech: simulation loop, generated dynamics vs Chrono, T=0.25 dt=2e-05
-    t= 0.031  gen b2( 2.8723  0.7004  0.0000)  chrono b2( 2.8723  0.7004 -0.0000)  max|dp|=1.07e-08
+    t= 0.031  gen b2( 2.8723  0.7004  0.0000)  chrono b2( 2.8723  0.7004 -0.0000)  max|gap|=1.07e-08 at b0
     ...
-    t= 0.250  gen b2( 2.9017  0.6093  0.0000)  chrono b2( 2.9017  0.6093 -0.0000)  max|dp|=8.56e-08
-chrono_check: max |position gap| = 8.561e-08 at dt, 4.286e-08 at dt/2  (ratio 2.00 -- shrinks with the step, so the gap is integrator truncation)
+    t= 0.250  gen b2( 2.9017  0.6093  0.0000)  chrono b2( 2.9017  0.6093 -0.0000)  max|gap|=8.56e-08 at b0
+chrono_check: max |gap| = 8.561e-08 at dt, 4.286e-08 at dt/2  (position in m or attitude in rad, whichever is worse)  (ratio 2.00 -- shrinks with the step, so the gap is integrator truncation)
 chrono_check: SIM PASS (tolerance 1.0e-02)
 ```
 

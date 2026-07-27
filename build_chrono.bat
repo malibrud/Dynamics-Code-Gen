@@ -25,7 +25,12 @@ if not exist "%EIGEN_DIR%\Eigen" (
     exit /b 1
 )
 
-set MODELS=threelink fourlink elbow stanford gantry pendulums bintree satellite fourbar rrrs slidercrank quartercar springpend halfcar hmmwv hmmwv_pitman
+rem m113 is deliberately NOT in the default list: Chrono rebuilds it as 153
+rem maximal-coordinate bodies, and the acceleration cross-check alone solves a
+rem dense KKT system of that size 200 times -- over an hour per run, which
+rem would make the no-argument sweep impractical. Check it explicitly with
+rem 'build_chrono.bat m113' when the model or the conventions change.
+set MODELS=threelink fourlink elbow stanford gantry pendulums bintree satellite fourbar rrrs slidercrank quartercar springpend halfcar hmmwv hmmwv_pitman track_demo
 rem Optional: pass model names as arguments to check just those.
 if not "%~1"=="" set MODELS=%*
 

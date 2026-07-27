@@ -91,7 +91,25 @@ int main( int argc, char **argv ) {
     int nb = mdl.nbod, nq = mdl.nq, nv = mdl.nv;
 
     const int NTRIALS = 1000;
-    const double TOL = 1e-9;
+
+    // Size-aware gate. Both implementations end in a Gaussian solve of H, so
+    // the floating-point noise floor is eps * cond(H) -- and for a long serial
+    // chain cond(H) grows like the fourth power of its length. That is not a
+    // correctness signal, it is arithmetic: on m113 (two 63-shoe bands) the
+    // dense CRBA and the dense ABA, which share no code and never touch the
+    // generator, disagree by 2.5e-9, and that gap tracks the chain length to
+    // the fourth across 15 / 31 / 63 shoes (3.0e-12 / 1.5e-10 / 2.5e-9).
+    // Holding a fixed 1e-9 there would be gating on conditioning, exactly the
+    // mistake near-manifold sampling exists to avoid at the loop level (see
+    // manifoldSeed in dense.h).
+    //
+    // So: 1e-9 flat up to nv = 64, then scaled by (nv/64)^4. Every model in
+    // build.bat's list except m113 has nv <= 44, so all of them are gated at
+    // exactly the same 1e-9 as before -- this loosens nothing that existed. A
+    // real bug still fails: it shows up as a large RELATIVE error (the metric
+    // below divides by |qdd|), not as a few ulps of solve noise.
+    double sizeFactor = nv > 64 ? ( nv / 64.0 ) * ( nv / 64.0 ) * ( nv / 64.0 ) * ( nv / 64.0 ) : 1.0;
+    const double TOL = 1e-9 * sizeFactor;
     double maxErr = 0;
     int worstTrial = -1;
     double maxObsErr = 0;
@@ -232,6 +250,9 @@ int main( int argc, char **argv ) {
                 path, NTRIALS, maxObsErr, worstObsTrial );
     printf( "validate: %s: %d trials, max scaled |qdd_aba - qdd_crba| (tree only) = %.3e (worst at trial %d)\n",
             path, NTRIALS, maxAbaErr, worstAbaTrial );
+    if ( sizeFactor > 1.0 )
+        printf( "validate: %s: nv = %d, so the gate is 1e-9 * (nv/64)^4 = %.1e (solve conditioning)\n",
+                path, nv, TOL );
     if ( maxErr < TOL && maxObsErr < TOL && maxAbaErr < TOL ) {
         printf( "validate: PASS\n" );
         return 0;

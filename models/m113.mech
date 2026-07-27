@@ -1,0 +1,568 @@
+# M113 armored personnel carrier: the first TRACKED vehicle here, and the
+# first model built around the 'track' block. A free-flying hull carries two
+# independent track assemblies; each is a drive sprocket, a translational
+# idler on a sliding tensioned carrier, five torsion-bar road-wheel stations,
+# and a closed band of 63 shoes riding the lot. Hardpoints, masses, and
+# inertias are the M113 data shipped with Project Chrono
+# (data/vehicle/M113/), single-pin track variant:
+#   vehicle/M113_Vehicle_SinglePin.json     track assemblies at y = +-1.0795
+#   chassis/M113_Chassis.json               7819.24 kg hull
+#   track_assembly/M113_TrackAssemblySinglePin_Left.json
+#                                           sprocket/idler/suspension stations,
+#                                           63 shoes
+#   sprocket/M113_SprocketSinglePin_Left.json        10 teeth, assy radius 0.245
+#   idler/M113_DoubleIdler_Left.json                 carrier + tensioner
+#   idler_wheel/M113_DoubleIdlerWheel_Left.json      radius 0.255
+#   suspension/M113_TranslationalDamperSuspension_Left.json   arm + torsion bar
+#   road_wheel/M113_DoubleRoadWheel_Left.json        radius 0.305
+#   track_shoe/M113_TrackShoeSinglePin.json          18.02 kg, pitch 0.154
+#
+# Axes are ISO vehicle: x forward, y outboard-left, z up. The BASE FRAME is
+# Chrono's chassis reference frame, which for the M113 sits on the SPROCKET
+# AXLE (the sprocket subsystem's location in the track assembly is exactly
+# [0,0,0]): x = 0 at the drive sprocket, z = 0 at its axle height, y = 0 on
+# the vehicle centerline. So the vehicle runs toward +x with the sprocket
+# FORWARD and the idler at x = -3.95, which is how the real M113 is driven.
+# A Chrono track-assembly hardpoint maps to this frame by adding the
+# assembly's lateral offset (0, +-1.0795, 0) and then the subsystem's own
+# location; left-side JSON values are used as given and the right side is the
+# mirror image (negate y), exactly how Chrono mirrors one side to build the
+# other. Both sides' revolute joints keep the +y axis (rather than mirroring
+# the axis too), so equal q means the same physical motion left and right.
+#
+# Topology (27 hand-written bodies + 2 x 63 generated shoes = 153, nv 168,
+# nc 4, mobility 164):
+#   0  hull      floating   the whole 7819.24 kg sprung mass, free-flying
+#                           (RBDA sec 9.4) with quaternion attitude, so no
+#                           gimbal lock in any pitch/roll attitude. Everything
+#                           else hangs off it. Unlike the wheeled models there
+#                           are no shaker posts: a tracked vehicle's only path
+#                           to the ground is through the band, so the hull is
+#                           held up by the track contact forces (fext on the
+#                           shoes) rather than by tire rods.
+#
+#   Left assembly bodies 1..13, right 14..26 (identical, y negated):
+#     sprocket   revolute y  the drive member: 10 teeth, assembly radius 0.245.
+#                            This is the DRIVE INPUT -- torque it through its
+#                            own tau slot (Chrono drives it through
+#                            M113_SimpleTrackDriveline; there is no driveline
+#                            body here, the sprocket joint IS the input).
+#     carrier    prismatic x idler carrier, sliding fore/aft on the hull
+#                            (Chrono's TranslationalIdler: pitch angle 0, so
+#                            the slide axis is exactly the hull x axis). The
+#                            tensioner TSDA below pushes it rearward; its
+#                            travel is what takes up track slack.
+#     idler      revolute y  idler wheel, radius 0.255, on the carrier.
+#     arm 1..5   revolute y  torsion-bar trailing arm, pivoting on the hull.
+#                            The road wheel trails rearward and below the
+#                            pivot (pivot->wheel = (-0.288, 0, -0.134), a
+#                            0.318 m arm), so +q is jounce: it swings the
+#                            wheel up and back. Carries the torsion bar as an
+#                            rsda on this joint (see below).
+#     wheel 1..5 revolute y  road wheel, radius 0.305, on its arm. Frame at
+#                            the wheel center, which is where the arm's own
+#                            revolute axis line passes -- Chrono puts the
+#                            arm/wheel pin 0.12 inboard of the wheel center,
+#                            but a revolute is indifferent to where along its
+#                            axis the frame sits, so this is exact.
+#
+# Track bands (one 'track' block per side, each expanding into 63 shoe bodies
+# -- a floating anchor shoe plus 62 revolute-y pins -- and ONE point-on-line
+# closure loop, the planar-loop rule): the band lies in the assembly's x-z
+# plane at y = +-1.0795 and rides the seven rollers listed in the block. The
+# shoe chain is parented to the BASE, not the hull, exactly like the
+# quartercar spindle: it is held in place by contact, not by a mount.
+#
+#   ONE FIDELITY NOTE. The loader's belt is the taut band around the TWO 'end'
+#   pulleys only (sprocket + idler), so at the design pose its lower run is
+#   the straight sprocket-to-idler tangent and the five road wheels, whose
+#   bottoms reach z = -0.52, poke through it. The real lower run is pushed
+#   down onto the road wheels. Consequences: the design-pose shoe positions
+#   along the bottom are high by up to ~0.15 m, and the band perimeter comes
+#   out 9.4745 m rather than 63 x 0.154 = 9.702 m, so the generated link
+#   length is 0.15039 rather than the real 0.154 pitch (2.3% short -- almost
+#   exactly the road-wheel wrap the two-pulley idealization leaves out). The
+#   band is dynamically correct either way (63 shoes, correct mass/inertia,
+#   a closed chain); it is the initial geometry that is idealized.
+#
+# Force elements (18: 10 torsion bars, 6 shocks, 2 tensioners; 16 POIs):
+#   torsion_[LR][1-5]  rsda on the arm joint. Chrono's torsional spring is
+#                      k = 2.5e4 Nm/rad, c = 5e2, free angle 0, preload
+#                      -1e4 Nm. This format's rsda has no separate preload
+#                      term, but a constant torque IS a shifted rest angle:
+#                      tau = -k(q - q0) has tau(0) = k*q0, so q0 = preload/k
+#                      = -0.4 rad reproduces it exactly. The sign checks out
+#                      physically -- negative tau at q = 0 pushes the wheel
+#                      down and back, which is the torsion bar holding the
+#                      hull up.
+#   shock_[LR][1,2,5]  tsda, the translational damper. Only stations 1, 2 and
+#                      5 have one ("Has Shock" in the assembly JSON); k = 0,
+#                      c = 1e2 N/(m/s), design length 0.6317 (used as l0, which
+#                      a pure damper never reads). Both anchors ride the body
+#                      that physically carries them -- hull above, arm below --
+#                      so with the hull free the element measures only arm
+#                      rotation, never a spurious length change from hull
+#                      heave (the halfcar lesson).
+#   tens_[LR]          tsda, the idler tensioner: k = 1e6 N/m, c = 1.4e4,
+#                      free length 0.75, preload 2e4 N. Preload folds into the
+#                      free length the same way (f = k(l - l0) is tension
+#                      here, so l0 = 0.75 + 2e4/1e6 = 0.77). At the design
+#                      pose the anchors are 0.5 apart, well inside l0, so the
+#                      element pushes -- driving the carrier rearward, which
+#                      is exactly how it tensions the track.
+#   All passive (no 'input'). Chrono's nonlinear shock/tensioner maps are not
+#   used; these are the linear JSON coefficients.
+#
+# WHAT HOLDS THIS UP. Nothing, yet. A tracked vehicle's only path to the
+# ground is through the band, and the track contact engine is not implemented
+# (the 'ground'/kn/kt/mu data below is parsed and carried, not used), so at
+# the design pose the hull is in free fall, the road wheels hang on their
+# preloaded torsion bars, the band hangs free, and each tensioner -- 0.27 m
+# inside its free length with no track tension to react it -- shoves its
+# carrier rearward at ~2.7e5 N. That is the honest state of a vehicle model
+# whose contact forces have to be supplied from outside: apply them through
+# fext on the shoes and road wheels (both carry 'fext 1'), exactly as the
+# wheeled models take tire loads through their spindles.
+#
+# q layout (nq 171, nv 168): hull q[0..6] (quat + pos) v[0..5]; then the 26
+# assembly joints one slot each; then each band's anchor shoe (quat + pos 7 /
+# spatial 6) followed by its 62 pins. Design pose is q = 0 with quaternions at
+# identity for the hand-written bodies; the SHOES are the exception -- a
+# closed band cannot sit at q = 0, so the loader writes their curved design
+# pose into m->q0 and consumers seed q from there.
+
+gravity 0 0 -9.81
+stab 0.05
+
+body                     # 0: hull, full M113 sprung mass, free-flying
+parent -1
+joint floating
+tree 0 0 0
+mass 7819.24
+cg -2.006 0 0.406
+inertia 13983.08 27287.61 28805.57 0 0 0
+fext 1
+
+# ---------------------------------------------------------------------------
+# Left track assembly (y = +1.0795)
+# ---------------------------------------------------------------------------
+
+body                     # 1: sprocket L (drive input)
+parent 0
+joint revolute y
+tree 0 1.0795 0
+mass 27.68
+cg 0 0 0
+inertia 0.646 0.883 0.646 0 0 0
+
+body                     # 2: idler carrier L, slides fore/aft on the hull
+parent 0
+joint prismatic x
+tree -3.95 1.0795 -0.12  # frame at the idler axle (a prismatic joint does not
+mass 10.0                # care where along its axis the frame sits)
+cg 0 -0.1 0
+inertia 0.04 0.04 0.04 0 0 0
+
+body                     # 3: idler wheel L, radius 0.255
+parent 2
+joint revolute y
+tree 0 0 0
+mass 25.76
+cg 0 0 0
+inertia 0.618 1.12 0.618 0 0 0
+
+body                     # 4: arm L1 (torsion-bar trailing arm)
+parent 0
+joint revolute y
+tree -0.367 0.9595 -0.081
+mass 75.26
+cg -0.144 0 -0.067
+inertia 0.37 0.77 0.77 0 0 0
+
+body                     # 5: road wheel L1, radius 0.305
+parent 4
+joint revolute y
+tree -0.288 0.12 -0.134
+mass 35.56
+cg 0 0 0
+inertia 1.14 2.16 1.14 0 0 0
+fext 1
+
+body                     # 6: arm L2
+parent 0
+joint revolute y
+tree -1.034 0.9595 -0.081
+mass 75.26
+cg -0.144 0 -0.067
+inertia 0.37 0.77 0.77 0 0 0
+
+body                     # 7: road wheel L2
+parent 6
+joint revolute y
+tree -0.288 0.12 -0.134
+mass 35.56
+cg 0 0 0
+inertia 1.14 2.16 1.14 0 0 0
+fext 1
+
+body                     # 8: arm L3
+parent 0
+joint revolute y
+tree -1.701 0.9595 -0.081
+mass 75.26
+cg -0.144 0 -0.067
+inertia 0.37 0.77 0.77 0 0 0
+
+body                     # 9: road wheel L3
+parent 8
+joint revolute y
+tree -0.288 0.12 -0.134
+mass 35.56
+cg 0 0 0
+inertia 1.14 2.16 1.14 0 0 0
+fext 1
+
+body                     # 10: arm L4
+parent 0
+joint revolute y
+tree -2.368 0.9595 -0.081
+mass 75.26
+cg -0.144 0 -0.067
+inertia 0.37 0.77 0.77 0 0 0
+
+body                     # 11: road wheel L4
+parent 10
+joint revolute y
+tree -0.288 0.12 -0.134
+mass 35.56
+cg 0 0 0
+inertia 1.14 2.16 1.14 0 0 0
+fext 1
+
+body                     # 12: arm L5
+parent 0
+joint revolute y
+tree -3.034 0.9595 -0.081
+mass 75.26
+cg -0.144 0 -0.067
+inertia 0.37 0.77 0.77 0 0 0
+
+body                     # 13: road wheel L5
+parent 12
+joint revolute y
+tree -0.288 0.12 -0.134
+mass 35.56
+cg 0 0 0
+inertia 1.14 2.16 1.14 0 0 0
+fext 1
+
+# ---------------------------------------------------------------------------
+# Right track assembly (y = -1.0795), the mirror image
+# ---------------------------------------------------------------------------
+
+body                     # 14: sprocket R (drive input)
+parent 0
+joint revolute y
+tree 0 -1.0795 0
+mass 27.68
+cg 0 0 0
+inertia 0.646 0.883 0.646 0 0 0
+
+body                     # 15: idler carrier R
+parent 0
+joint prismatic x
+tree -3.95 -1.0795 -0.12
+mass 10.0
+cg 0 0.1 0
+inertia 0.04 0.04 0.04 0 0 0
+
+body                     # 16: idler wheel R
+parent 15
+joint revolute y
+tree 0 0 0
+mass 25.76
+cg 0 0 0
+inertia 0.618 1.12 0.618 0 0 0
+
+body                     # 17: arm R1
+parent 0
+joint revolute y
+tree -0.367 -0.9595 -0.081
+mass 75.26
+cg -0.144 0 -0.067
+inertia 0.37 0.77 0.77 0 0 0
+
+body                     # 18: road wheel R1
+parent 17
+joint revolute y
+tree -0.288 -0.12 -0.134
+mass 35.56
+cg 0 0 0
+inertia 1.14 2.16 1.14 0 0 0
+fext 1
+
+body                     # 19: arm R2
+parent 0
+joint revolute y
+tree -1.034 -0.9595 -0.081
+mass 75.26
+cg -0.144 0 -0.067
+inertia 0.37 0.77 0.77 0 0 0
+
+body                     # 20: road wheel R2
+parent 19
+joint revolute y
+tree -0.288 -0.12 -0.134
+mass 35.56
+cg 0 0 0
+inertia 1.14 2.16 1.14 0 0 0
+fext 1
+
+body                     # 21: arm R3
+parent 0
+joint revolute y
+tree -1.701 -0.9595 -0.081
+mass 75.26
+cg -0.144 0 -0.067
+inertia 0.37 0.77 0.77 0 0 0
+
+body                     # 22: road wheel R3
+parent 21
+joint revolute y
+tree -0.288 -0.12 -0.134
+mass 35.56
+cg 0 0 0
+inertia 1.14 2.16 1.14 0 0 0
+fext 1
+
+body                     # 23: arm R4
+parent 0
+joint revolute y
+tree -2.368 -0.9595 -0.081
+mass 75.26
+cg -0.144 0 -0.067
+inertia 0.37 0.77 0.77 0 0 0
+
+body                     # 24: road wheel R4
+parent 23
+joint revolute y
+tree -0.288 -0.12 -0.134
+mass 35.56
+cg 0 0 0
+inertia 1.14 2.16 1.14 0 0 0
+fext 1
+
+body                     # 25: arm R5
+parent 0
+joint revolute y
+tree -3.034 -0.9595 -0.081
+mass 75.26
+cg -0.144 0 -0.067
+inertia 0.37 0.77 0.77 0 0 0
+
+body                     # 26: road wheel R5
+parent 25
+joint revolute y
+tree -0.288 -0.12 -0.134
+mass 35.56
+cg 0 0 0
+inertia 1.14 2.16 1.14 0 0 0
+fext 1
+
+# ---------------------------------------------------------------------------
+# Torsion bars: one per road-wheel station, on the arm's own joint.
+# q0 = preload/k = -1e4 / 2.5e4 = -0.4 rad reproduces Chrono's preload.
+# ---------------------------------------------------------------------------
+
+rsda torsion_L1
+joint 4
+k 2.5e4
+c 5e2
+q0 -0.4
+
+rsda torsion_L2
+joint 6
+k 2.5e4
+c 5e2
+q0 -0.4
+
+rsda torsion_L3
+joint 8
+k 2.5e4
+c 5e2
+q0 -0.4
+
+rsda torsion_L4
+joint 10
+k 2.5e4
+c 5e2
+q0 -0.4
+
+rsda torsion_L5
+joint 12
+k 2.5e4
+c 5e2
+q0 -0.4
+
+rsda torsion_R1
+joint 17
+k 2.5e4
+c 5e2
+q0 -0.4
+
+rsda torsion_R2
+joint 19
+k 2.5e4
+c 5e2
+q0 -0.4
+
+rsda torsion_R3
+joint 21
+k 2.5e4
+c 5e2
+q0 -0.4
+
+rsda torsion_R4
+joint 23
+k 2.5e4
+c 5e2
+q0 -0.4
+
+rsda torsion_R5
+joint 25
+k 2.5e4
+c 5e2
+q0 -0.4
+
+# ---------------------------------------------------------------------------
+# Shocks: stations 1, 2 and 5 only. Hull anchor above, arm anchor below;
+# design length 0.6317 (a pure damper never reads l0).
+# ---------------------------------------------------------------------------
+
+poi shock_L1_hull  0 -0.955 0.9595 0.085
+poi shock_L1_arm   4 -0.104 0 -0.240
+tsda shock_L1
+from shock_L1_hull
+to shock_L1_arm
+k 0
+c 1e2
+l0 0.63174
+
+poi shock_L2_hull  0 -1.622 0.9595 0.085
+poi shock_L2_arm   6 -0.104 0 -0.240
+tsda shock_L2
+from shock_L2_hull
+to shock_L2_arm
+k 0
+c 1e2
+l0 0.63174
+
+poi shock_L5_hull  0 -3.622 0.9595 0.085
+poi shock_L5_arm  12 -0.104 0 -0.240
+tsda shock_L5
+from shock_L5_hull
+to shock_L5_arm
+k 0
+c 1e2
+l0 0.63174
+
+poi shock_R1_hull  0 -0.955 -0.9595 0.085
+poi shock_R1_arm  17 -0.104 0 -0.240
+tsda shock_R1
+from shock_R1_hull
+to shock_R1_arm
+k 0
+c 1e2
+l0 0.63174
+
+poi shock_R2_hull  0 -1.622 -0.9595 0.085
+poi shock_R2_arm  19 -0.104 0 -0.240
+tsda shock_R2
+from shock_R2_hull
+to shock_R2_arm
+k 0
+c 1e2
+l0 0.63174
+
+poi shock_R5_hull  0 -3.622 -0.9595 0.085
+poi shock_R5_arm  25 -0.104 0 -0.240
+tsda shock_R5
+from shock_R5_hull
+to shock_R5_arm
+k 0
+c 1e2
+l0 0.63174
+
+# ---------------------------------------------------------------------------
+# Idler tensioners: hull anchor forward of the carrier anchor, so the
+# compressed spring drives the carrier rearward and tensions the band.
+# l0 = free length + preload/k = 0.75 + 2e4/1e6 = 0.77.
+# ---------------------------------------------------------------------------
+
+poi tens_L_hull     0 -3.45 0.8795 -0.12
+poi tens_L_carrier  2 0 -0.2 0
+tsda tens_L
+from tens_L_hull
+to tens_L_carrier
+k 1e6
+c 1.4e4
+l0 0.77
+
+poi tens_R_hull     0 -3.45 -0.8795 -0.12
+poi tens_R_carrier 15 0 0.2 0
+tsda tens_R
+from tens_R_hull
+to tens_R_carrier
+k 1e6
+c 1.4e4
+l0 0.77
+
+# ---------------------------------------------------------------------------
+# The two track bands. 63 single-pin shoes each, riding sprocket + idler (the
+# two path-defining 'end' pulleys) and the five road wheels. Ground plane at
+# z = -0.55: the design-pose band centerline on the bottom run sits at the
+# road-wheel bottom, z = -0.215 - 0.305 = -0.52, and the shoe pad reaches
+# 0.03 below its own frame.
+# ---------------------------------------------------------------------------
+
+track band_L
+root 0
+plane xz
+shoes 63
+pitch 0.154
+mass 18.02
+cg 0.0752 0 0          # link midpoint: half the generated link length
+inertia 0.22 0.04 0.25 0 0 0
+fext 1
+roller 1 0.245 end drive teeth 10   # sprocket (assembly radius, not addendum)
+roller 3 0.255 end                  # idler wheel
+roller 5 0.305                      # road wheel 1
+roller 7 0.305                      # road wheel 2
+roller 9 0.305                      # road wheel 3
+roller 11 0.305                     # road wheel 4
+roller 13 0.305                     # road wheel 5
+ground z -0.55
+kn 2e5
+kt 2e5
+mu 0.8
+
+track band_R
+root 0
+plane xz
+shoes 63
+pitch 0.154
+mass 18.02
+cg 0.0752 0 0
+inertia 0.22 0.04 0.25 0 0 0
+fext 1
+roller 14 0.245 end drive teeth 10
+roller 16 0.255 end
+roller 18 0.305
+roller 20 0.305
+roller 22 0.305
+roller 24 0.305
+roller 26 0.305
+ground z -0.55
+kn 2e5
+kt 2e5
+mu 0.8

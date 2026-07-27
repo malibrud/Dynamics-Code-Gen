@@ -492,6 +492,111 @@ static void setChronoState( const Model *mdl, ChronoModel &cm,
     }
 }
 
+// Reads body i's own tree-joint coordinate and rate back OUT of the Chrono
+// system, i.e. the inverse of what setChronoState() wrote in. Only revolute
+// and prismatic are handled -- the only joints an rsda may act on.
+//
+// This is exact rather than approximate because a .mech tree joint carries no
+// fixed rotation (`tree` is translation-only): the child's frame differs from
+// the parent's by a pure rotation of q about `axis` (revolute) or a pure
+// translation of q along it (prismatic), so q can be recovered in closed form.
+//
+// The revolute angle comes back wrapped to (-pi, pi], which is the same branch
+// ambiguity that rules ChLinkRSDA out of the staged-state checks (see
+// buildChronoModel). Here it is harmless and is resolved by *prevQ: a stepped
+// simulation moves the joint by a tiny amount per step, so the true angle is
+// the one nearest the previous step's. Pass prevQ seeded from the initial
+// state; it is updated in place.
+static void chronoJointState( const Model *mdl, const ChronoModel &cm, int i,
+                              double *prevQ, double *qOut, double *qdOut ) {
+    const ModelBody *b = &mdl->body[ i ];
+    const ChronoBody &cb = cm.bod[ i ];
+    int p = b->parent;
+
+    ChQuaternion<> Qc = cb.body->GetRot();
+    ChVector3d wc = cb.body->GetAngVelParent();
+    ChQuaternion<> Qp = p == -1 ? QUNIT : cm.bod[ p ].body->GetRot();
+    ChVector3d wp = p == -1 ? ChVector3d( 0, 0, 0 ) : cm.bod[ p ].body->GetAngVelParent();
+
+    ChVector3d a = axis3( b->axis );
+    ChVector3d aW = Qp.Rotate( a );              // the joint axis in world coords
+
+    if ( b->jtype == JOINT_REVOLUTE ) {
+        // Qrel maps child coords into parent coords, so it IS the physical
+        // rotation of +q about a. Its half-angle form gives a signed angle.
+        ChQuaternion<> Qrel = Qp.GetConjugate() * Qc;
+        double raw = 2.0 * atan2( Vdot( Qrel.GetVector(), a ), Qrel.e0() );
+        double turns = floor( ( *prevQ - raw ) / ( 2 * CH_PI ) + 0.5 );
+        *qOut  = raw + turns * 2 * CH_PI;         // unwrapped onto prevQ's branch
+        *qdOut = Vdot( wc - wp, aW );
+    } else {                                      // JOINT_PRISMATIC
+        // Mech frame origins (the ChBody frame sits at the CG, at local -cg).
+        ChVector3d rc = cb.body->TransformPointLocalToParent( -cb.cg );
+        ChVector3d vc = cb.body->PointSpeedLocalToParent( -cb.cg );
+        ChVector3d rp( 0, 0, 0 ), vp( 0, 0, 0 );
+        if ( p != -1 ) {
+            rp = cm.bod[ p ].body->TransformPointLocalToParent( -cm.bod[ p ].cg );
+            vp = cm.bod[ p ].body->PointSpeedLocalToParent( -cm.bod[ p ].cg );
+        }
+        // q is the slide beyond the fixed tree offset, measured along the axis
+        // as the PARENT carries it; the -wp x d term removes the parent's own
+        // rotation so what is left is the joint's own rate.
+        ChVector3d d = rc - rp;
+        *qOut  = Vdot( d, aW ) - Vdot( v3( b->tree ), a );
+        *qdOut = Vdot( vc - vp - Vcross( wp, d ), aW );
+    }
+    *prevQ = *qOut;
+}
+
+// Recomputes every RSDA's torque from the CHRONO side's own joint state and
+// reloads the accumulators with it. The simulation loop must call this before
+// each step: an rsda has no Chrono link object (see buildChronoModel), so
+// unlike a TSDA -- which is a ChLinkTSDA that re-evaluates its own force law
+// every step -- its force is a plain accumulator entry that would otherwise
+// stay frozen at whatever setChronoState() last wrote. Leaving it frozen
+// silently simulates a CONSTANT torque on the Chrono side while the generated
+// side applies the real state-dependent law: the two sides then integrate
+// different systems, which shows up as a trajectory gap that does not shrink
+// with the step. (Found on m113, whose torsion bars carry a large preload;
+// springpend hid it for two independent reasons -- its q0 is 0, so the frozen
+// torque happens to be the correct one, and its pendulum rotates about its own
+// frame origin, which a position-only comparison cannot see either way.)
+//
+// Emptying every accumulator is safe here precisely because runSim holds tau
+// and fext at zero for the whole run, so RSDA torques are the only thing in
+// them. Gravity is a system-level acceleration and TSDA forces come from the
+// link objects, so neither is disturbed.
+static void refreshChronoRsda( const Model *mdl, ChronoModel &cm, double *prevQ ) {
+    for ( int i = 0 ; i < mdl->nbod ; i++ )
+        cm.bod[ i ].body->EmptyAccumulator( cm.bod[ i ].accum );
+
+    for ( int e = 0 ; e < mdl->nelem ; e++ ) {
+        const ModelElem *el = &mdl->elem[ e ];
+        if ( el->type != ELEM_RSDA ) continue;
+        int i = el->joint;
+        const ModelBody *b = &mdl->body[ i ];
+
+        double qq, qqd;
+        chronoJointState( mdl, cm, i, &prevQ[ e ], &qq, &qqd );
+        double tau_e = -el->k * ( qq - el->ref ) - el->c * qqd; // act is 0 in runSim
+
+        ChronoBody &cb = cm.bod[ i ];
+        if ( b->jtype == JOINT_REVOLUTE ) {
+            ChVector3d T = axis3( b->axis ) * tau_e;
+            cb.body->AccumulateTorque( cb.accum, T, true );
+            if ( b->parent != -1 )
+                cm.bod[ b->parent ].body->AccumulateTorque( cm.bod[ b->parent ].accum, -T, true );
+        } else { // JOINT_PRISMATIC
+            ChQuaternion<> Qp = b->parent == -1 ? QUNIT : cm.bod[ b->parent ].body->GetRot();
+            ChVector3d F = Qp.Rotate( axis3( b->axis ) ) * tau_e;
+            ChVector3d at = cb.body->TransformPointLocalToParent( -cb.cg );
+            cb.body->AccumulateForce( cb.accum, F, at, false );
+            if ( b->parent != -1 )
+                cm.bod[ b->parent ].body->AccumulateForce( cm.bod[ b->parent ].accum, -F, at, false );
+        }
+    }
+}
+
 // Solves for the exact accelerations of the Chrono system at its current
 // state and scatters them into the bodies.
 //
@@ -826,28 +931,55 @@ static double runSim( const Model *mdl, double T, double dt, int printRows ) {
     int rowEvery = printRows > 0 ? nsteps / printRows : 0;
     double maxDiv = 0;
 
+    // Per-RSDA joint coordinate on the Chrono side, seeded from the initial
+    // state and carried forward so refreshChronoRsda() can unwrap against it.
+    // TSDAs need none of this: a ChLinkTSDA re-evaluates its own force law
+    // every step, so only RSDAs have to be refreshed by hand.
+    double prevQ[ MODEL_MAX_ELEM ] = { 0 };
+    int hasRsda = 0;
+    for ( int e = 0 ; e < mdl->nelem ; e++ )
+        if ( mdl->elem[e].type == ELEM_RSDA ) {
+            prevQ[e] = q[ mdl->qidx[ mdl->elem[e].joint ] ];
+            hasRsda = 1;
+        }
+
     for ( int n = 1 ; n <= nsteps ; n++ ) {
         stepGenerated( mdl, q, qd, dt );
+        if ( hasRsda ) refreshChronoRsda( mdl, cm, prevQ );
         cm.sys.DoStepDynamics( dt );
 
         fk( mdl, q, qd, kin );
         double stepDiv = 0;
+        int stepDivBody = 0;
         for ( int i = 0 ; i < mdl->nbod ; i++ ) {
             ChVector3d pCh = cm.bod[i].body->TransformPointLocalToParent( -cm.bod[i].cg );
             double d = ( kin[i].r - pCh ).Length();
-            if ( d > stepDiv ) stepDiv = d;
+
+            // Attitude gap too, as the rotation angle carrying Chrono's frame
+            // onto ours. Comparing radians against metres on one scale is
+            // crude, but both are O(1) here and the metric only has to catch a
+            // divergence -- and without it a body that ROTATES in place is
+            // invisible to this check, which is half of why the frozen-RSDA
+            // bug survived so long in springpend (see refreshChronoRsda).
+            ChQuaternion<> dQ = cm.bod[i].body->GetRot().GetConjugate() * kin[i].R.GetQuaternion();
+            double ang = 2.0 * atan2( dQ.GetVector().Length(), fabs( dQ.e0() ) );
+            if ( ang > d ) d = ang;
+
+            if ( d > stepDiv ) { stepDiv = d; stepDivBody = i; }
         }
         if ( stepDiv > maxDiv ) maxDiv = stepDiv;
 
         if ( rowEvery && n % rowEvery == 0 ) {
             // Track the last body: for a serial chain body 0's origin sits on
             // its own joint and never translates, so the tip is what shows
-            // the motion. Also print the worst gap across all bodies.
+            // the motion. Also print the worst gap across all bodies, and WHICH
+            // body it is -- on a 153-body model "some body is off by 0.7 m" is
+            // not a diagnosis, and the culprit's index is the whole lead.
             int tip = mdl->nbod - 1;
             ChVector3d pCh = cm.bod[tip].body->TransformPointLocalToParent( -cm.bod[tip].cg );
-            printf( "    t=%6.3f  gen b%d(% .4f % .4f % .4f)  chrono b%d(% .4f % .4f % .4f)  max|dp|=%.2e\n",
+            printf( "    t=%6.3f  gen b%d(% .4f % .4f % .4f)  chrono b%d(% .4f % .4f % .4f)  max|gap|=%.2e at b%d\n",
                     n * dt, tip, kin[tip].r.x(), kin[tip].r.y(), kin[tip].r.z(),
-                    tip, pCh.x(), pCh.y(), pCh.z(), stepDiv );
+                    tip, pCh.x(), pCh.y(), pCh.z(), stepDiv, stepDivBody );
         }
     }
     return maxDiv;
@@ -870,7 +1002,8 @@ static int simCompare( const Model *mdl, const char *path, double T, double dt )
     const double ROUNDOFF = 1e-11;
     double ratio = divFine > 0 ? divCoarse / divFine : 0;
 
-    printf( "chrono_check: max |position gap| = %.3e at dt, %.3e at dt/2", divCoarse, divFine );
+    printf( "chrono_check: max |gap| = %.3e at dt, %.3e at dt/2  (position in m or attitude in rad,"
+            " whichever is worse)", divCoarse, divFine );
     if ( divCoarse <= ROUNDOFF )
         printf( "  (already at roundoff)\n" );
     else if ( ratio >= 1.5 )
