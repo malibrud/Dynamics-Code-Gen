@@ -32,7 +32,7 @@ directly, rather than shelling out to a C compiler.
   - `stanford` — Stanford arm, the classic serial chain with a prismatic
     boom (R-R-P plus 3R wrist)
   - `gantry` — Cartesian PPP robot; no trigonometry survives generation
-    and H is constant (~19 ns/call, ~36x over dense)
+    and H is constant (~10 ns/call, ~69x over dense)
   - `pendulums` — four independent spatial pendulums off the base;
     maximally parallel, H is diagonal by branch-induced sparsity
   - `bintree` — Featherstone's balanced binary tree (7 bodies); block
@@ -151,7 +151,10 @@ directly, rather than shelling out to a C compiler.
   emits each force element's generalized force (folded into the solve as
   `+ Q_r`); `gen_observe.h` emits that second function, `fwd_dyn_observe`,
   plus the `fwd_dyn_find` name-lookup tables (see [Force elements and points
-  of interest](#force-elements-and-points-of-interest)).
+  of interest](#force-elements-and-points-of-interest)). `gen_solve_qdd.h`
+  closes the function with the `H qdd = tau - C` solve, whose sparse
+  factorization `gen_prelude.h` emits at file scope (see [The H
+  solve](#the-h-solve)).
 - `src/validate` — a dense-matrix validation reference. Implements the same
   forward dynamics (RNEA bias force + CRBA mass matrix + solve) with full
   6x6 spatial matrices built straight from the RBDA equations — explicit
@@ -172,8 +175,10 @@ directly, rather than shelling out to a C compiler.
   CRBA path on a tree-only, element-free copy of the model.
 
   **The gate is size-aware above nv = 64**: `1e-9 * (nv/64)^4`. Both
-  implementations end in a Gaussian solve of H, so the noise floor is
-  `eps * cond(H)`, and for a long serial chain cond(H) grows like the fourth
+  implementations end in a factorization of H — Gaussian elimination on the
+  dense side, `L^T D L` on the generated one (see [The H solve](#the-h-solve))
+  — so the noise floor is `eps * cond(H)` either way, and for a long serial
+  chain cond(H) grows like the fourth
   power of its length — arithmetic, not correctness. On `m113` the dense CRBA
   and the dense ABA, which share no code and never touch the generator,
   disagree by 2.5e-9, and that gap tracks the chain length to the fourth
@@ -265,7 +270,8 @@ directly, rather than shelling out to a C compiler.
   dense reference (both built with `/O2`), cycling through a pool of random
   states with a checksum to defeat dead-code elimination. Run by `build.bat`
   after validation; on the original dev machine the 3-link chain runs at
-  ~50 ns/call generated vs ~800 ns/call dense (~16x).
+  ~42 ns/call generated vs ~880 ns/call dense (~21x). The full table across
+  every model is under [The H solve](#the-h-solve).
 - `src/numeric` — an earlier, currently non-building attempt at a runtime
   (non-generated) numeric implementation of the same algorithms. Kept for
   reference; `system.h` was removed mid-refactor and never replaced, so this
@@ -284,6 +290,78 @@ directly, rather than shelling out to a C compiler.
   reference implementation this project is checked against. Not checked into
   git (see `.gitignore`).
 
+## The H solve
+
+Forward dynamics ends in `H qdd = tau - C`, and for a while that solve was the
+one part of the generated code that ignored everything the generator knew. The
+CRBA emitted `H`'s branch-induced structural zeros symbolically and then handed
+the matrix to a dense Gaussian elimination with partial pivoting — `O(n^3)`, and
+blind to the sparsity. On `m113` that was a 168x168 elimination, ~1.6M
+multiply-adds, and it had grown to dominate: the model ran at 433 us/call, only
+4.4x over the dense reference, while `threelink` was managing 17x. Essentially
+all of the 74k generated lines were optimizing the cheap part.
+
+The solve is now Featherstone's sparse **`L^T D L` factorization** (RBDA sec 6.5,
+Tables 6.3–6.5), emitted in `gen_prelude.h` as `ltdlFactor` / `ltdlSolveM` and
+called from `gen_solve_qdd.h`. Three things make it fit this project unusually
+well:
+
+- **`H` is symmetric positive definite**, so the partial pivoting was pure
+  waste — no pivot search, no row swaps, half the flops.
+- **The factorization has zero fill-in.** Given the *expanded parent array*
+  `lam` (RBDA Table 6.4 — the parent relation over velocity coordinates rather
+  than bodies: within a floating body's 6-wide block the coordinates chain, and
+  the block's first coordinate points at the parent body's last), `L` carries
+  exactly `H`'s sparsity pattern. So the branch-induced zeros are not merely
+  skipped, they are provably never touched, and the cost falls from `n^3/3` to
+  `sum_i depth(i)^2 / 2`. `lam` is emitted as a `static const int Hlam[]` table
+  beside `H`; the generator asserts it reproduces `crbaHasEntry()`'s pattern on
+  every coordinate pair, so the two descriptions of the same sparsity cannot
+  drift apart.
+- **One factorization still serves every right-hand side**, which is what the
+  method-2 loop solve needs for its `1 + nc` columns (see [Closed kinematic
+  loops](#closed-kinematic-loops)). Only the `nc x nc` constraint system
+  `A = K H^-1 K^T` still goes through a dense solver: it has no tree structure
+  to exploit, and `nc <= 33` across every model here.
+
+Table 6.3 gives both `L^T L` and `L^T D L`, and the choice between them was
+settled by measurement, not preference. `L^T L` needs a square root per
+coordinate, and that was enough to make it measurably **slower** than the dense
+elimination it replaced on every model with no branch sparsity to win back —
+`elbow` 163 -> 172 ns, `rrrs` 194 -> 216 ns. `L^T D L`'s `L` is unit
+lower-triangular, so no square roots appear at all, and the regressions became
+speedups.
+
+Generated `ns/call`, before and after, across the whole model set (same machine,
+same `/O2`, `x` = speedup over the dense reference):
+
+| model | nv | before | after | | model | nv | before | after |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| threelink | 3 | 53.1 | **41.8** (21x) | | slidercrank | 2 | 34.5 | **23.1** (49x) |
+| fourlink | 4 | 80.7 | **66.0** (18x) | | springpend | 2 | 25.6 | **15.5** (33x) |
+| elbow | 6 | 163.5 | **139.3** (12x) | | fourbar | 3 | 80.6 | **64.1** (29x) |
+| stanford | 6 | 158.4 | **137.6** (12x) | | rrrs | 4 | 194.4 | **180.6** (13x) |
+| gantry | 3 | 19.2 | **10.1** (69x) | | quartercar | 10 | 759 | **539** (17x) |
+| pendulums | 4 | 48.6 | **20.1** (36x) | | halfcar | 20 | 3747 | **1719** (19x) |
+| bintree | 7 | 197.7 | **129.1** (15x) | | hmmwv | 43 | 26795 | **9865** (27x) |
+| satellite | 9 | 216.8 | **166.0** (7.7x) | | hmmwv_pitman | 44 | 56442 | **11097** (27x) |
+| track_demo | 27 | 2933 | **1640** (9.3x) | | m113 | 168 | 432934 | **148075** (13x) |
+
+Every model got faster; the gains track how branchy each one is. `m113` is 2.9x
+(433 -> 148 us, ~6.8 kHz), `hmmwv_pitman` 5.1x. The generated file also shrank
+~75 KB, since only `H`'s lower triangle is now written — the factorization and
+both substitutions stay below the diagonal, so the upper half is never read.
+
+**What this does not fix:** `L^T D L` exploits *branch* sparsity only. Down a
+single serial chain `lam[i] = i - 1`, `H` is full, and the algorithm degenerates
+to a dense factorization — which is why `rrrs` and `elbow` gain the least.
+`m113` wins because it is three independent branches off the base (each track
+band's anchor shoe is its own root, so the two 68-coordinate band blocks are
+mutually zero) and not because its 63-long chains got any cheaper. Making a long
+chain itself `O(n)` needs the articulated-body algorithm — see `fd_dense_aba` in
+`src/validate`, which is already split into a config-only factorization and a
+cheap per-RHS solve for exactly that purpose.
+
 ## Closed kinematic loops
 
 Mechanisms may contain kinematic loops (RBDA ch. 8). The bodies always form
@@ -299,8 +377,9 @@ A lambda = k + kstab - K qdd0        A = K H^-1 K^T,  qdd0 = H^-1 (tau - C)
 H qdd    = tau - C + K^T lambda
 ```
 
-One Gaussian elimination of H serves qdd0 and all columns of H^-1 K^T
-(`solveLinearSystemM` in the generated code), and everything before the
+One factorization of H serves qdd0 and all columns of H^-1 K^T (`ltlFactor`
+then a single `ltlSolveM` over all 1 + nc right-hand sides in the generated
+code — see [The H solve](#the-h-solve) below), and everything before the
 solve — K's epsilon structure (only tree joints on the loop's two root
 paths get entries, RBDA eq 8.18–8.20), the Table 8.1 position-error
 formulae, the axis alignment — is symbolic, so loop constraints get the

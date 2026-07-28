@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdio.h>
+#include <assert.h>
 #include "system.h"
 #include "prln.h"
 
@@ -32,20 +33,66 @@ void gen_solve_qdd( FILE *f, System *sys ) {
         for ( int k = 0 ; k < w ; k++ ) bodyOf[ sys->vidx[ i ] + k ] = i;
     }
 
-    prln( "" );
-    prln( "// Solve H*qdd = tau - C for qdd. Entries written as 0.0 are" );
-    prln( "// branch-induced structural zeros: those body pairs share no" );
-    prln( "// common subtree, so the CRBA never computes them." );
-    prln( "double H[ %d ] = {", NV * NV );
-    prln_indent_level++;
+    // The expanded parent array (RBDA Table 6.4): lam[r] is the velocity
+    // coordinate that precedes r on the path to the base. Within a floating
+    // body's 6-wide block the coordinates form a chain; the block's first
+    // coordinate points at the parent body's LAST one.
+    vector<int> lam( NV );
+    for ( int i = 0 ; i < NB ; i++ ) {
+        int v0 = sys->vidx[ i ], w = sys->jtype[ i ] == J_FLOATING ? 6 : 1;
+        int par = sys->parent[ i ];
+        lam[ v0 ] = par == -1 ? -1
+                  : sys->vidx[ par ] + ( sys->jtype[ par ] == J_FLOATING ? 6 : 1 ) - 1;
+        for ( int k = 1 ; k < w ; k++ ) lam[ v0 + k ] = v0 + k - 1;
+    }
+
+    // lam must reproduce H's sparsity pattern exactly, or the factorization
+    // would skip a nonzero: H_rc is nonzero iff one of r, c is reachable from
+    // the other by walking lam. That is the same relation crbaHasEntry() tests
+    // at body level, so the two must agree on every pair. Costs O(nv^2) here
+    // and nothing at runtime. Also checks Featherstone's lam[r] < r, which the
+    // factorization's reverse-order sweep depends on.
     for ( int r = 0 ; r < NV ; r++ ) {
+        assert( lam[ r ] < r );
+        for ( int c = 0 ; c < NV ; c++ ) {
+            bool viaLam = false;
+            for ( int k = r ; k != -1 ; k = lam[ k ] ) if ( k == c ) viaLam = true;
+            for ( int k = c ; k != -1 ; k = lam[ k ] ) if ( k == r ) viaLam = true;
+            assert( viaLam == crbaHasEntry( sys, bodyOf[ r ], bodyOf[ c ] ) );
+        }
+    }
+
+    prln( "" );
+    prln( "// Solve H*qdd = tau - C for qdd, via the sparse L^T D L factorization" );
+    prln( "// of RBDA sec 6.5 (see ltdlFactor/ltdlSolveM above)." );
+    prln( "//" );
+    prln( "// lam is the expanded parent array over velocity coordinates. It is" );
+    prln( "// also H's sparsity pattern: a pair of coordinates has a nonzero H" );
+    prln( "// entry exactly when one is reachable from the other along lam, so" );
+    prln( "// every entry NOT emitted below is a branch-induced structural zero" );
+    prln( "// (those bodies share no common subtree) that the factorization" );
+    prln( "// provably never touches." );
+    prln( "static const int Hlam[ %d ] = {", NV );
+    prln_indent_level++;
+    {
         string row;
-        for ( int c = 0 ; c < NV ; c++ )
-            row += crbaHasEntry( sys, bodyOf[ r ], bodyOf[ c ] ) ? format( "H_{}_{}, ", r, c ) : "0.0, "s;
+        for ( int r = 0 ; r < NV ; r++ ) row += format( "{}, ", lam[ r ] );
         prln( "%s", row.c_str() );
     }
     prln_indent_level--;
     prln( "};" );
+
+    prln( "// Only the lower triangle is ever read -- the factorization and both" );
+    prln( "// substitutions stay below the diagonal -- so H is left uninitialized" );
+    prln( "// and only that half is written." );
+    prln( "double H[ %d ];", NV * NV );
+    for ( int r = 0 ; r < NV ; r++ ) {
+        string row;
+        for ( int c = 0 ; c <= r ; c++ )
+            if ( crbaHasEntry( sys, bodyOf[ r ], bodyOf[ c ] ) )
+                row += format( "H[ {} ] = H_{}_{}; ", r * NV + c, r, c );
+        if ( !row.empty() ) prln( "%s", row.c_str() );
+    }
 
     if ( sys->loops.empty() ) {
         prln( "double rhs[ %d ] = {", NV );
@@ -58,16 +105,16 @@ void gen_solve_qdd( FILE *f, System *sys ) {
         prln_indent_level--;
         prln( "};" );
 
-        prln( "double qdd[ %d ];", NV );
-        prln( "solveLinearSystem( %d, H, rhs, qdd );", NV );
-        for ( int k = 0 ; k < NV ; k++ ) prln( "out_qdd[ %d ] = qdd[ %d ];", k, k );
+        prln( "ltdlFactor( %d, Hlam, H );", NV );
+        prln( "ltdlSolveM( %d, Hlam, H, 1, rhs );", NV );
+        for ( int k = 0 ; k < NV ; k++ ) prln( "out_qdd[ %d ] = rhs[ %d ];", k, k );
 
         prln_indent_level--;
         prln( "}" );
         return;
     }
 
-    // Closed loops: method 2 of RBDA sec 8.5. One elimination of H serves
+    // Closed loops: method 2 of RBDA sec 8.5. One factorization of H serves
     // both the tree solve qdd0 = H^-1 (tau - C) and Y = H^-1 K^T; then the
     // nc x nc system (K Y) lambda = kful - K qdd0 gives the constraint
     // forces, and qdd = qdd0 + Y lambda. K's structural zeros (tree joints
@@ -92,7 +139,8 @@ void gen_solve_qdd( FILE *f, System *sys ) {
     }
     prln_indent_level--;
     prln( "};" );
-    prln( "solveLinearSystemM( %d, H, %d, B );", NV, M );
+    prln( "ltdlFactor( %d, Hlam, H );", NV );
+    prln( "ltdlSolveM( %d, Hlam, H, %d, B );", NV, M );
 
     prln( "double Km[ %d ] = {", NC * NV );
     prln_indent_level++;
