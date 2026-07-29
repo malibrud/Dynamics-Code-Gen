@@ -22,6 +22,7 @@ tree -1.0 0.5 0.30
 mass 80
 cg 0 0 0
 inertia 4 7 4 0 0 0
+fext 1                   # contact reaction from the track band
 
 body                     # 2: idler (front end pulley)
 parent 0
@@ -30,6 +31,7 @@ tree 1.0 0.5 0.30
 mass 60
 cg 0 0 0
 inertia 3 5 3 0 0 0
+fext 1                   # contact reaction from the track band
 
 body                     # 3: road wheel 1
 parent 0

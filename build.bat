@@ -88,5 +88,37 @@ if errorlevel 1 (
     exit /b 1
 )
 "%BUILD%\bench_%1.exe" "%ROOT%models\%1.mech"
+rem Track contact force law (src\contact): internal-wrench balance, purity,
+rem smoothness, the tooth law, and the design-pose regression. Links no
+rem generated code -- it tests the force producer, not the dynamics -- so it
+rem runs on every model; ones without a band assert they produce no forces.
+cl /nologo /O2 /std:c17 /Fecontact_%1.exe /Fo"%BUILD%\\" "%SRC%\contact\main.c"
+if errorlevel 1 (
+    echo Contact test build failed for %1.
+    popd
+    exit /b 1
+)
+"%BUILD%\contact_%1.exe" "%ROOT%models\%1.mech"
+if errorlevel 1 (
+    echo CONTACT CHECK FAILED for %1.
+    popd
+    exit /b 1
+)
+rem Trajectory checks (src\sim): properties no fixed-state comparison can see --
+rem that qd really is dq/dt, that the quaternion update is right, and that the
+rem energy error is first order in dt. Unlike the benchmark above, this one's
+rem exit code IS checked: it is a gate, not a measurement.
+cl /nologo /O2 /std:c17 /Fesim_%1.exe /Fo"%BUILD%\\" "%SRC%\sim\main.c" "%BUILD%\dynamics_%1.c"
+if errorlevel 1 (
+    echo Sim build failed for %1.
+    popd
+    exit /b 1
+)
+"%BUILD%\sim_%1.exe" "%ROOT%models\%1.mech"
+if errorlevel 1 (
+    echo SIM CHECK FAILED for %1.
+    popd
+    exit /b 1
+)
 popd
 exit /b 0

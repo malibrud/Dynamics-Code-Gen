@@ -154,6 +154,7 @@ tree 0 1.0795 0
 mass 27.68
 cg 0 0 0
 inertia 0.646 0.883 0.646 0 0 0
+fext 1                   # contact reaction from the track band
 
 body                     # 2: idler carrier L, slides fore/aft on the hull
 parent 0
@@ -170,6 +171,7 @@ tree 0 0 0
 mass 25.76
 cg 0 0 0
 inertia 0.618 1.12 0.618 0 0 0
+fext 1                   # contact reaction from the track band
 
 body                     # 4: arm L1 (torsion-bar trailing arm)
 parent 0
@@ -267,6 +269,7 @@ tree 0 -1.0795 0
 mass 27.68
 cg 0 0 0
 inertia 0.646 0.883 0.646 0 0 0
+fext 1                   # contact reaction from the track band
 
 body                     # 15: idler carrier R
 parent 0
@@ -283,6 +286,7 @@ tree 0 0 0
 mass 25.76
 cg 0 0 0
 inertia 0.618 1.12 0.618 0 0 0
+fext 1                   # contact reaction from the track band
 
 body                     # 17: arm R1
 parent 0

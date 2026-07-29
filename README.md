@@ -136,7 +136,12 @@ directly, rather than shelling out to a C compiler.
     made the validator's gate size-aware (see `src/validate` below)
 - `src/model` — the shared model-file parser (plain C, header-only), used
   by the generator, the validator, and the benchmark, so all three always
-  agree on the mechanism.
+  agree on the mechanism. `kinematics.h` alongside it is the shared spatial
+  algebra and forward-kinematics layer — `plux`, `jointXS`, `mcI`,
+  `xformOrigin`, `denseKinematics` — extracted from `src/validate/dense.h`
+  once it acquired a second consumer that has nothing to do with validation
+  (the contact engine needs per-body poses and velocities, and a force
+  producer must not depend on the validation reference).
 - `src/codegen` — the active approach. A small C++ program that loads a
   mechanism file and, instead of computing with numbers, computes with
   strings: each spatial-vector/transform component is a symbolic expression.
@@ -272,6 +277,23 @@ directly, rather than shelling out to a C compiler.
   after validation; on the original dev machine the 3-link chain runs at
   ~42 ns/call generated vs ~880 ns/call dense (~21x). The full table across
   every model is under [The H solve](#the-h-solve).
+- `src/contact` — the track-band contact force producer
+  (`track_contact.h`) and its test harness. Caller-side and stateless: it
+  reads a state, writes `fext`, and the generated dynamics never learns
+  contact exists. See [Track contact](#track-contact) below. The harness
+  links no generated code — it tests the force law, not the dynamics — so
+  `build.bat` runs it on every model, and models without a band assert they
+  produce no forces.
+- `src/sim` — the trajectory harness: a plain-C semi-implicit Euler stepper
+  (`integrate.h`, with the quaternion update ported out of the Chrono
+  cross-check so it needs no SDK) plus the checks that only a trajectory can
+  make. Before this, nothing in `build.bat` stepped time at all — `validate`
+  and `bench` evaluate at fixed states, and the only integrator in the repo
+  lived inside the Chrono harness. Tree models are gated on the energy error
+  being first order in `dt` (halving `dt` must halve the drift, which it does
+  to 3 digits on all eight, `satellite` included — the only thing that
+  exercises the quaternion path). Track models get the contact-in-the-loop
+  settling run instead.
 - `src/numeric` — an earlier, currently non-building attempt at a runtime
   (non-generated) numeric implementation of the same algorithms. Kept for
   reference; `system.h` was removed mid-refactor and never replaced, so this
@@ -346,6 +368,16 @@ same `/O2`, `x` = speedup over the dense reference):
 | bintree | 7 | 197.7 | **129.1** (15x) | | hmmwv | 43 | 26795 | **9865** (27x) |
 | satellite | 9 | 216.8 | **166.0** (7.7x) | | hmmwv_pitman | 44 | 56442 | **11097** (27x) |
 | track_demo | 27 | 2933 | **1640** (9.3x) | | m113 | 168 | 432934 | **148075** (13x) |
+
+(The `m113` figure predates [Track contact](#track-contact), which added
+`fext 1` to four roller bodies and with it four more inverse-transform blocks
+inside an already 74k-line function. Measured A/B on one machine, interleaved,
+min of four: 137.6 us without them against 150.7 us with, so **+9.5%** — and the
+variance widens too, 137-141 against 150-173, which is what extra straight-line
+code does to the instruction cache. That is the standing price of routing
+contact reactions through the bearing into the hull rather than lumping them
+into `tau`; the rest of the table is untouched and was measured in a single
+earlier session, so it is left as it was rather than half-rewritten.)
 
 Every model got faster; the gains track how branchy each one is. `m113` is 2.9x
 (433 -> 148 us, ~6.8 kHz), `hmmwv_pitman` 5.1x. The generated file also shrank
@@ -506,6 +538,211 @@ Two things to know:
   reported as `linkLen`, since the shoes must close on the path exactly.
 - The contact data (`ground`, `kn`, `kt`, `mu`, `teeth`) is parsed and kept
   for a contact force engine that this loader does not implement.
+
+## Track contact
+
+A tracked vehicle's only path to the ground is through the band, so until
+there were contact forces the `m113` model could not move: the hull was in
+free fall, the band hung free, and each idler tensioner — 0.27 m inside its
+free length with no track tension to react it — shoved its carrier rearward
+at ~2.7e5 N. The `track` block had been carrying `kn`/`kt`/`mu`, a ground
+plane, and each roller's `radius`/`isDrive`/`teeth` since it landed, parsed
+and validated and then read by nothing but the two `end` pulleys.
+
+This stage implements shoe-against-roller contact for all seven rollers per
+band. Shoe-against-ground is **not** implemented yet, so the vehicle still
+does not stand up (see the note on gravity below, which is why that does not
+prevent any of this from being tested).
+
+**A caller-side force producer, not a change to the dynamics.** The step is
+
+```
+denseKinematics( mdl, q, qd, X, v );          // src/model/kinematics.h
+trackContactFext( mdl, prm, X, v, fext );     // src/contact/track_contact.h
+fwd_dyn_crba( q, qd, tau, fext, act, qdd );   // unchanged
+```
+
+**Why penalty contact and not exact unilateral constraints.** The reason is
+structural rather than numerical, and it is forced by the architecture: the
+loop machinery is baked at code-generation time. `nc` and `cidx[]` are frozen
+in the model, `K` is emitted as straight-line code, and `gen_solve_qdd.h`
+emits a solve sized for a fixed `A = K H⁻¹ Kᵀ`. A contact set that changes
+every step — pins entering and leaving the sprocket wrap — would have to add
+and remove constraint rows at runtime, which cannot be done without
+abandoning code generation entirely. `fext` is a dense array read at fixed
+offsets, so it is structurally invariant. It is also what the model file
+already assumed: `m113.mech` says contact forces "have to be supplied from
+outside: apply them through `fext`".
+
+**Stateless, deliberately.** `trackContactFext` is a pure function of
+`(q, qd)`: no contact anchors, no active set, no memory between calls. That
+is what lets it be exercised at 1000 random, off-trajectory states by the
+same machinery the rest of the project uses. It is also why friction is
+regularized Coulomb rather than a bristle model, and why **`kt` remains
+unused**: `kt` is dimensionally a tangential stiffness belonging to a
+persistent-anchor stick model, which could not be evaluated at a random state
+at all. The honest cost is that a loaded stationary vehicle creeps at up to
+`vEps` ≈ 1 cm/s.
+
+**One primitive for every roller.** The shoe frame's *origin is a pin*
+(`model.h`: "the shoe frame is at its own pin, the next pin is at +linkLen on
+x"), so walking shoes `shoe0 .. shoe0+N-1` visits all N pins exactly once
+with no local-point transform, and a pin's world velocity is exactly
+`Eᵀ·v[3..5]` with no `ω × ρ` term. The belt path was itself built tangent to
+circles of the declared radii, so the query is just pin-centre against a
+circle of `roller.radius`, in the roller's own rotating frame.
+
+The force law, in that frame (band plane x–z, axle y):
+
+- **Radial**, one-sided because the band wraps the outside:
+  `f_n = kn·δ + c_n·ramp(δ)·δ̇`, clamped at zero. The clamp is what stops the
+  damper pulling a separating shoe back, and it is exactly what the passivity
+  check would catch if it were removed.
+- **Tooth engagement** on the drive sprocket:
+  `f = −g(δ)·[ F_skip·sin(N(θ−θ₀)) + c·u_t ]`. Because `N = teeth` is an
+  **integer**, the sine is automatically periodic at the pocket pitch `2π/N`
+  and automatically continuous across `θ = ±π` — no phase wrapping, no
+  `round()`, no branch, which is most of why this form was chosen over an
+  explicit nearest-pocket law. It vanishes at the pocket centre (stable) and
+  at the tooth tip (unstable — correct: a pin balanced on a tip has no
+  circumferential force), so the taper at half pitch is built in; `|f| ≤
+  F_skip` makes tooth skip fall out of the law rather than being modelled
+  separately; and it is the gradient of a real potential, which is what makes
+  the energy accounting meaningful. Two-sided by construction, which is what
+  a pin sitting between two flanks needs to carry drive *and* overrun.
+- **Getting the gradient right, in both coordinates.** `g(δ)·U₀(θ)` is a
+  potential in *two* variables, and two separate mistakes are easy here. Both
+  were made, and the trajectory energy check found both.
+  - `−∇U` has a **radial** part `g′(δ)·U₀` alongside the circumferential one.
+    Applying only the circumferential part leaves the law non-conservative — a
+    pin entering the wrap at one phase and leaving at another closes a loop
+    with net work — and the term is not small: `g′` reaches 1.5/`gateFade` =
+    50/m against a tooth potential reaching `2·F_skip·R/N` = 980 J, so the
+    omitted force is up to ~5e4 N, the same order as contact itself.
+  - In polar coordinates the conservative tangential force is
+    `−(1/ρ)·∂U₀/∂θ`, so the moment arm is **ρ, not R**. Dividing by `R` leaves
+    a residual of order `δ/ρ`, which reaches 14% at the edge of the gate band.
+    Using `ρ` costs nothing and keeps the peak exactly `F_skip` *on* the pitch
+    circle, where `ρ = R` — which is where the unit test measures, so it stays
+    exact.
+
+  Cumulatively, on the `m113` settle: worst single-step energy rise 13.04 J →
+  0.22 J → **0.102 J**, and settled interpenetration 0.029 → 0.019 → **0.0078
+  m**.
+- **Lateral guide.** Not optional. The band is a floating planar chain
+  parented to the **base**, closed only by a point-on-line loop constraining
+  two in-plane translations, so its rigid-body y-translation, roll and yaw are
+  completely unconstrained — and gravity is z-only. With purely in-plane
+  contact those three modes would receive no force at all and the band would
+  walk off its wheels. The guide horns are the real mechanism and `d[1]` is
+  already in hand.
+- **Friction** on the non-drive rollers only. On the sprocket the tooth term
+  *is* the circumferential force, and Coulomb on top would double-count drive.
+- **Damping** is derived from a critical-damping fraction and the declared
+  shoe mass rather than new format keys — dimensionally correct and it
+  rescales automatically with `kn`. For `m113` (`kn` 2e5, 18.02 kg shoes):
+  ω = 105 rad/s, `c_crit` = 3797, so `c_n` = 759 at the running ζ = 0.2.
+
+Reactions go on as `[p × F; F]` and its exact negation, with the moment
+computed **once** from the same `p` and the same `F`. That makes each pair
+cancel exactly; the *total* cancels only to accumulation roundoff (4.3e-16
+relative on `m113`), because the two halves land in different running sums and
+floating-point addition is not associative.
+
+Sprockets (bodies 1/14) and idler wheels (3/16) gained `fext 1` — without it
+their slots are never read, the reaction is silently dropped, and the vehicle
+would gain momentum from nothing. Lumping the reaction into `tau` instead
+would be wrong for the same reason: only the y-moment maps onto a joint
+coordinate, so the radial bearing load carrying band tension into the hull
+would vanish. `tau[6]`/`tau[19]` remain the drive input; the contact engine
+adds the band's reaction on top.
+
+That correctness is not free, and the cost is bigger than it looks: each
+`fext 1` body emits its own `invertXform` plus a 6x6 force transform, and four
+more of those inside `m113`'s 74k-line function cost **9.5%** (137.6 -> 150.7
+us, interleaved A/B, min of four) — far more than the ~100 flops involved,
+because what actually hurts is instruction-cache pressure. `trackContactCheckModel`
+refuses to run on a model whose roller bodies lack the flag, since the failure
+mode is otherwise invisible: the wrench still sums to zero in the `fext` array
+while quietly never reaching the dynamics.
+
+**Three things about the design pose**, all consequences of the belt wrapping
+only the two `end` pulleys:
+
+- Pins do **not** sit exactly on the pitch circle. The loader takes each
+  shoe's direction from the chord between pins but its length from the *arc*
+  spacing `ds`, and on a wrap arc the true chord `2R·sin(ds/2R)` = 0.148040 m
+  is shorter than `ds` = 0.150388 m, so every link overshoots by ~2.3 mm and
+  the reconstructed pins drift a few millimetres *outside*. The radial force
+  is zero there because the one-sided clamp fires, not because δ = 0 — so the
+  regression asserts `δ ≤ 0`, never `|δ| ≈ 0`.
+- The five road wheels per side poke **0.17–0.25 m** through the design-pose
+  lower run (the "~0.15 m" quoted under [Track bands](#track-bands) understates
+  it). At full stiffness that is order 1e6 N per side against a 1.1e5 N
+  vehicle weight, so the settling run ramps the gains in over 0.2 s with heavy
+  initial damping, letting the band relax through the same force law that runs
+  afterwards rather than through a separate assembly path.
+- The sprocket's tooth arc pitch `2πR/N` = 0.153938 m is *exactly* the real
+  0.154 m shoe pitch, but `linkLen` comes out 2.36% short for the same
+  wrap-shortfall reason, so the phase error over the ~5 engaged pins spans
+  about ±5.8% of a pitch. Net torque largely cancels; per-pin forces do not.
+  `modelLoad` now warns when a drive sprocket's tooth pitch is more than 5%
+  off the shoe pitch — `m113` is fine at 2.4%, `track_demo` is 62% off and
+  says outright that its geometry is placeholder.
+
+The permanent fix for all three — generalising `trkBuildBelt` to the convex
+hull of every roller circle rather than just the two end pulleys — is
+deferred, so that a large geometric change is not debugged at the same time
+as a new force law.
+
+**Verification, and why not against Chrono.** Chrono's `ChSprocketSinglePin`
+runs its own narrowphase callback against a hand-authored tooth profile from
+`M113_SprocketSinglePin_Left.json`, colliding against the pin *surface* — not
+a pitch-circle abstraction. Reproducing it would mean reimplementing the
+profile, at which point the check tests the reimplementation rather than the
+physics. What is achievable later is aggregate agreement only: tractive force
+against sprocket torque, steady track speed against `ω·R`.
+
+So the checks are self-contained (`src/contact/main.c`, on `m113`):
+
+| check | what it catches | result |
+| --- | --- | --- |
+| internal wrenches sum to zero over 1000 random states | any sign error, wrong body index, or dropped reaction | 4.3e-16 relative |
+| determinism at a repeated state | hidden state creeping into the force law | bitwise |
+| radial and circumferential sweeps | a discontinuity that would make an explicit integrator chatter | 1.1 N and 12.6 N per step |
+| tooth law fixed points, slope signs, amplitude, periodicity, branch cut | the whole engagement model | exact |
+| design pose on the path-defining pulleys | a band jammed into the geometry that defines it | no penetration, worst clearance 0.4 mm |
+| sprocket axle torque, assembled from `fext` vs summed directly | a wrong moment reference point — which the balance check *cannot* see, since a wrong reference still cancels between the two bodies | 6.4e-15 relative |
+| passivity of the velocity-dependent force | an energy-injecting damper | dissipates everywhere, worst power 0 W |
+
+and one trajectory check (`src/sim/main.c`): settle the band from `q0` with
+ramped gains, then assert the interpenetration went down, that the energy
+budget shrinks once the ramp is over, and that linear momentum tracks `M·g·Δt`.
+On `m113` that is worst pin penetration 0.224 → 0.0078 m over 0.6 s, momentum
+matching to 9.1e-4 relative, and a net energy change of −2.06e4 J with the
+largest single-step rise 0.102 J against a 15.5 J truncation bound.
+
+The energy assertion is deliberately *not* strict monotonicity. Semi-implicit
+Euler's energy error oscillates within an O(`dt`) band rather than decreasing,
+so a first-order integrator on a stiff penalty law ripples upward
+occasionally no matter how correct the forces are; what is asserted is that the
+net change is a loss and that no single step adds a truncation-scale fraction
+of the kinetic energy. The budget has to be complete for any of that to mean
+anything — kinetic, gravitational, the model's own 18 springs, *and* the
+contact springs. Omitting the force elements alone made the tensioners' stored
+energy look like energy appearing from nowhere.
+
+That last one deserves a note, because it is why **gravity does not need
+turning off** even though nothing holds the vehicle up. Gravity is uniform, so
+it contributes the same acceleration to every body and cancels out of every
+*relative* position and velocity the contact law depends on: the band relaxes
+onto its wheels in free fall exactly as it would in orbit, and only the
+absolute altitude runs away. It also makes the momentum check exact rather
+than approximate — with every other force internal, `dP/dt = M·g` holds
+identically, whatever the contact model does. (The check starts after the
+ramp, because the artificial viscosity that drains the relaxation transient
+multiplies all of `qd`, rigid-body modes included, and is an external force
+while it is on.)
 
 ## Force elements and points of interest
 

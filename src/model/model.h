@@ -974,6 +974,28 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
         tr->linkLen = ds;
         for ( int i = 0 ; i < N ; i++ ) { double ph; trkPin[ i ] = trkPoint( seg, i*ds, &ph ); }
 
+        // A drive sprocket's teeth must be spaced like the shoes, or tooth
+        // engagement is meaningless: the pockets sit at arc pitch 2*pi*R/teeth
+        // and the pins arrive at linkLen. m113 is 2.4% off (0.153938 vs
+        // 0.150388) because the belt wraps only the two end pulleys and so
+        // comes out short by the road-wheel wrap it leaves out -- small enough
+        // that the phase error over the ~5 engaged pins stays bounded. A gross
+        // mismatch means the model's teeth count and radius were never chosen
+        // for its shoe count, and any tooth force computed from them is noise.
+        // Warn rather than fail: the band itself is still dynamically valid,
+        // and track_demo says outright that its geometry is placeholder.
+        for ( int r = 0 ; r < tr->nroller ; r++ ) {
+            const ModelTrackRoller *rr = &tr->roller[ r ];
+            if ( !rr->isDrive || rr->teeth <= 0 ) continue;
+            double toothPitch = 2.0 * M_PI * rr->radius / rr->teeth;
+            double rel = fabs( toothPitch - ds ) / ds;
+            if ( rel > 0.05 )
+                fprintf( stderr, "%s: warning: track '%s': sprocket tooth pitch %.6f m "
+                                 "(2*pi*%.4f/%d) is %.0f%% off the shoe pitch %.6f m -- "
+                                 "tooth engagement will not be physical\n",
+                         path, tr->name, toothPitch, rr->radius, rr->teeth, rel*100.0, ds );
+        }
+
         int b0 = m->nbod;
         tr->shoe0 = b0;
         // Anchor shoe: a floating body (held in the plane by contact at runtime,
