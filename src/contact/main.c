@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../contact/track_contact.h"
+#include "../contact/ground_contact.h"
 
 static unsigned long rngState = 123456789UL;
 static double frand2( void ) {          // uniform in [-1, 1)
@@ -529,6 +530,383 @@ static int checkPassivity( const Model *mdl, const TrackContactParams *prm ) {
     return 0;
 }
 
+// ===========================================================================
+// Ground contact. The same discipline as above, but check 1 had to change
+// SHAPE rather than just target: every track contact is internal, so its
+// wrenches sum to zero, whereas the ground is not a body and its reactions
+// have nowhere to go. There is no cancellation left to assert. What replaces
+// it is a second, independently written sum of the same wrenches, plus a
+// statement about WHERE in fext they are allowed to land -- because with no
+// reaction body, a wrench written to the wrong body index would otherwise
+// leave no trace at all in any total.
+// ===========================================================================
+
+// A random contact point straddling the terrain, and a random material
+// velocity. depth < 0 is clear of the ground, > 0 is penetrating.
+static void randomGroundPoint( const ModelGround *gnd, double p[3], double u[3] ) {
+    double h, hx, hy;
+    p[0] = 20.0 * frand2();
+    p[1] = 20.0 * frand2();
+    terrainAt( &gnd->terrain, p[0], p[1], &h, &hx, &hy );
+    p[2] = h - 0.05 * frand2();          // +/- 50 mm about the surface
+    for ( int k = 0 ; k < 3 ; k++ ) u[k] = 5.0 * frand2();
+}
+
+// ---------------------------------------------------------------------------
+// G1 + G2: total wrench by two routes, where the wrenches land, and purity.
+// ---------------------------------------------------------------------------
+static int checkGroundBalance( const Model *mdl, const GroundContactParams *prm ) {
+    static double q[ MODEL_MAX_Q ], qd[ MODEL_MAX_V ];
+    static double fext[ MODEL_MAX_BODIES * 6 ], fext2[ MODEL_MAX_BODIES * 6 ];
+    static double Xa[ MODEL_MAX_BODIES ][6][6], vb[ MODEL_MAX_BODIES ][6];
+    const int NTRIALS = 500;
+    const double TOL = 1e-12;
+    int touched = 0;
+    double worstRel = 0;
+
+    // Which bodies are allowed to receive a ground wrench at all.
+    static char mayReceive[ MODEL_MAX_BODIES ];
+    memset( mayReceive, 0, sizeof mayReceive );
+    for ( int t = 0 ; t < mdl->ntrack ; t++ ) {
+        const ModelTrack *tr = &mdl->track[t];
+        if ( !tr->hasPad ) continue;
+        for ( int i = 0 ; i < tr->shoes ; i++ ) mayReceive[ tr->shoe0 + i ] = 1;
+    }
+
+    for ( int t = 0 ; t < NTRIALS ; t++ ) {
+        randomState( mdl, q, qd );
+
+        double fTot[6];
+        groundContactFromState( mdl, prm, q, qd, fext, fTot );
+
+        // Route 2: re-derive every pad point from the kinematics and sum
+        // [p x F; F] directly, sharing nothing with the fext bookkeeping but
+        // gndPointForce itself. This is what catches a wrong moment reference
+        // point -- an error a total that cancels can never see, which is
+        // exactly why the track harness needed its separate drive-torque check.
+        double ref[6] = { 0, 0, 0, 0, 0, 0 };
+        denseKinematics( mdl, q, qd, Xa, vb );
+        for ( int tr_i = 0 ; tr_i < mdl->ntrack ; tr_i++ ) {
+            const ModelTrack *tr = &mdl->track[ tr_i ];
+            if ( !tr->hasPad ) continue;
+            for ( int i = 0 ; i < tr->shoes ; i++ ) {
+                int j = tr->shoe0 + i;
+                double r[3];
+                xformOrigin( Xa[j], r );
+                for ( int c = 0 ; c < 4 ; c++ ) {
+                    double tl[3], p[3], ub[3], u[3];
+                    gndPadCorner( tr, c, tl );
+                    for ( int k = 0 ; k < 3 ; k++ )
+                        p[k] = r[k] + Xa[j][0][k]*tl[0] + Xa[j][1][k]*tl[1] + Xa[j][2][k]*tl[2];
+                    ub[0] = vb[j][3] + vb[j][1]*tl[2] - vb[j][2]*tl[1];
+                    ub[1] = vb[j][4] + vb[j][2]*tl[0] - vb[j][0]*tl[2];
+                    ub[2] = vb[j][5] + vb[j][0]*tl[1] - vb[j][1]*tl[0];
+                    for ( int k = 0 ; k < 3 ; k++ )
+                        u[k] = Xa[j][0][k]*ub[0] + Xa[j][1][k]*ub[1] + Xa[j][2][k]*ub[2];
+                    GndPointForce pf;
+                    if ( !gndPointForce( prm, &mdl->ground, p, u, &pf ) ) continue;
+                    ref[0] += p[1]*pf.f[2] - p[2]*pf.f[1];
+                    ref[1] += p[2]*pf.f[0] - p[0]*pf.f[2];
+                    ref[2] += p[0]*pf.f[1] - p[1]*pf.f[0];
+                    for ( int k = 0 ; k < 3 ; k++ ) ref[3+k] += pf.f[k];
+                }
+            }
+        }
+
+        double sum[6] = { 0, 0, 0, 0, 0, 0 }, scale[6] = { 0, 0, 0, 0, 0, 0 };
+        for ( int i = 0 ; i < mdl->nbod ; i++ )
+            for ( int k = 0 ; k < 6 ; k++ ) {
+                sum[k]   += fext[ i*6 + k ];
+                scale[k] += fabs( fext[ i*6 + k ] );
+            }
+        for ( int i = 0 ; i < mdl->nbod * 6 ; i++ ) if ( fext[i] != 0.0 ) touched = 1;
+
+        for ( int k = 0 ; k < 6 ; k++ ) {
+            double sc  = scale[k] > 1 ? scale[k] : 1.0;
+            double rel = fabs( sum[k] - ref[k] ) / sc;
+            if ( rel > worstRel ) worstRel = rel;
+            if ( rel > TOL ) {
+                printf( "contact: FAIL: ground wrench disagrees with the direct sum at trial %d: "
+                        "component %d is %.6g via fext against %.6g direct (relative %.3e)\n",
+                        t, k, sum[k], ref[k], rel );
+                return 1;
+            }
+            // fTotal is the engine's own report of what it applied, and
+            // src/sim/main.c's momentum balance is measured against it.
+            if ( fabs( sum[k] - fTot[k] ) > TOL * sc ) {
+                printf( "contact: FAIL: the reported total ground wrench does not match what "
+                        "landed in fext at trial %d: component %d, %.6g reported, %.6g applied\n",
+                        t, k, fTot[k], sum[k] );
+                return 1;
+            }
+        }
+
+        // Ground wrenches must land only on bodies that carry pads. With no
+        // reaction body there is nothing to cancel against, so a wrench written
+        // to the wrong index is invisible in every total above.
+        for ( int i = 0 ; i < mdl->nbod ; i++ ) {
+            if ( mayReceive[i] ) continue;
+            for ( int k = 0 ; k < 6 ; k++ ) if ( fext[ i*6 + k ] != 0.0 ) {
+                printf( "contact: FAIL: body %d carries no ground pad but received a wrench "
+                        "(component %d = %.6g) at trial %d\n", i, k, fext[ i*6 + k ], t );
+                return 1;
+            }
+        }
+
+        groundContactFromState( mdl, prm, q, qd, fext2, NULL );
+        for ( int i = 0 ; i < mdl->nbod * 6 ; i++ ) if ( fext[i] != fext2[i] ) {
+            printf( "contact: FAIL: ground engine is not a pure function of (q,qd): "
+                    "fext[%d] = %.17g then %.17g at trial %d\n", i, fext[i], fext2[i], t );
+            return 1;
+        }
+    }
+
+    printf( "contact: ground: %d random states: wrench matches an independent sum to %.3e "
+            "relative, lands only on padded bodies, output deterministic%s\n",
+            NTRIALS, worstRel, touched ? "" : " (no pads in range -- model has no ground)" );
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// G3 + G4: smoothness, vertically through the surface and horizontally across
+// it. The vertical sweep is the counterpart of the track harness's radial one.
+//
+// The HORIZONTAL sweep is the new one, and it is aimed at terrain that does not
+// exist yet: dragging a point along the surface must not make the force jump.
+// On a plane that is trivially true, which is the point of writing it now --
+// when a sampled grid arrives, bilinear interpolation gives C0 heights and
+// therefore a normal direction that snaps at every cell edge, and this check is
+// what will reject it and force a bicubic.
+// ---------------------------------------------------------------------------
+static int checkGroundSmoothness( const Model *mdl, const GroundContactParams *prm ) {
+    if ( !mdl->ground.has ) return 0;
+    const int N = 20000;
+    double u[3] = { 0.3, -0.2, 0.4 };
+
+    // Vertical: 100 mm of travel straddling the surface.
+    double h, hx, hy, worstV = 0, prev[3] = { 0, 0, 0 };
+    terrainAt( &mdl->ground.terrain, 1.0, 0.5, &h, &hx, &hy );
+    for ( int i = 0 ; i <= N ; i++ ) {
+        double p[3] = { 1.0, 0.5, h + 0.05 - 0.10 * i / N };
+        GndPointForce pf;
+        gndPointForce( prm, &mdl->ground, p, u, &pf );
+        if ( i ) {
+            double d = 0;
+            for ( int k = 0 ; k < 3 ; k++ ) d += ( pf.f[k] - prev[k] ) * ( pf.f[k] - prev[k] );
+            d = sqrt( d );
+            if ( d > worstV ) worstV = d;
+        }
+        for ( int k = 0 ; k < 3 ; k++ ) prev[k] = pf.f[k];
+    }
+
+    // Horizontal: 20 m of travel at a fixed depth, so only the terrain varies.
+    double worstH = 0;
+    for ( int i = 0 ; i <= N ; i++ ) {
+        double x = -10.0 + 20.0 * i / N, hh, hxx, hyy;
+        terrainAt( &mdl->ground.terrain, x, 0.5, &hh, &hxx, &hyy );
+        double p[3] = { x, 0.5, hh - 0.01 };       // 10 mm down, always in contact
+        GndPointForce pf;
+        gndPointForce( prm, &mdl->ground, p, u, &pf );
+        if ( i ) {
+            double d = 0;
+            for ( int k = 0 ; k < 3 ; k++ ) d += ( pf.f[k] - prev[k] ) * ( pf.f[k] - prev[k] );
+            d = sqrt( d );
+            if ( d > worstH ) worstH = d;
+        }
+        for ( int k = 0 ; k < 3 ; k++ ) prev[k] = pf.f[k];
+    }
+
+    // The vertical bound is the elastic slope: crossing 100 mm in N steps at
+    // stiffness kn cannot legitimately step by more than kn*100mm/N, and the
+    // damper adds its own ramp. Allow 4x that; a genuine discontinuity is
+    // orders of magnitude over, not a factor of a few.
+    double vBound = 4.0 * ( mdl->ground.kn * 0.10 / N
+                          + 2.0 * prm->zeta * sqrt( mdl->ground.kn * prm->mEff ) * 0.10 / N );
+    if ( worstV > vBound && vBound > 0 ) {
+        printf( "contact: FAIL: the vertical force sweep steps by %.4g N against a %.4g N bound "
+                "-- the ground law is discontinuous\n", worstV, vBound );
+        return 1;
+    }
+    printf( "contact: ground: sweeps smooth: vertical max step %.3e N (bound %.3e), "
+            "horizontal %.3e N over 20 m\n", worstV, vBound, worstH );
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// G5: the elastic force is exactly -grad U, checked end to end.
+//
+// This is the check the whole vertical-gap formulation exists to pass, and it
+// is aimed squarely at the failure that cost the sprocket tooth law two rounds
+// of debugging: a force that is only PART of the gradient of its own potential
+// leaks energy around any closed path, and no pointwise test of either the
+// force or the potential alone can see it.
+//
+// Method: translate the entire model by +/-eps and central-difference
+// groundContactPotential against the total force from groundContactFext.
+// Translating every FLOATING body's position slice translates the whole model,
+// since every other body's pose comes from tree offsets beneath one. Evaluated
+// at qd = 0, which kills the damper and friction and leaves exactly the elastic
+// part -- the only part that is supposed to be a gradient.
+// ---------------------------------------------------------------------------
+static int checkGroundGradient( const Model *mdl, const GroundContactParams *prm ) {
+    if ( !mdl->ground.has ) return 0;
+    static double q[ MODEL_MAX_Q ], qd[ MODEL_MAX_V ], qp[ MODEL_MAX_Q ];
+    static double fext[ MODEL_MAX_BODIES * 6 ];
+    static double Xa[ MODEL_MAX_BODIES ][6][6], vb[ MODEL_MAX_BODIES ][6];
+    const double EPS = 1e-6;
+    double worst = 0, worstScale = 0;
+    int tested = 0;
+
+    for ( int t = 0 ; t < 200 ; t++ ) {
+        randomState( mdl, q, qd );
+        memset( qd, 0, mdl->nv * sizeof *qd );        // elastic part only
+
+        double fTot[6];
+        groundContactFromState( mdl, prm, q, qd, fext, fTot );
+        double mag = fabs( fTot[3] ) + fabs( fTot[4] ) + fabs( fTot[5] );
+        if ( mag < 1.0 ) continue;                     // nothing in contact
+        tested++;
+
+        for ( int k = 0 ; k < 3 ; k++ ) {
+            double U[2];
+            for ( int s = 0 ; s < 2 ; s++ ) {
+                memcpy( qp, q, mdl->nq * sizeof *qp );
+                double d = s ? EPS : -EPS;
+                for ( int i = 0 ; i < mdl->nbod ; i++ )
+                    if ( mdl->body[i].jtype == JOINT_FLOATING )
+                        qp[ mdl->qidx[i] + 4 + k ] += d;
+                denseKinematics( mdl, qp, qd, Xa, vb );
+                U[s] = groundContactPotential( mdl, prm, Xa );
+            }
+            double dUdx = ( U[1] - U[0] ) / ( 2.0 * EPS );
+            double e    = fabs( -dUdx - fTot[ 3 + k ] );
+            if ( e / mag > worst ) { worst = e / mag; worstScale = mag; }
+        }
+    }
+
+    if ( !tested ) {
+        printf( "contact: ground: gradient check found no loaded states to sample\n" );
+        return 0;
+    }
+    // Central differences at eps 1e-6 on a stiff quadratic: the floor is
+    // roundoff in U divided by eps, a few parts in 1e-7 of the force scale.
+    if ( worst > 1e-5 ) {
+        printf( "contact: FAIL: the elastic ground force is not -grad U (worst relative "
+                "mismatch %.3e over %d loaded states) -- the law is not conservative\n",
+                worst, tested );
+        return 1;
+    }
+    printf( "contact: ground: elastic force matches -grad U to %.3e relative over %d loaded "
+            "states (force scale %.4g N)\n", worst, tested, worstScale );
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// G6: the terrain's analytic gradient against central differences of its own
+// height. Cheap, and it catches a bad dh/dx in every terrain kind that will
+// ever be added -- including the ones this file cannot otherwise reach, since
+// the gradient is what the conservativeness argument in terrain.h rests on.
+// ---------------------------------------------------------------------------
+static int checkTerrainGradient( const Model *mdl ) {
+    if ( !mdl->ground.has ) return 0;
+    const ModelTerrain *tn = &mdl->ground.terrain;
+    const double EPS = 1e-5;
+    double worst = 0;
+
+    for ( int t = 0 ; t < 5000 ; t++ ) {
+        double x = 50.0 * frand2(), y = 50.0 * frand2();
+        double h, hx, hy, a, b, gx, gy;
+        if ( !terrainAt( tn, x, y, &h, &hx, &hy ) ) return 0;
+        terrainAt( tn, x + EPS, y, &a, &gx, &gy );
+        terrainAt( tn, x - EPS, y, &b, &gx, &gy );
+        double fdx = ( a - b ) / ( 2.0 * EPS );
+        terrainAt( tn, x, y + EPS, &a, &gx, &gy );
+        terrainAt( tn, x, y - EPS, &b, &gx, &gy );
+        double fdy = ( a - b ) / ( 2.0 * EPS );
+
+        double sc = 1.0 + fabs( hx ) + fabs( hy );
+        double e  = ( fabs( fdx - hx ) + fabs( fdy - hy ) ) / sc;
+        if ( e > worst ) worst = e;
+        if ( e > 1e-6 ) {
+            printf( "contact: FAIL: terrain gradient disagrees with finite differences at "
+                    "(%.4f, %.4f): analytic (%.6g, %.6g), differenced (%.6g, %.6g)\n",
+                    x, y, hx, hy, fdx, fdy );
+            return 1;
+        }
+    }
+    printf( "contact: ground: terrain gradient matches central differences to %.3e relative\n", worst );
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// G7 + G8: passivity, and the friction cone.
+//
+// Passivity is the same statement as the track harness's, and here it is
+// provable rather than empirical -- power = -(kn*g + c*ramp*gd)*gd, whose
+// second term is a square. The check is still worth running: it is what would
+// catch the one-sided clamp being dropped, or gd losing its sign.
+//
+// The cone is separate because it is about the friction term specifically:
+// |f_t| <= mu*|f_n|, and f_t must be perpendicular to the surface normal. A
+// tangential force with a normal component would quietly add to or subtract
+// from the load it is itself proportional to.
+// ---------------------------------------------------------------------------
+static int checkGroundPassivityAndCone( const Model *mdl, const GroundContactParams *prm ) {
+    if ( !mdl->ground.has ) return 0;
+    double worstPower = 0, worstCone = 0, worstPerp = 0;
+
+    for ( int t = 0 ; t < 200000 ; t++ ) {
+        double p[3], u[3], uz[3] = { 0, 0, 0 };
+        randomGroundPoint( &mdl->ground, p, u );
+
+        GndPointForce pf, p0;
+        if ( !gndPointForce( prm, &mdl->ground, p, u, &pf ) ) continue;
+        gndPointForce( prm, &mdl->ground, p, uz, &p0 );
+
+        double power = 0, mag = 0;
+        for ( int k = 0 ; k < 3 ; k++ ) {
+            power += ( pf.f[k] - p0.f[k] ) * u[k];
+            mag   += fabs( pf.f[k] - p0.f[k] ) * fabs( u[k] );
+        }
+        if ( power > worstPower ) worstPower = power;
+        if ( power > 1e-12 * ( mag > 1 ? mag : 1 ) ) {
+            printf( "contact: FAIL: the ground law does %.6g W of work at p = (%.4f, %.4f, %.4f), "
+                    "u = (%.3f, %.3f, %.3f) -- it is not passive\n",
+                    power, p[0], p[1], p[2], u[0], u[1], u[2] );
+            return 1;
+        }
+
+        // Split the total back into normal and tangential about the unit
+        // normal the law itself reported.
+        double fn = 0;
+        for ( int k = 0 ; k < 3 ; k++ ) fn += pf.f[k] * pf.n[k];
+        double ft[3], ftMag = 0;
+        for ( int k = 0 ; k < 3 ; k++ ) { ft[k] = pf.f[k] - fn * pf.n[k]; ftMag += ft[k]*ft[k]; }
+        ftMag = sqrt( ftMag );
+
+        double perp = 0;
+        for ( int k = 0 ; k < 3 ; k++ ) perp += ft[k] * pf.n[k];
+        double fScale = pf.fN > 1 ? pf.fN : 1.0;
+        if ( fabs( perp ) / fScale > worstPerp ) worstPerp = fabs( perp ) / fScale;
+
+        // mu*fN is the cone; the regularization only ever shrinks the friction
+        // below it, never above, so this is a hard bound with no tolerance
+        // beyond roundoff.
+        double lim = mdl->ground.mu * pf.fN;
+        double over = ftMag - lim;
+        if ( over / fScale > worstCone ) worstCone = over / fScale;
+        if ( over > 1e-9 * fScale ) {
+            printf( "contact: FAIL: friction %.6g N exceeds the cone mu*fN = %.6g N at "
+                    "p = (%.4f, %.4f, %.4f)\n", ftMag, lim, p[0], p[1], p[2] );
+            return 1;
+        }
+    }
+    printf( "contact: ground: passivity holds everywhere (worst power %.3e W); friction stays "
+            "inside the cone (worst excess %.3e relative) and normal to the surface (%.3e)\n",
+            worstPower, worstCone, worstPerp );
+    return 0;
+}
+
 int main( int argc, char **argv ) {
     const char *path = argc > 1 ? argv[ 1 ] : "../models/m113.mech";
     Model mdl;
@@ -541,17 +919,33 @@ int main( int argc, char **argv ) {
         fprintf( stderr, "contact: FAIL: %s\n", err );
         return 1;
     }
+    if ( groundContactCheckModel( &mdl, err, sizeof err ) ) {
+        fprintf( stderr, "contact: FAIL: %s\n", err );
+        return 1;
+    }
 
     TrackContactParams prm;
     trackContactDefaults( &mdl, &prm );
+    GroundContactParams gprm;
+    groundContactDefaults( &mdl, &gprm );
 
-    printf( "contact: %s: %d track band(s)\n", path, mdl.ntrack );
+    printf( "contact: %s: %d track band(s), %s\n", path, mdl.ntrack,
+            mdl.ground.has ? "ground declared" : "no ground" );
     if ( checkBalanceAndPurity( &mdl, &prm ) ) return 1;
     if ( checkSmoothness( &mdl, &prm ) )       return 1;
     if ( checkToothLaw( &mdl, &prm ) )         return 1;
     if ( checkDesignPose( &mdl, &prm ) )       return 1;
     if ( checkDriveTorque( &mdl, &prm ) )      return 1;
     if ( checkPassivity( &mdl, &prm ) )        return 1;
+
+    // Ground. Every one of these is inert on a model with no 'ground' block,
+    // except the balance check, which asserts the engine produces nothing at
+    // all -- the same thing the track checks assert for a model with no band.
+    if ( checkGroundBalance( &mdl, &gprm ) )          return 1;
+    if ( checkGroundSmoothness( &mdl, &gprm ) )       return 1;
+    if ( checkGroundGradient( &mdl, &gprm ) )         return 1;
+    if ( checkTerrainGradient( &mdl ) )               return 1;
+    if ( checkGroundPassivityAndCone( &mdl, &gprm ) ) return 1;
 
     printf( "contact: PASS\n" );
     return 0;

@@ -185,8 +185,34 @@
 //                                 positive tooth engagement. Both ends must be
 //                                 rigidly located in the root frame at the
 //                                 design pose
-//     ground <axis> <offset>      contact plane, e.g. 'ground z -0.55'
-//     kn/kt/mu <v>                contact material
+//     pad <z> <lx> <ly>           the shoe's ground-contact plate: shoe-local z
+//                                 of the pad face, then its footprint along x
+//                                 (link direction) and y (pin axis). The ground
+//                                 engine takes its four corners as contact
+//                                 points, so a band without it has no path to
+//                                 the ground
+//     kn/kt/mu <v>                roller contact material
+//
+// Ground
+// ------
+// At most one top-level 'ground' block. Top-level and not a 'track' key: there
+// is one ground and (typically) two bands, and a per-band copy of the terrain
+// is simply wrong once terrain stops being a constant. ('ground <axis>
+// <offset>' inside a track block was the old spelling; it was never read, and
+// modelLoad now rejects it rather than ignoring it.)
+//
+//   ground
+//     plane <nx> <ny> <nz> <d>    the terrain, as the plane n.x = d. The normal
+//                                 is normalized at load and must have nz > 0:
+//                                 terrain is a height field h(x,y), so it
+//                                 cannot be vertical or overhanging. Flat
+//                                 ground is 'plane 0 0 1 <z>'
+//     kn <v>                      normal stiffness PER CONTACT POINT
+//     mu <v>                      Coulomb friction, default 0.8
+//
+// The damping fraction is deliberately absent: it is ramped while a model
+// settles, so it belongs to the run and lives in the force engine's runtime
+// params, exactly as the track band's does.
 //
 // Expansion, done before coordinate layout so the shoes are counted into
 // nq/nv: N shoe BODIES -- a floating anchor shoe parented to the base (it is
@@ -319,14 +345,56 @@ typedef struct {
     double cg[3];
     double inertia[6];
     int hasFext;
-    double kn, kt, mu;       // contact material (for the force engine)
+    double kn, kt, mu;       // roller contact material (for the force engine)
     int nroller;
     ModelTrackRoller roller[ MODEL_MAX_ROLLERS ];
-    int hasGround; char groundAxis; double groundOffset;
+    // Ground pad: the flat plate on the outside of a shoe that actually touches
+    // the terrain, given as a plane at shoe-local z and a footprint. The ground
+    // engine takes its four corners as contact points. Without it a band has no
+    // path to the ground at all.
+    int hasPad;
+    double padZ;             // shoe-local z of the pad face (outward is -z)
+    double padLen, padWid;   // footprint along x (link direction) and y (pin axis)
     // filled during expansion:
     int shoe0;               // body index of the floating anchor shoe
     double linkLen;          // actual shoe length used = perimeter / N
 } ModelTrack;
+
+// Terrain: a HEIGHT FIELD h(x,y), never a general surface. Flat ground, a
+// slope, a sinusoid and (later) a sampled grid are all the same object and all
+// run through one evaluator, src/contact/terrain.h. That is what makes uneven
+// ground a new evaluator rather than a new force law -- see the note there on
+// why the vertical gap h(x,y) - z is the strain measure.
+typedef enum {
+    TERRAIN_NONE = 0,
+    TERRAIN_PLANE,           // h = ( d - nx*x - ny*y ) / nz
+} ModelTerrainKind;
+
+typedef struct {
+    ModelTerrainKind kind;
+    double n[3];             // unit normal, normalized at load; n[2] > 0
+    double d;                // plane offset: n . x = d
+} ModelTerrain;
+
+// The 'ground' block: at most one per model, and top-level rather than inside a
+// 'track' -- there is one ground and (typically) two bands, and the moment
+// terrain stops being a constant a per-band copy is simply wrong.
+//
+// kn and mu only, mirroring the track block's contact material. The damping
+// fraction lives in the runtime params struct instead, for the same reason the
+// track's does: it is RAMPED while the model settles, so it is a property of
+// the run and not of the terrain.
+typedef struct {
+    int has;
+    ModelTerrain terrain;
+    double kn;               // per contact point
+    double mu;
+    // filled during expansion: total ground contact points in the model. The
+    // ground engine derives its damping against M_total/npoint -- the mean
+    // static load share -- and NOT against a single shoe's mass; see the sizing
+    // note in groundContactDefaults.
+    int npoint;
+} ModelGround;
 
 typedef struct {
     int nbod;
@@ -349,6 +417,7 @@ typedef struct {
     int obsLen;              // fwd_dyn_observe_len = 6*npoi + 2*nelem
     int ntrack;
     ModelTrack track[ MODEL_MAX_TRACKS ];
+    ModelGround ground;
     double q0[ MODEL_MAX_Q ]; // design-pose coordinates: 0 / quaternion-identity
                               // for hand-written bodies, the curved band pose for
                               // generated shoes. Consumers seed initial q from this.
@@ -478,6 +547,7 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
     ModelLoop *curLoop = NULL;
     ModelElem *curElem = NULL;
     ModelTrack *curTrack = NULL;
+    ModelGround *curGround = NULL;
     char line[ 512 ];
     int lineNo = 0;
 
@@ -508,6 +578,7 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
             curLoop = NULL;
             curElem = NULL;
             curTrack = NULL;
+            curGround = NULL;
             memset( cur, 0, sizeof *cur );
             cur->parent = -1;
             cur->jtype = JOINT_REVOLUTE;
@@ -523,6 +594,7 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
             cur = NULL;
             curElem = NULL;
             curTrack = NULL;
+            curGround = NULL;
             memset( curLoop, 0, sizeof *curLoop );
             curLoop->pred = -2; // "unset" so validation can insist both ends are given
             curLoop->succ = -2;
@@ -535,6 +607,7 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
             curLoop = NULL;
             curElem = NULL;
             curTrack = NULL;
+            curGround = NULL;
             if ( m->npoi >= MODEL_MAX_POI ) {
                 snprintf( err, errSize, "%s:%d: too many pois (max %d)", path, lineNo, MODEL_MAX_POI );
                 goto fail;
@@ -558,6 +631,7 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
             cur = NULL;
             curLoop = NULL;
             curTrack = NULL;
+            curGround = NULL;
             if ( m->nelem >= MODEL_MAX_ELEM ) {
                 snprintf( err, errSize, "%s:%d: too many elements (max %d)", path, lineNo, MODEL_MAX_ELEM );
                 goto fail;
@@ -585,6 +659,7 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
                 snprintf( err, errSize, "%s:%d: too many tracks (max %d)", path, lineNo, MODEL_MAX_TRACKS );
                 goto fail;
             }
+            curGround = NULL;
             curTrack = &m->track[ m->ntrack++ ];
             memset( curTrack, 0, sizeof *curTrack );
             curTrack->root = -1;
@@ -597,6 +672,70 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
                     goto fail;
                 }
                 strcpy( curTrack->name, name );
+            }
+            continue;
+        }
+
+        if ( !strcmp( key, "ground" ) ) {
+            // 'ground' used to be a track key carrying an axis and an offset.
+            // It was never read by anything, so promoting it costs no
+            // behaviour -- but a silently ignored line would, so say what to
+            // write instead. Blocks here have no terminator, so a track is
+            // still "current" when a legitimate top-level ground follows it;
+            // the two forms are told apart by their ARGUMENTS, since the new
+            // block opener takes none.
+            char tail[ 8 ];
+            if ( sscanf( rest, " %7s", tail ) == 1 ) {
+                snprintf( err, errSize, "%s:%d: 'ground' is now an argument-less top-level block, "
+                                        "not a track key. Replace 'ground %s ...' with a 'ground' "
+                                        "block carrying 'plane <nx> <ny> <nz> <d>' plus 'kn'/'mu'",
+                          path, lineNo, tail );
+                goto fail;
+            }
+            if ( m->ground.has ) {
+                snprintf( err, errSize, "%s:%d: only one 'ground' block per model", path, lineNo );
+                goto fail;
+            }
+            cur = NULL;
+            curLoop = NULL;
+            curElem = NULL;
+            curTrack = NULL;
+            memset( &m->ground, 0, sizeof m->ground );
+            m->ground.has = 1;
+            m->ground.mu = 0.8;             // same default as the track material
+            curGround = &m->ground;
+            continue;
+        }
+
+        // Ground-block keys. Every block opener clears the others, so at most
+        // one of curGround/curTrack is live and 'plane' is unambiguous even
+        // though the track block has a 'plane' of its own.
+        if ( curGround ) {
+            if ( !strcmp( key, "plane" ) ) {
+                double n[3], d;
+                if ( sscanf( rest, "%lf %lf %lf %lf", &n[0], &n[1], &n[2], &d ) != 4 ) goto badArgs;
+                double len = sqrt( n[0]*n[0] + n[1]*n[1] + n[2]*n[2] );
+                if ( len < 1e-12 ) {
+                    snprintf( err, errSize, "%s:%d: ground plane normal is zero", path, lineNo );
+                    goto fail;
+                }
+                // A height field cannot represent a vertical or overhanging
+                // surface, and n[2] <= 0 would put the solid side on top.
+                if ( n[2] / len < 1e-6 ) {
+                    snprintf( err, errSize, "%s:%d: ground plane normal must point up (nz > 0); "
+                                            "terrain is a height field h(x,y) and cannot be vertical", path, lineNo );
+                    goto fail;
+                }
+                for ( int k = 0 ; k < 3 ; k++ ) curGround->terrain.n[k] = n[k] / len;
+                curGround->terrain.d = d / len;
+                curGround->terrain.kind = TERRAIN_PLANE;
+            } else if ( !strcmp( key, "kn" ) ) {
+                if ( sscanf( rest, "%lf", &curGround->kn ) != 1 ) goto badArgs;
+            } else if ( !strcmp( key, "mu" ) ) {
+                if ( sscanf( rest, "%lf", &curGround->mu ) != 1 ) goto badArgs;
+            } else {
+                snprintf( err, errSize, "%s:%d: unknown keyword '%s' in ground block", path, lineNo, key );
+                goto fail;
             }
             continue;
         }
@@ -650,11 +789,9 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
                 if ( strstr( rest, "drive" ) ) rr->isDrive = 1;
                 const char *tp = strstr( rest, "teeth" );
                 if ( tp ) sscanf( tp, "teeth %d", &rr->teeth );
-            } else if ( !strcmp( key, "ground" ) ) {
-                char ax[ 8 ] = "";
-                if ( sscanf( rest, "%7s %lf", ax, &curTrack->groundOffset ) != 2 ) goto badArgs;
-                curTrack->groundAxis = ax[0];
-                curTrack->hasGround = 1;
+            } else if ( !strcmp( key, "pad" ) ) {
+                if ( sscanf( rest, "%lf %lf %lf", &curTrack->padZ, &curTrack->padLen, &curTrack->padWid ) != 3 ) goto badArgs;
+                curTrack->hasPad = 1;
             } else {
                 snprintf( err, errSize, "%s:%d: unknown keyword '%s' in track block", path, lineNo, key );
                 goto fail;
@@ -927,6 +1064,21 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
             snprintf( err, errSize, "%s: track '%s': shoe mass must be positive", path, tr->name );
             goto fail;
         }
+        if ( tr->hasPad && ( tr->padLen <= 0 || tr->padWid <= 0 ) ) {
+            snprintf( err, errSize, "%s: track '%s': pad footprint must be positive (got %g x %g)",
+                      path, tr->name, tr->padLen, tr->padWid );
+            goto fail;
+        }
+        // A band with a pad but no ground has nothing to press against, and a
+        // ground with no padded band has nothing pressing on it. Neither is an
+        // error -- a model may legitimately be run in free fall, which is what
+        // every track model did before ground contact existed -- but a pad
+        // declared against no ground is a typo often enough to be worth saying.
+        if ( tr->hasPad && !m->ground.has ) {
+            fprintf( stderr, "%s: warning: track '%s' declares a ground pad but the model has no "
+                             "'ground' block -- the pad will never touch anything\n", path, tr->name );
+        }
+        if ( tr->hasPad ) m->ground.npoint += 4 * tr->shoes;
         int endIdx[ 2 ], nend = 0;
         for ( int r = 0 ; r < tr->nroller ; r++ ) {
             ModelTrackRoller *rr = &tr->roller[ r ];
@@ -984,6 +1136,33 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
         // for its shoe count, and any tooth force computed from them is noise.
         // Warn rather than fail: the band itself is still dynamically valid,
         // and track_demo says outright that its geometry is placeholder.
+        // A roller is carried by the PINS either side of it, so the shoe pitch
+        // has to be small against the roller. Two adjacent pins on a chord of
+        // length ds sit a distance sqrt(R^2 - ds^2/4) from the axle, so once
+        // ds >= 2R that distance is imaginary: the roller passes clean between
+        // consecutive pins and can never carry load, however stiff the contact
+        // is. Below that it still sags by R - sqrt(R^2 - ds^2/4), which is 3.4%
+        // of R at ds = R and grows fast.
+        //
+        // Warn rather than fail, like the tooth-pitch check below: the band is
+        // dynamically valid either way, and it is the vehicle standing up that
+        // silently stops working. (This is exactly how track_demo's road wheels
+        // were found to be unsupportable -- 0.464 m shoes on 0.15 m wheels.)
+        for ( int r = 0 ; r < tr->nroller ; r++ ) {
+            const ModelTrackRoller *rr = &tr->roller[ r ];
+            if ( ds >= 2.0 * rr->radius )
+                fprintf( stderr, "%s: warning: track '%s': shoe pitch %.6f m is at least twice the "
+                                 "radius %.4f of the roller on body %d -- that roller falls between "
+                                 "consecutive pins and can never carry load\n",
+                         path, tr->name, ds, rr->radius, rr->body );
+            else if ( ds > rr->radius )
+                fprintf( stderr, "%s: warning: track '%s': shoe pitch %.6f m exceeds the radius "
+                                 "%.4f of the roller on body %d -- the band sags %.1f%% of the "
+                                 "radius between pins\n",
+                         path, tr->name, ds, rr->radius, rr->body,
+                         100.0 * ( 1.0 - sqrt( 1.0 - ds*ds/( 4.0*rr->radius*rr->radius ) ) ) );
+        }
+
         for ( int r = 0 ; r < tr->nroller ; r++ ) {
             const ModelTrackRoller *rr = &tr->roller[ r ];
             if ( !rr->isDrive || rr->teeth <= 0 ) continue;

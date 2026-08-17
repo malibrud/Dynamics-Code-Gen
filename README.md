@@ -277,13 +277,18 @@ directly, rather than shelling out to a C compiler.
   after validation; on the original dev machine the 3-link chain runs at
   ~42 ns/call generated vs ~880 ns/call dense (~21x). The full table across
   every model is under [The H solve](#the-h-solve).
-- `src/contact` — the track-band contact force producer
-  (`track_contact.h`) and its test harness. Caller-side and stateless: it
-  reads a state, writes `fext`, and the generated dynamics never learns
-  contact exists. See [Track contact](#track-contact) below. The harness
-  links no generated code — it tests the force law, not the dynamics — so
-  `build.bat` runs it on every model, and models without a band assert they
-  produce no forces.
+- `src/contact` — two contact force producers and their shared test harness:
+  `track_contact.h` (shoe pins against the rollers they ride on) and
+  `ground_contact.h` (shoe pads against the terrain), the latter reading its
+  surface through `terrain.h`. Both are caller-side and stateless: they read a
+  state, write `fext`, and the generated dynamics never learns contact exists.
+  They are deliberately **independent of each other** — the shared surface is a
+  damping formula and a regularized-Coulomb expression, which is not worth
+  giving up the property that a mistake in one cannot be present in the other.
+  See [Track contact](#track-contact) and [Ground contact](#ground-contact)
+  below. The harness links no generated code — it tests the force laws, not the
+  dynamics — so `build.bat` runs it on every model, and models without a band or
+  without a ground assert they produce no forces.
 - `src/sim` — the trajectory harness: a plain-C semi-implicit Euler stepper
   (`integrate.h`, with the quaternion update ported out of the Chrono
   cross-check so it needs no SDK) plus the checks that only a trajectory can
@@ -536,8 +541,16 @@ Two things to know:
   correct either way; it is the initial geometry that is idealized.
 - **`pitch` is advisory.** The link length actually used is perimeter / N,
   reported as `linkLen`, since the shoes must close on the path exactly.
-- The contact data (`ground`, `kn`, `kt`, `mu`, `teeth`) is parsed and kept
-  for a contact force engine that this loader does not implement.
+- The contact data (`pad`, `kn`, `kt`, `mu`, `teeth`) is parsed and kept for the
+  contact force engines, which live outside this loader — see
+  [Track contact](#track-contact) and [Ground contact](#ground-contact).
+- **Shoe pitch has to stay well under the roller diameter.** A roller is carried
+  by the pins either side of it, so once the pitch reaches `2R` the roller passes
+  clean between two consecutive pins and can never carry load, however stiff the
+  contact is. `modelLoad` warns. This is not hypothetical: `track_demo` used to
+  declare 12 shoes on a 5.57 m perimeter — a 0.464 m pitch against 0.30 m road
+  wheels — and its hull sank straight through its own track the moment there was
+  a ground to stand on. It now has 40.
 
 ## Track contact
 
@@ -550,9 +563,9 @@ plane, and each roller's `radius`/`isDrive`/`teeth` since it landed, parsed
 and validated and then read by nothing but the two `end` pulleys.
 
 This stage implements shoe-against-roller contact for all seven rollers per
-band. Shoe-against-ground is **not** implemented yet, so the vehicle still
-does not stand up (see the note on gravity below, which is why that does not
-prevent any of this from being tested).
+band. Shoe-against-ground came next and is written up under
+[Ground contact](#ground-contact); the note on gravity below is why none of
+this needed it in order to be tested.
 
 **A caller-side force producer, not a change to the dynamics.** The step is
 
@@ -743,6 +756,142 @@ identically, whatever the contact model does. (The check starts after the
 ramp, because the artificial viscosity that drains the relaxation transient
 multiplies all of `qd`, rigid-body modes included, and is an external force
 while it is on.)
+
+That paragraph is now history rather than current state: with ground contact in
+the loop, the vehicle *does* stand up, `dP/dt = M·g` no longer holds on its own,
+and the momentum check had to be rebuilt around the ground impulse. See below.
+
+## Ground contact
+
+The M113 now stands on the ground under its own weight: 147 of its 504 shoe pads
+settle onto flat terrain carrying **1.114e5 N against a 1.111e5 N vehicle
+weight — 0.24% off**. That number is the headline check, and it is one an
+internal-only band could never have offered.
+
+**Flat ground and uneven ground are the same code path.** The force law reads a
+height field `h(x,y)` and its two first derivatives and nothing else, so a
+sloped plane, a sinusoid or a sampled grid are new cases in
+`src/contact/terrain.h` alone — they change no force law, no wrench
+bookkeeping, no energy budget and no test. Flat ground is not a special case at
+all; it is `plane 0 0 1 z`.
+
+**The vertical gap, not the perpendicular distance.** This is the one design
+decision everything else follows from. Take
+
+```
+g  = h(p.x, p.y) - p.z          > 0 = penetrating
+F  = ( kn·g + c·ramp(g)·ġ ) · ( -h_x, -h_y, 1 )        clamped at zero
+U  = ½·kn·g²
+```
+
+with the direction deliberately **not** normalized. Then, because
+`∇g = (h_x, h_y, -1)`:
+
+- `-∇U = -kn·g·∇g = kn·g·(-h_x, -h_y, 1)`, which is the elastic force verbatim.
+  The law is **exactly conservative on arbitrary terrain**, with no planarity
+  assumption and using only *first* derivatives of `h`.
+- `ġ = ∇g·u` exactly, so `power = F·u = -kn·g·ġ - c·ramp·ġ²`. The first term is
+  `-dU/dt`; the second is a square. The law is **exactly passive**, whatever the
+  terrain does, and the clamp can only ever zero it.
+
+The obvious alternative — penetration as perpendicular distance, force along the
+unit normal — is exact on a plane and *not the gradient of anything* on curved
+terrain. That is the same class of error as the sprocket tooth law's missing
+`g′(δ)·U₀` term, which cost two rounds of trajectory-energy debugging to find.
+Here it costs nothing to get right, and a check confirms it: finite-differencing
+`groundContactPotential` by translating the whole model matches the total elastic
+force to **1.4e-9 relative over 153 loaded states**.
+
+There is also **no engagement gate, no polar coordinates, no `atan2` and no
+branch cut**. `trkGate` exists because the tooth and lateral terms are gated
+potentials; nothing here is gated, and the one-sided `g > 0` test is the entire
+activation logic. Ground contact is genuinely simpler than roller contact.
+
+`ground` is a **top-level block**, not a `track` key — there is one ground and
+two bands, and a per-band copy stops making sense the moment terrain is a field.
+The old `ground <axis> <offset>` had been parsed and read by nothing since the
+band landed; `modelLoad` now rejects it rather than ignoring it, telling the
+author what to write instead. The shoe's own contact geometry is a `pad` line
+giving the plate's shoe-local `z` and footprint, from which the engine takes four
+corners per shoe — computed on demand, since materializing m113's 504 of them is
+exactly the sort of new model array that overflows the dense validator's stack.
+
+**Damping is derived against the supported mass, not the shoe mass.** Copying
+`c = 2ζ√(k·m)` with the shoe's own `m` — correct for a shoe bouncing on a
+roller — gives the *vehicle heave* mode ζ ≈ 0.06 and it rings for seconds. What
+rests on the ground is the vehicle, so the share is `M_total/n` with `n` the
+points expected to be carrying it. Only a band's lower run ever touches, so `n`
+is taken as a quarter of the declared pads: the conservative end, since assuming
+fewer points both stiffens the damping and shortens the step estimate. The
+harness prints the realized ζ after settling so the assumption is checkable.
+
+**The step size is set by friction, not by stiffness.** Regularized Coulomb has
+tangential slope `μ·f_n/v_eps`, which on m113 is four points of 4.3e4 N·s/m on an
+18 kg shoe — `dt < 2m/c ≈ 1.2e-4 s`, an order of magnitude tighter than the
+normal damper. The harness derives its `dt` from that rather than hard-coding one
+that happens to suit m113, which is how `track_demo` ends up at 1.4e-5 s. The
+tempting move of shrinking `v_eps` so a parked vehicle creeps less costs step
+size linearly.
+
+**What the harnesses had to change, and what got stronger.** The ground is not a
+body, so ground reactions are external and two long-standing checks stopped
+meaning what they said:
+
+| check | before | now |
+| --- | --- | --- |
+| Newton's third law | all contact internal, wrenches sum to zero | replaced: the wrench must match an independently written sum, **and land only on padded bodies** — with no reaction body, a wrench at the wrong index leaves no trace in any total |
+| linear momentum | `ΔP = M·g·Δt` identically | `ΔP = ∫(M·g + F_gnd)dt`, measured against the wrench the engine reports applying |
+| band interpenetration | must go down | a band that starts *tangent* has to compress to carry load; now "never crushed onto its axles", plus "if it started jammed it must have relaxed" |
+| — | — | **new: static equilibrium.** Settled ground load = vehicle weight |
+
+The momentum residual is asserted to be truncation rather than assumed to be:
+halving `dt` twice from 6.22e-5 takes it **33.4 → 4.91 → 1.64 N·s** against a
+scale that stays put at 8.25e5. A dropped reaction does not converge — it is
+order 1e5. (Pass an explicit `dt` to `sim_<model>.exe` to repeat that.) The
+normalization had to change too: dividing by the momentum present was right in
+free fall and meaningless once the vehicle is standing still, where it measures
+how quiet the settle happened to be rather than whether a force went missing.
+
+Five new checks in `src/contact/main.c`, all inert on models with no `ground`
+block, on top of the two above:
+
+| check | result on m113 |
+| --- | --- |
+| wrench vs an independent sum; lands only on padded bodies; deterministic | 1.8e-15 relative |
+| vertical sweep through the surface | 0.70 N step against a 2.24 N bound |
+| horizontal sweep across terrain | 0 N over 20 m |
+| **elastic force is exactly `-∇U`**, by finite-differencing the potential | 1.4e-9 relative, 153 loaded states |
+| terrain gradient vs central differences of its own height | exact |
+| passivity, friction cone `\|f_t\| ≤ μ·f_n`, and `f_t ⊥ n̂` | exact |
+
+The horizontal sweep is aimed at terrain that does not exist yet. On a plane it
+is trivially zero, which is the point of writing it now: when a sampled grid
+arrives, bilinear interpolation gives C0 heights and therefore a normal
+direction that snaps at every cell edge, and this is the check that will reject
+it and force a bicubic.
+
+**Not validated against Chrono, and not for the sprocket's reason.** Flat rigid
+ground *is* reproducible there, but Chrono's contact is its own penalty model
+with its own parameters, so accelerations would not agree to 1e-9 and forcing
+them to would be tuning one model against another. The analytic gates are
+strictly stronger and need no Chrono at all — which is also what the next stage
+is built around: slope holding below `tan θ = μ`, slope release above it at
+`g(sin θ - μ cos θ)`, sinkage `W/(n·kn)`, and tractive force `T/R` against
+sprocket torque.
+
+**What is deliberately not here.** Triangle meshes (C⁻¹ normals at edges, and
+they need a broadphase); unilateral constraints, for the same frozen-`nc` reason
+penalty contact was chosen for the band; and stateful stick friction, which would
+forfeit the random-state testability the whole harness rests on. Sphere-against-
+terrain — the honest replacement for `hmmwv`'s four shaker posts and `distance`
+"tire" rods — reintroduces exactly the gradient subtlety the vertical-gap point
+formulation avoids, so it waits.
+
+The remaining fidelity gap is unchanged and is the band's, not the ground's: the
+belt still wraps only the two `end` pulleys, so m113's road wheels start 0.22 m
+through the lower run and the settle has to relax that before it can stand. It
+does — 0.2237 → 0.0348 m over 4 s — but generalizing `trkBuildBelt` to the convex
+hull of every roller circle is what would make it clean.
 
 ## Force elements and points of interest
 

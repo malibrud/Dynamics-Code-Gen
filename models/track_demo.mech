@@ -36,7 +36,13 @@ fext 1                   # contact reaction from the track band
 body                     # 3: road wheel 1
 parent 0
 joint revolute y
-tree -0.35 0.5 0.0
+tree -0.35 0.5 0.20      # z chosen so the wheel is TANGENT to the belt's lower
+                         # run: the end pulleys sit at z 0.30 with radius 0.25,
+                         # so the run is at z 0.05, and 0.20 + 0.15 puts this
+                         # wheel exactly on it. Unlike m113 this model has no
+                         # road-wheel poke-through, which is the point -- it
+                         # exercises ground contact without the belt
+                         # idealization confounding the result
 mass 50
 cg 0 0 0
 inertia 2 3 2 0 0 0
@@ -45,7 +51,7 @@ fext 1
 body                     # 4: road wheel 2
 parent 0
 joint revolute y
-tree 0.35 0.5 0.0
+tree 0.35 0.5 0.20       # tangent to the lower run, as above
 mass 50
 cg 0 0 0
 inertia 2 3 2 0 0 0
@@ -54,17 +60,34 @@ fext 1
 track demo_band
 root 0
 plane xz
-shoes 12
-pitch 0.46
+shoes 40                            # not 12: a roller is carried by the pins
+                                    # either side of it, so the shoe pitch has
+                                    # to stay well under the roller DIAMETER or
+                                    # the wheel falls straight between two pins.
+                                    # 12 shoes gave a 0.464 m pitch against
+                                    # 0.30 m road wheels and the hull sank right
+                                    # through its own track. 40 gives 0.139 m
+pitch 0.139
 mass 5.0
 cg 0 0 0
 inertia 0.01 0.03 0.03 0 0 0
 fext 1
-roller 1 0.25 end drive teeth 9    # sprocket
+roller 1 0.25 end drive teeth 11   # sprocket: 2*pi*0.25/11 = 0.1428 m tooth
+                                   # pitch, within 2.5% of the 0.1393 shoe pitch
 roller 2 0.25 end                  # idler
 roller 3 0.15                       # road wheel 1
 roller 4 0.15                       # road wheel 2
-ground z 0
+pad -0.05 0.11 0.30                 # ground pad: 0.05 below the pin line, inset
+                                    # from the 0.139 link so adjacent pads do
+                                    # not put corners on the shared pins
 kn 3.5e6
 kt 1.0e6
+mu 0.8
+
+# Ground. The lower run is tangent to all four rollers at z = 0.05 and the pad
+# face is 0.05 below that, so the design pose IS the ride height and the model
+# starts at zero penetration -- it sinks by its static deflection and no more.
+ground
+plane 0 0 1 0.0
+kn 2.0e5
 mu 0.8

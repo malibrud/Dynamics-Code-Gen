@@ -113,16 +113,26 @@
 #   All passive (no 'input'). Chrono's nonlinear shock/tensioner maps are not
 #   used; these are the linear JSON coefficients.
 #
-# WHAT HOLDS THIS UP. Nothing, yet. A tracked vehicle's only path to the
-# ground is through the band, and the track contact engine is not implemented
-# (the 'ground'/kn/kt/mu data below is parsed and carried, not used), so at
-# the design pose the hull is in free fall, the road wheels hang on their
-# preloaded torsion bars, the band hangs free, and each tensioner -- 0.27 m
-# inside its free length with no track tension to react it -- shoves its
-# carrier rearward at ~2.7e5 N. That is the honest state of a vehicle model
-# whose contact forces have to be supplied from outside: apply them through
-# fext on the shoes and road wheels (both carry 'fext 1'), exactly as the
-# wheeled models take tire loads through their spindles.
+# WHAT HOLDS THIS UP. Two contact engines in series, both external to the
+# generated dynamics and both applied through 'fext' (shoes, sprockets, idlers
+# and road wheels all carry 'fext 1'), exactly as the wheeled models take tire
+# loads through their spindles:
+#
+#   src/contact/track_contact.h   shoe pins against the seven rollers per side
+#   src/contact/ground_contact.h  shoe pads against the terrain, via the
+#                                 'ground' block at the foot of this file
+#
+# So the load path is ground -> pad -> shoe -> pin -> road wheel -> trailing arm
+# -> torsion bar -> hull, which is the real one. Neither engine touches the
+# generated code; both are caller-side force producers.
+#
+# At the DESIGN POSE this is still not an equilibrium, and deliberately so: the
+# belt wraps only the two end pulleys, so the road wheels poke 0.17-0.25 m
+# through the lower run and each tensioner sits 0.27 m inside its free length
+# with no track tension yet to react it, shoving its carrier rearward at
+# ~2.7e5 N. src/sim/main.c ramps both engines' stiffness in over 0.2 s and lets
+# the band relax through the same force law that runs afterwards, rather than
+# through a separate assembly path.
 #
 # q layout (nq 171, nv 168): hull q[0..6] (quat + pos) v[0..5]; then the 26
 # assembly joints one slot each; then each band's anchor shoe (quat + pos 7 /
@@ -545,7 +555,9 @@ roller 7 0.305                      # road wheel 2
 roller 9 0.305                      # road wheel 3
 roller 11 0.305                     # road wheel 4
 roller 13 0.305                     # road wheel 5
-ground z -0.55
+pad -0.03 0.12 0.36                 # ground pad: face 0.03 below the pin line,
+                                    # inset from the 0.1504 link so adjacent
+                                    # pads do not stack corners on shared pins
 kn 2e5
 kt 2e5
 mu 0.8
@@ -566,7 +578,24 @@ roller 20 0.305
 roller 22 0.305
 roller 24 0.305
 roller 26 0.305
-ground z -0.55
+pad -0.03 0.12 0.36
 kn 2e5
 kt 2e5
+mu 0.8
+
+# ---------------------------------------------------------------------------
+# GROUND. Flat, at z = -0.55: the settled lower run rests on the road wheels
+# (centres z = -0.215, radius 0.305, so the pin line lands at -0.52) and the pad
+# face is 0.03 below that. The design pose above is therefore ALREADY the ride
+# height -- the vehicle needs no drop, which is why src/sim/main.c only ever
+# lifts a model clear of the ground and never lowers one onto it.
+#
+# kn is sized per contact point: 208 pads carry the 1.11e5 N vehicle weight at
+# about 534 N each, so 1.1e5 N/m gives ~5 mm sinkage. That is deliberately close
+# to the band's own kn 2e5, so the two springs in series contribute comparable
+# deflection and neither one dominates the ride height.
+# ---------------------------------------------------------------------------
+ground
+plane 0 0 1 -0.55
+kn 1.1e5
 mu 0.8
