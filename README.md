@@ -409,8 +409,10 @@ unlike track contact's 9.5%: it needed `fext 1` only on the shoes, which already
 had it, so no new inverse-transform blocks were emitted.
 
 Both engines run about 8–13 ns per pair or per point. They are all-pairs with no
-culling — `m113` evaluates 882 roller pairs to find ~61 loaded and 504 pad
-corners to find ~147 — so the cost is set by the declared counts rather than by
+culling — `m113` tests all 63x7x2 = 882 shoe-pin-against-roller pairs to find
+the ~61 actually pressed into a cylinder, and all 504 pad corners to find the
+~147 actually on the ground (both counts are pairs and corners, not rollers or
+shoes: the model declares only 14 rollers in total) — so the cost is set by the declared counts rather than by
 what is touching, which is also why a random state is a fair place to measure
 them. A broadphase would save ~4% of the step and cost a persistent contact set,
 so it has not been written.

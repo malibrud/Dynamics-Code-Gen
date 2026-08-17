@@ -164,7 +164,7 @@ static void reportContact( const char *path, double nsGen ) {
     printf( "bench: %s: contact-in-the-loop step budget\n", path );
     printf( "bench:   denseKinematics    %8.1f ns  %5.1f%%\n", nsBase, 100.0*nsBase/step );
     if ( pairs )
-        printf( "bench:   trackContactFext   %8.1f ns  %5.1f%%   %d pairs, %.1f ns/pair\n",
+        printf( "bench:   trackContactFext   %8.1f ns  %5.1f%%   %d shoe-roller pairs, %.1f ns/pair\n",
                 nsTrk, 100.0*nsTrk/step, pairs, nsTrk / pairs );
     if ( pts )
         printf( "bench:   groundContactFext  %8.1f ns  %5.1f%%   %d points, %.1f ns/point\n",
