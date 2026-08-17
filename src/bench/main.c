@@ -13,6 +13,8 @@
 #include <stdio.h>
 #include <windows.h>
 #include "../validate/dense.h"
+#include "../contact/track_contact.h"
+#include "../contact/ground_contact.h"
 
 // The generated implementation (compiled from build/dynamics.c).
 void fwd_dyn_crba( double *q, double *qd, double *tau, double *fext, double *act, double *out_qdd );
@@ -70,6 +72,109 @@ static double benchOne( FdFn fn, double minSeconds, double *checksumPerCall ) {
     return elapsed * 1e9 / (double)calls;
 }
 
+// ---------------------------------------------------------------------------
+// Contact force producers (src/contact). These are not part of the generated
+// dynamics -- they are caller-side, and a step that uses them costs
+// denseKinematics + the producers + fwd_dyn_crba -- so they are timed and
+// reported separately rather than folded into the comparison above.
+//
+// WHY A RANDOM STATE IS A FAIR PLACE TO MEASURE THEM, even though contact is
+// nominally state-dependent: both engines are all-pairs with no culling. Every
+// (shoe, roller) pair and every pad corner is visited on every call, and only
+// the force arithmetic is skipped when a pair is out of range. So the cost is
+// set by the DECLARED counts rather than by how many pairs happen to be
+// loaded, which is also what the per-pair figures below are normalized
+// against. Measured against a settled m113 the difference is well under the
+// run-to-run spread.
+//
+// Each producer is timed as (kinematics + zero + producer) and differenced
+// against (kinematics + zero), so every sample runs at a different state
+// instead of repeatedly re-walking one frozen configuration.
+// ---------------------------------------------------------------------------
+static double cXa[ MODEL_MAX_BODIES ][6][6];   // static: 590 KB, blows the stack
+static double cVb[ MODEL_MAX_BODIES ][6];
+static double cFext[ MODEL_MAX_BODIES * 6 ];
+static TrackContactParams  g_tprm;
+static GroundContactParams g_gprm;
+static double g_sink;                          // keeps the calls from being elided
+
+typedef void (*ContactFn)( int s );
+
+static void cBase( int s ) {
+    denseKinematics( &g_mdl, qs[s], qds[s], cXa, cVb );
+    memset( cFext, 0, g_mdl.nbod * 6 * sizeof *cFext );
+    g_sink += cXa[0][0][0];
+}
+static void cTrack( int s ) {
+    cBase( s );
+    trackContactFext( &g_mdl, &g_tprm, cXa, cVb, cFext );
+    g_sink += cFext[5];
+}
+static void cGround( int s ) {
+    double ft[6];
+    cBase( s );
+    groundContactFext( &g_mdl, &g_gprm, cXa, cVb, cFext, ft );
+    g_sink += ft[5];
+}
+
+// Same batching discipline as benchOne, but min-of-3 because these figures are
+// produced by differencing and so carry twice the noise.
+static double benchContact( ContactFn fn, double minSeconds ) {
+    LARGE_INTEGER freq, t0, t1;
+    QueryPerformanceFrequency( &freq );
+    double best = 1e30;
+
+    for ( int rep = 0 ; rep < 3 ; rep++ ) {
+        long long calls = 0;
+        double elapsed = 0;
+        QueryPerformanceCounter( &t0 );
+        do {
+            for ( int b = 0 ; b < 200 ; b++ ) {
+                fn( (int)( calls & ( NSTATES - 1 ) ) );
+                calls++;
+            }
+            QueryPerformanceCounter( &t1 );
+            elapsed = (double)( t1.QuadPart - t0.QuadPart ) / (double)freq.QuadPart;
+        } while ( elapsed < minSeconds );
+        double ns = elapsed * 1e9 / (double)calls;
+        if ( ns < best ) best = ns;
+    }
+    return best;
+}
+
+static void reportContact( const char *path, double nsGen ) {
+    if ( !g_mdl.ntrack && !g_mdl.ground.has ) return;
+
+    trackContactDefaults ( &g_mdl, &g_tprm );
+    groundContactDefaults( &g_mdl, &g_gprm );
+
+    int pairs = 0;
+    for ( int t = 0 ; t < g_mdl.ntrack ; t++ )
+        pairs += g_mdl.track[t].shoes * g_mdl.track[t].nroller;
+    int pts = g_mdl.ground.npoint;
+
+    benchContact( cBase, 0.05 );                       // warm-up
+    double nsBase = benchContact( cBase,   0.30 );
+    double nsTrk  = benchContact( cTrack,  0.30 ) - nsBase;
+    double nsGnd  = benchContact( cGround, 0.30 ) - nsBase;
+    if ( nsTrk < 0 ) nsTrk = 0;
+    if ( nsGnd < 0 ) nsGnd = 0;
+
+    double step = nsBase + nsTrk + nsGnd + nsGen;
+    printf( "bench: %s: contact-in-the-loop step budget\n", path );
+    printf( "bench:   denseKinematics    %8.1f ns  %5.1f%%\n", nsBase, 100.0*nsBase/step );
+    if ( pairs )
+        printf( "bench:   trackContactFext   %8.1f ns  %5.1f%%   %d pairs, %.1f ns/pair\n",
+                nsTrk, 100.0*nsTrk/step, pairs, nsTrk / pairs );
+    if ( pts )
+        printf( "bench:   groundContactFext  %8.1f ns  %5.1f%%   %d points, %.1f ns/point\n",
+                nsGnd, 100.0*nsGnd/step, pts, nsGnd / pts );
+    printf( "bench:   fwd_dyn_crba       %8.1f ns  %5.1f%%\n", nsGen, 100.0*nsGen/step );
+    printf( "bench:   full step          %8.1f ns  (contact %.1f%%, %.0f steps/s)\n",
+            step, 100.0*( nsBase + nsTrk + nsGnd )/step, 1e9/step );
+    if ( g_sink == 12345.6789 ) printf( "bench: (unreachable %g)\n", g_sink );
+}
+
 int main( int argc, char **argv ) {
     const char *path = argc > 1 ? argv[ 1 ] : "../models/threelink.mech";
     char err[ 256 ];
@@ -109,5 +214,6 @@ int main( int argc, char **argv ) {
     printf( "bench: generated sparse  %8.1f ns/call  (checksum/call %+.6f)\n", nsGen, csGen );
     printf( "bench: dense reference   %8.1f ns/call  (checksum/call %+.6f)\n", nsDense, csDense );
     printf( "bench: speedup %.1fx\n", nsDense / nsGen );
+    reportContact( path, nsGen );
     return 0;
 }

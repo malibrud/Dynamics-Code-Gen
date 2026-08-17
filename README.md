@@ -384,6 +384,44 @@ contact reactions through the bearing into the hull rather than lumping them
 into `tau`; the rest of the table is untouched and was measured in a single
 earlier session, so it is left as it was rather than half-rewritten.)
 
+(The `track_demo` row also predates [Ground contact](#ground-contact), which
+raised that model from 12 shoes to 40 — 17 bodies to 45 — because 12 could not
+physically stand. Its generated call went 1.6 -> 22.9 us with it. That is the
+model getting bigger, not the solver getting worse.)
+
+**Where a contact step actually goes.** `bench_<model>.exe` reports a step
+budget for any model with a band or a ground, since the producers are
+caller-side and a real step costs `denseKinematics` + both producers +
+`fwd_dyn_crba`:
+
+| | m113 | track_demo |
+| --- | ---: | ---: |
+| `denseKinematics` | 14.0 us (7.2%) | 4.0 us (13.2%) |
+| `trackContactFext` | 7.1 us (3.6%) | 1.4 us (4.6%) |
+| `groundContactFext` | 5.7 us (2.9%) | 2.1 us (6.8%) |
+| `fwd_dyn_crba` | 167.5 us (86.2%) | 22.9 us (75.5%) |
+| **full step** | **194 us**, contact 13.8% | **30 us**, contact 24.5% |
+
+Two things worth reading off that. **Contact is not the bottleneck** — the
+generated solve outweighs both engines and the kinematics they share by better
+than 5:1 on `m113`. And **ground contact cost nothing in the generated code**,
+unlike track contact's 9.5%: it needed `fext 1` only on the shoes, which already
+had it, so no new inverse-transform blocks were emitted.
+
+Both engines run about 8–13 ns per pair or per point. They are all-pairs with no
+culling — `m113` evaluates 882 roller pairs to find ~61 loaded and 504 pad
+corners to find ~147 — so the cost is set by the declared counts rather than by
+what is touching, which is also why a random state is a fair place to measure
+them. A broadphase would save ~4% of the step and cost a persistent contact set,
+so it has not been written.
+
+The real lever is **`dt`, not the per-step cost.** Regularized Coulomb has
+tangential slope `mu*f_n/v_eps`, an order of magnitude stiffer than the normal
+damper, and it holds `m113` to 6.2e-5 s where the band alone ran happily at
+1e-4 — so `src/sim` derives its step from that rather than hard-coding one.
+`m113` settles at about 0.35x realtime; recovering the full step would take it
+to ~0.57x, a bigger win than deleting contact entirely.
+
 Every model got faster; the gains track how branchy each one is. `m113` is 2.9x
 (433 -> 148 us, ~6.8 kHz), `hmmwv_pitman` 5.1x. The generated file also shrank
 ~75 KB, since only `H`'s lower triangle is now written — the factorization and
