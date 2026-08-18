@@ -1,0 +1,95 @@
+# The smallest thing that exercises ROAD-WHEEL FACE CONTACT.
+#
+# One band, one road wheel, 16 shoes. Everything else is the minimum the track
+# block requires: a floating hull to carry the weight, and the two 'end' pulleys
+# that define the belt path. m113 has 2 bands x 63 shoes x 7 rollers = 882 pin
+# pairs and 504 ground pads; this has 16 shoes, 3 rollers and 64 pads, and one
+# single face pair under load at a time. When the energy budget or the
+# penetration gate trips here, the failing pair can be printed by hand.
+#
+# GEOMETRY IS EXACTLY TANGENT ON PURPOSE. Every round number below is chosen so
+# the design pose is the equilibrium pose to within the static deflection:
+#
+#   end pulleys   z 0.30, radius 0.25   ->  lower run of the belt at z 0.05
+#   road wheel    z 0.20, radius 0.15   ->  bottom at z 0.05, ON the run
+#   thickness     0.05 above padZ -0.05 ->  running face at shoe-local z 0, i.e.
+#                                           on the pin line, i.e. z 0.05 world
+#   pad face      0.05 below the run    ->  z 0.00 world
+#   ground        plane z 0.00          ->  zero penetration at t = 0
+#
+# So the model starts with the road wheel exactly touching the face and the pads
+# exactly touching the ground. It should sink by its static deflection and stop.
+# Any other motion is the contact law, not the pose.
+
+gravity 0 0 -9.81
+stab 0.05
+
+body                     # 0: hull, free-flying
+parent -1
+joint floating
+tree 0 0 0
+mass 2000
+cg 0 0 0.35
+inertia 400 900 1000 0 0 0
+fext 1
+
+body                     # 1: drive sprocket (rear end pulley)
+parent 0
+joint revolute y
+tree -0.5 0 0.30
+mass 60
+cg 0 0 0
+inertia 2 4 2 0 0 0
+fext 1
+
+body                     # 2: idler (front end pulley)
+parent 0
+joint revolute y
+tree 0.5 0 0.30
+mass 60
+cg 0 0 0
+inertia 2 4 2 0 0 0
+fext 1
+
+body                     # 3: road wheel -- the ONLY face-contact roller
+parent 0
+joint revolute y
+tree 0 0 0.20            # 0.20 + 0.15 = 0.35 = 0.30 + 0.25 - 0.10, i.e. its
+                         # bottom sits exactly on the lower run. Rigidly mounted
+                         # (no trailing arm, no spring) so that a face force is
+                         # reacted straight into the hull and nothing else can
+                         # store energy between the two.
+mass 50
+cg 0 0 0
+inertia 2 3 2 0 0 0
+fext 1
+
+track band
+root 0
+plane xz
+shoes 16                            # belt perimeter is 2*1.0 + 2*pi*0.25 =
+                                    # 3.570796 m, so the link comes out at
+                                    # 0.223175 -- under the 0.25 end-roller
+                                    # radius, so the pins carry the sprocket
+                                    # and idler without sagging between them
+pitch 0.223175
+mass 8.0
+cg 0 0 0
+inertia 0.02 0.05 0.05 0 0 0
+fext 1
+roller 1 0.25 end drive teeth 7     # 2*pi*0.25/7 = 0.224399, 0.5% off the link
+roller 2 0.25 end                   # idler
+roller 3 0.15                       # road wheel: face contact, not pin contact
+pad -0.05 0.18 0.30                 # inset from the 0.2232 link so adjacent
+                                    # pads do not stack corners on a shared pin
+thickness 0.05                      # running face at shoe-local z 0
+kn 3.5e6
+kt 1.0e6
+mu 0.8
+
+# Total mass 2000 + 60 + 60 + 50 + 16*8 = 2298 kg, W = 22544 N. With 64 declared
+# pads and a quarter of them loaded, kn 2.5e5 gives ~5.6 mm of static sinkage.
+ground
+plane 0 0 1 0.0
+kn 2.5e5
+mu 0.8

@@ -73,17 +73,17 @@
 # shoe chain is parented to the BASE, not the hull, exactly like the
 # quartercar spindle: it is held in place by contact, not by a mount.
 #
-#   ONE FIDELITY NOTE. The loader's belt is the taut band around the TWO 'end'
-#   pulleys only (sprocket + idler), so at the design pose its lower run is
-#   the straight sprocket-to-idler tangent and the five road wheels, whose
-#   bottoms reach z = -0.52, poke through it. The real lower run is pushed
-#   down onto the road wheels. Consequences: the design-pose shoe positions
-#   along the bottom are high by up to ~0.15 m, and the band perimeter comes
-#   out 9.4745 m rather than 63 x 0.154 = 9.702 m, so the generated link
-#   length is 0.15039 rather than the real 0.154 pitch (2.3% short -- almost
-#   exactly the road-wheel wrap the two-pulley idealization leaves out). The
-#   band is dynamically correct either way (63 shoes, correct mass/inertia,
-#   a closed chain); it is the initial geometry that is idealized.
+#   THE BELT IS THE CONVEX HULL of all seven roller circles, not the taut band
+#   around the two 'end' pulleys. That distinction used to matter a great deal:
+#   a two-pulley belt runs straight from sprocket to idler, and the five road
+#   wheels -- bottoms at z = -0.52 -- poked up to 0.22 m through their own
+#   track at the design pose. Wrapping the full hull is what a real lower run
+#   does, and it closes the gap: the design pose now sits within 0.009 m of
+#   equilibrium, and the perimeter comes out near 63 x 0.154 = 9.702 m instead
+#   of 2.3% short, so the generated link length agrees with the declared pitch
+#   and with the sprocket's tooth pitch. The band was dynamically correct
+#   either way (63 shoes, correct mass/inertia, a closed chain); it was the
+#   initial geometry that was idealized, and now is not.
 #
 # Force elements (18: 10 torsion bars, 6 shocks, 2 tensioners; 16 POIs):
 #   torsion_[LR][1-5]  rsda on the arm joint. Chrono's torsional spring is
@@ -104,12 +104,16 @@
 #                      rotation, never a spurious length change from hull
 #                      heave (the halfcar lesson).
 #   tens_[LR]          tsda, the idler tensioner: k = 1e6 N/m, c = 1.4e4,
-#                      free length 0.75, preload 2e4 N. Preload folds into the
-#                      free length the same way (f = k(l - l0) is tension
-#                      here, so l0 = 0.75 + 2e4/1e6 = 0.77). At the design
-#                      pose the anchors are 0.5 apart, well inside l0, so the
-#                      element pushes -- driving the carrier rearward, which
-#                      is exactly how it tensions the track.
+#                      preload 2e4 N. At the design pose the anchors are 0.50
+#                      apart and the element PUSHES, driving the carrier
+#                      rearward, which is how it tensions the track. l0 is
+#                      therefore set from the design length, not from a free
+#                      length: l0 = 0.50 + 2e4/1e6 = 0.52 delivers exactly the
+#                      2e4 N preload there. (It read 0.77 for a while, from
+#                      folding the preload into a 0.75 free length that the
+#                      0.50 anchor spacing does not match -- that compresses
+#                      the spring 0.27 m and preloads the band at 2.7e5 N,
+#                      thirteen times what this comment claims.)
 #   All passive (no 'input'). Chrono's nonlinear shock/tensioner maps are not
 #   used; these are the linear JSON coefficients.
 #
@@ -510,7 +514,8 @@ l0 0.63174
 # ---------------------------------------------------------------------------
 # Idler tensioners: hull anchor forward of the carrier anchor, so the
 # compressed spring drives the carrier rearward and tensions the band.
-# l0 = free length + preload/k = 0.75 + 2e4/1e6 = 0.77.
+# l0 = design anchor spacing + preload/k = 0.50 + 2e4/1e6 = 0.52, which is
+# what makes the preload at the design pose the 2e4 N intended.
 # ---------------------------------------------------------------------------
 
 poi tens_L_hull     0 -3.45 0.8795 -0.12
@@ -520,7 +525,7 @@ from tens_L_hull
 to tens_L_carrier
 k 1e6
 c 1.4e4
-l0 0.77
+l0 0.52
 
 poi tens_R_hull     0 -3.45 -0.8795 -0.12
 poi tens_R_carrier 15 0 0.2 0
@@ -529,7 +534,7 @@ from tens_R_hull
 to tens_R_carrier
 k 1e6
 c 1.4e4
-l0 0.77
+l0 0.52
 
 # ---------------------------------------------------------------------------
 # The two track bands. 63 single-pin shoes each, riding sprocket + idler (the
@@ -558,7 +563,24 @@ roller 13 0.305                     # road wheel 5
 pad -0.03 0.12 0.36                 # ground pad: face 0.03 below the pin line,
                                     # inset from the 0.1504 link so adjacent
                                     # pads do not stack corners on shared pins
-kn 2e5
+thickness 0.03                      # pad face to inner running face, which the
+                                    # ROAD WHEELS roll on (the pins engage only
+                                    # the sprocket and idler). 0.03 puts that
+                                    # face exactly on the pin plane, so road
+                                    # wheel ride height is unchanged
+kn 2.5e6                            # sized for FACE contact, which is a very
+                                    # different load path from the pins. A pin
+                                    # wrap engages ~10 pins at once and they
+                                    # share the roller's load, so 2e5 was ample;
+                                    # the running face is a partition of unity
+                                    # whose weights sum to exactly 1, so ONE
+                                    # shoe's stiffness carries a whole wheel.
+                                    # 1.11e5 N over 10 road wheels is 1.11e4 N
+                                    # each, so 2.5e6 gives 4.4 mm of face
+                                    # deflection; 2e5 gave 55 mm and the wheels
+                                    # sank through the band. This is why
+                                    # track_min and track_demo, authored after
+                                    # the face law, both sit near 3.5e6
 kt 2e5
 mu 0.8
 
@@ -579,7 +601,20 @@ roller 22 0.305
 roller 24 0.305
 roller 26 0.305
 pad -0.03 0.12 0.36
-kn 2e5
+thickness 0.03
+kn 2.5e6                            # sized for FACE contact, which is a very
+                                    # different load path from the pins. A pin
+                                    # wrap engages ~10 pins at once and they
+                                    # share the roller's load, so 2e5 was ample;
+                                    # the running face is a partition of unity
+                                    # whose weights sum to exactly 1, so ONE
+                                    # shoe's stiffness carries a whole wheel.
+                                    # 1.11e5 N over 10 road wheels is 1.11e4 N
+                                    # each, so 2.5e6 gives 4.4 mm of face
+                                    # deflection; 2e5 gave 55 mm and the wheels
+                                    # sank through the band. This is why
+                                    # track_min and track_demo, authored after
+                                    # the face law, both sit near 3.5e6
 kt 2e5
 mu 0.8
 

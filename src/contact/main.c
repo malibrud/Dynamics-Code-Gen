@@ -531,6 +531,233 @@ static int checkPassivity( const Model *mdl, const TrackContactParams *prm ) {
 }
 
 // ===========================================================================
+// 8, 9, 10: the ROAD-WHEEL FACE law.
+//
+// Every check above drives trkPairForce, which since the face primitive landed
+// is the SPROCKET AND IDLER path only. A road wheel never reaches it, so all
+// of them stayed clean while the face law was free to do as it liked --
+// checkPassivity in particular printed "worst power 0.000e+00 W" for a model
+// whose face friction was injecting 5e6 J over a four-second settle, because
+// the states it sampled went through a function the wheels no longer use.
+// These three drive trkFaceForce directly, the same way.
+// ===========================================================================
+
+// Any non-'end' roller will do; returns 0 if the model has no road wheels.
+static const ModelTrack *faceFixture( const Model *mdl, const ModelTrackRoller **roOut ) {
+    for ( int t = 0 ; t < mdl->ntrack ; t++ ) {
+        const ModelTrack *tr = &mdl->track[ t ];
+        for ( int r = 0 ; r < tr->nroller ; r++ )
+            if ( !tr->roller[ r ].isEnd ) { *roOut = &tr->roller[ r ]; return tr; }
+    }
+    return 0;
+}
+
+// An axle position straddling the face in all three directions, and velocities
+// reaching well past vEps, so approach, separation, spin-up and lateral slip
+// all occur.
+static void randomFaceState( const ModelTrack *tr, const ModelTrackRoller *ro,
+                             double c[3], double uc[3], double us[3] ) {
+    double runZ = tr->padZ + tr->thickness;
+    c[0] = tr->linkLen * ( 0.5 + 1.5*frand2() );        // reaches past both ends
+    c[1] = 0.05 * frand2();
+    c[2] = runZ + ro->radius * ( 1.0 + 0.20*frand2() );
+    for ( int k = 0 ; k < 3 ; k++ ) { uc[k] = 5.0 * frand2(); us[k] = 5.0 * frand2(); }
+}
+
+// ---------------------------------------------------------------------------
+// 8: the partition of unity, as an identity rather than through a model. Shoes
+// tile the band end to end, so one world point is at local x on one shoe,
+// x - linkLen on the next and x + linkLen on the previous. Those weights must
+// sum to exactly 1 and their slopes to exactly 0, or support is dropped or
+// doubled at every pin -- which an explicit integrator answers with chatter.
+// dw is checked against central differences too, since it is dw that carries
+// the tangential half of the gradient.
+// ---------------------------------------------------------------------------
+static int checkFacePartition( const Model *mdl, const TrackContactParams *prm ) {
+    const ModelTrackRoller *ro;
+    const ModelTrack *tr = faceFixture( mdl, &ro );
+    if ( !tr ) return 0;
+
+    double L = tr->linkLen, fade = prm->faceFade * L;
+    double worstSum = 0, worstSlope = 0, worstD = 0;
+
+    for ( int i = 0 ; i <= 20000 ; i++ ) {
+        double x = L * ( (double)i / 20000.0 );         // one full link
+        double sum = 0, slope = 0;
+        for ( int k = -3 ; k <= 3 ; k++ ) {             // every shoe that can reach
+            double dw, w = trkFaceW( x + k*L, L, fade, &dw );
+            sum += w; slope += dw;
+        }
+        if ( fabs( sum - 1.0 ) > worstSum )   worstSum   = fabs( sum - 1.0 );
+        if ( fabs( slope )     > worstSlope ) worstSlope = fabs( slope );
+
+        double h = 1e-6 * L, dw;
+        trkFaceW( x, L, fade, &dw );
+        double fd = ( trkFaceW( x + h, L, fade, 0 ) - trkFaceW( x - h, L, fade, 0 ) ) / ( 2*h );
+        double err = fabs( dw - fd ) * fade;             // scaled by the 1/fade slope
+        if ( err > worstD ) worstD = err;
+    }
+    if ( worstSum > 1e-12 || worstSlope > 1e-9 ) {
+        printf( "contact: FAIL: face weights do not partition unity across a joint "
+                "(worst |sum - 1| %.3e, worst |sum of slopes| %.3e)\n", worstSum, worstSlope );
+        return 1;
+    }
+    if ( worstD > 1e-5 ) {
+        printf( "contact: FAIL: face weight slope disagrees with central differences by "
+                "%.3e relative\n", worstD );
+        return 1;
+    }
+    printf( "contact: face: weights partition unity across every joint (worst |sum - 1| %.3e, "
+            "slopes %.3e), dw matches central differences to %.3e\n",
+            worstSum, worstSlope, worstD );
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// 9: force = grad U for the face law, by finite difference against an
+// INDEPENDENTLY WRITTEN potential -- the weight is restated here rather than
+// reused, since it is the weight that carries the trap. U = w(x) * U0 is a
+// gated potential, so the gradient has a tangential term U0*w'(x) beside the
+// normal one; that is the same shape as the sprocket tooth law's missing
+// g'(delta)*U0 term, and it is worth testing at a state rather than waiting
+// for a trajectory to notice. trkFaceForce reports the force ON THE SHOE,
+// which is +grad U, not -grad U.
+// ---------------------------------------------------------------------------
+static double faceU( const ModelTrack *tr, const ModelTrackRoller *ro,
+                     const TrackContactParams *prm, const double c[3] ) {
+    double runZ = tr->padZ + tr->thickness;
+    double d = c[2] - runZ;
+    if ( d <= 0 ) return 0;
+    double delta = ro->radius - d;
+    if ( delta <= 0 ) return 0;
+
+    double fade = prm->faceFade * tr->linkLen;
+    double a = ( c[0] + fade ) / ( 2*fade );
+    double b = ( c[0] - tr->linkLen + fade ) / ( 2*fade );
+    double sa = a <= 0 ? 0 : a >= 1 ? 1 : a*a*( 3 - 2*a );
+    double sb = b <= 0 ? 0 : b >= 1 ? 1 : b*b*( 3 - 2*b );
+    double w  = sa * ( 1 - sb );
+
+    double kn   = prm->gain * tr->kn;
+    double kLat = prm->gain * prm->kLatFrac * tr->kn;
+    return w * ( 0.5*kn*delta*delta + 0.5*kLat*c[1]*c[1] );
+}
+
+static int checkFaceGradient( const Model *mdl, const TrackContactParams *prm ) {
+    const ModelTrackRoller *ro;
+    const ModelTrack *tr = faceFixture( mdl, &ro );
+    if ( !tr ) return 0;
+
+    // Elastic only: dampers and friction are not gradients of anything.
+    TrackContactParams sp = *prm;
+    sp.enableFriction = 0;
+    sp.zeta           = 0;
+
+    double worst = 0, scale = 0;
+    int tested = 0;
+
+    for ( int t = 0 ; t < 200000 ; t++ ) {
+        double c[3], ua[3], ub[3], zero[3] = { 0, 0, 0 };
+        randomFaceState( tr, ro, c, ua, ub );
+
+        TrkFaceForce ff;
+        if ( !trkFaceForce( &sp, tr, ro, c, zero, zero, &ff ) ) continue;
+        // Skip the gate edges, where the one-sided cut makes a central
+        // difference meaningless -- smoothness there is check 8's business.
+        if ( ff.delta < 1e-4 || ff.w < 1e-3 || ff.w > 1 - 1e-3 ) continue;
+        tested++;
+
+        double h = 1e-7;
+        for ( int k = 0 ; k < 3 ; k++ ) {
+            double cp[3], cm[3];
+            for ( int j = 0 ; j < 3 ; j++ ) { cp[j] = c[j]; cm[j] = c[j]; }
+            cp[k] += h; cm[k] -= h;
+            double fd  = ( faceU( tr, ro, &sp, cp ) - faceU( tr, ro, &sp, cm ) ) / ( 2*h );
+            double err = fabs( ff.fCons[k] - fd );
+            double s   = fabs( fd ) > 1 ? fabs( fd ) : 1.0;
+            if ( fabs( fd ) > scale ) scale = fabs( fd );
+            if ( err / s > worst ) worst = err / s;
+            if ( err / s > 1e-5 ) {
+                printf( "contact: FAIL: face elastic force disagrees with grad U in axis %d: "
+                        "%.6g vs %.6g at c = (%.5f, %.5f, %.5f)\n",
+                        k, ff.fCons[k], fd, c[0], c[1], c[2] );
+                return 1;
+            }
+        }
+    }
+    printf( "contact: face: elastic force matches grad U to %.3e relative over %d loaded "
+            "states (force scale %.3e N)\n", worst, tested, scale );
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// 10: passivity of the face law, and its friction cone.
+//
+// Two application points means two velocities: the conservative half acts at
+// the AXLE and is conjugate to uc, friction acts at the FOOT and is conjugate
+// to us. And unlike the pin law, both of those are the ROLLER against the
+// shoe while the reported force is still the force ON the shoe -- so the power
+// the pair delivers is -f.u, not +f.u. Getting that backwards is precisely the
+// bug this check exists to catch, and it is invisible to every other check
+// here: the wrench balance still cancels, the gradient is still right, and the
+// design pose is still clean, because at rest there is no slip to be wrong
+// about.
+// ---------------------------------------------------------------------------
+static int checkFacePassivity( const Model *mdl, const TrackContactParams *prm ) {
+    const ModelTrackRoller *ro;
+    const ModelTrack *tr = faceFixture( mdl, &ro );
+    if ( !tr ) return 0;
+
+    double worst = 0, worstCone = 0;
+    int tested = 0;
+
+    for ( int t = 0 ; t < 200000 ; t++ ) {
+        double c[3], uc[3], us[3], zero[3] = { 0, 0, 0 };
+        randomFaceState( tr, ro, c, uc, us );
+
+        TrkFaceForce ff, f0;
+        if ( !trkFaceForce( prm, tr, ro, c, uc, us, &ff ) ) continue;
+        trkFaceForce( prm, tr, ro, c, zero, zero, &f0 );
+        tested++;
+
+        double power = 0, mag = 0;
+        for ( int k = 0 ; k < 3 ; k++ ) {
+            power -= ( ff.fCons[k] - f0.fCons[k] ) * uc[k];
+            power -= ( ff.fFric[k] - f0.fFric[k] ) * us[k];
+            mag   += fabs( ff.fCons[k] - f0.fCons[k] ) * fabs( uc[k] )
+                   + fabs( ff.fFric[k] - f0.fFric[k] ) * fabs( us[k] );
+        }
+        if ( power > worst ) worst = power;
+        if ( power > 1e-12 * ( mag > 1 ? mag : 1 ) ) {
+            printf( "contact: FAIL: the face law does %.6g W of work at c = (%.4f, %.4f, %.4f), "
+                    "uc = (%.3f, %.3f, %.3f), us = (%.3f, %.3f, %.3f) -- it is not passive\n",
+                    power, c[0], c[1], c[2], uc[0], uc[1], uc[2], us[0], us[1], us[2] );
+            return 1;
+        }
+
+        // The cone, on the same states. Friction must also stay in the face
+        // plane, or it would modulate the load it is itself proportional to.
+        if ( ff.fFric[2] != 0 ) {
+            printf( "contact: FAIL: face friction has a normal component of %.6g N\n", ff.fFric[2] );
+            return 1;
+        }
+        double ftMag = sqrt( ff.fFric[0]*ff.fFric[0] + ff.fFric[1]*ff.fFric[1] );
+        double lim   = tr->mu * ff.fN;
+        double fS    = ff.fN > 1 ? ff.fN : 1.0;
+        if ( ( ftMag - lim ) / fS > worstCone ) worstCone = ( ftMag - lim ) / fS;
+        if ( ftMag - lim > 1e-9 * fS ) {
+            printf( "contact: FAIL: face friction %.6g N exceeds the cone mu*fN = %.6g N\n",
+                    ftMag, lim );
+            return 1;
+        }
+    }
+    printf( "contact: face: velocity-dependent force dissipates at every sampled state (worst "
+            "power %.3e W over %d loaded states); friction inside the cone (worst excess %.3e)\n",
+            worst, tested, worstCone );
+    return 0;
+}
+
+// ===========================================================================
 // Ground contact. The same discipline as above, but check 1 had to change
 // SHAPE rather than just target: every track contact is internal, so its
 // wrenches sum to zero, whereas the ground is not a body and its reactions
@@ -937,6 +1164,13 @@ int main( int argc, char **argv ) {
     if ( checkDesignPose( &mdl, &prm ) )       return 1;
     if ( checkDriveTorque( &mdl, &prm ) )      return 1;
     if ( checkPassivity( &mdl, &prm ) )        return 1;
+
+    // The road-wheel face law, which none of the above reaches: every one of
+    // them drives trkPairForce, and road wheels stopped going through it when
+    // the face primitive landed. Inert on a band with no non-'end' rollers.
+    if ( checkFacePartition( &mdl, &prm ) )    return 1;
+    if ( checkFaceGradient( &mdl, &prm ) )     return 1;
+    if ( checkFacePassivity( &mdl, &prm ) )    return 1;
 
     // Ground. Every one of these is inert on a model with no 'ground' block,
     // except the balance check, which asserts the engine produces nothing at

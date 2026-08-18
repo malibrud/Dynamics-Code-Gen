@@ -191,7 +191,26 @@
 //                                 engine takes its four corners as contact
 //                                 points, so a band without it has no path to
 //                                 the ground
+//     thickness <t>               pad face to inner running face. The shoe is a
+//                                 plate: its outer surface is the pad and its
+//                                 inner surface, at padZ + t, is what the ROAD
+//                                 WHEELS roll on. Required if the band carries
+//                                 any non-'end' roller
 //     kn/kt/mu <v>                roller contact material
+//
+// Which surface a roller touches is NOT the same for all of them, and the
+// 'end' flag is what decides it:
+//
+//   sprocket, idler ('end')   the PINS. Tooth pockets on the sprocket; the
+//                             belt path is built through pin centres, so
+//                             pin-against-circle is what that geometry means.
+//   road wheels (not 'end')   the shoe's inner RUNNING FACE, a flat between
+//                             consecutive pins. A wheel rolling on pin points
+//                             instead would sit R - sqrt(R^2 - ds^2/4) deep
+//                             inside the surface it is supposed to roll on
+//                             (9.4 mm on m113) and could fall between two pins
+//                             whenever the pitch reached 2R -- neither of which
+//                             is a real vehicle's behaviour.
 //
 // Ground
 // ------
@@ -355,6 +374,11 @@ typedef struct {
     int hasPad;
     double padZ;             // shoe-local z of the pad face (outward is -z)
     double padLen, padWid;   // footprint along x (link direction) and y (pin axis)
+    // Shoe thickness, pad face to inner running face. The road wheels roll on
+    // that inner face -- NOT on the pins, which only engage the sprocket and
+    // idler -- so the shoe is modelled as a plate and its two surfaces are
+    // declared together rather than independently: runZ = padZ + thickness.
+    double thickness;
     // filled during expansion:
     int shoe0;               // body index of the floating anchor shoe
     double linkLen;          // actual shoe length used = perimeter / N
@@ -447,10 +471,11 @@ static int modelFindPoi( const Model *m, const char *name ) {
 }
 
 // ---------------------------------------------------------------------------
-// Track band geometry: an open (external-tangent) belt around two end pulleys.
-// The band is the two straight runs tangent to both circles plus the two outer
-// wrap arcs; shoes are laid evenly by arc length. Everything is 2D in the band
-// plane, coordinates (x,z) in the root frame. See models notes for the design.
+// Track band geometry: the taut belt around the CONVEX HULL of every roller
+// circle -- straight runs tangent to consecutive circles, joined by wrap arcs,
+// with shoes laid evenly by arc length. Everything is 2D in the band plane,
+// coordinates (x,z) in the root frame. See the note on trkBuildBelt for why
+// this is the hull and not just the two end pulleys.
 // ---------------------------------------------------------------------------
 typedef struct { double x, z; } TrkV2;
 typedef struct {
@@ -460,41 +485,143 @@ typedef struct {
     double len;                  // segment arc length
 } TrkSeg;
 
-// Build the belt around pulleys A and B (band on the OUTSIDE of both); fill
-// seg[0..3] in circulation order (bottom run, B arc, top run, A arc); return
-// the perimeter. Caller guarantees |rA-rB| < |B-A|.
-static double trkBuildBelt( TrkV2 cA, double rA, TrkV2 cB, double rB, TrkSeg seg[4] ) {
-    TrkV2 d; d.x = cB.x - cA.x; d.z = cB.z - cA.z;
-    double D = sqrt( d.x*d.x + d.z*d.z );
-    TrkV2 u; u.x = d.x / D; u.z = d.z / D;
-    TrkV2 perp; perp.x = -u.z; perp.z = u.x;         // +90 deg in (x,z)
-    double alpha = asin( ( rA - rB ) / D ), ca = cos( alpha ), sa = sin( alpha );
-    TrkV2 mup, mlo;                                   // tangent-line outward normals
-    mup.x = sa*u.x + ca*perp.x; mup.z = sa*u.z + ca*perp.z;
-    mlo.x = sa*u.x - ca*perp.x; mlo.z = sa*u.z - ca*perp.z;
-    TrkV2 Aup, Bup, Alo, Blo;
-    Aup.x = cA.x + rA*mup.x; Aup.z = cA.z + rA*mup.z;
-    Bup.x = cB.x + rB*mup.x; Bup.z = cB.z + rB*mup.z;
-    Alo.x = cA.x + rA*mlo.x; Alo.z = cA.z + rA*mlo.z;
-    Blo.x = cB.x + rB*mlo.x; Blo.z = cB.z + rB*mlo.z;
-    double Lt = sqrt( D*D - ( rA - rB )*( rA - rB ) );
-
-    seg[0].arc = 0; seg[0].p0 = Alo;                  // bottom run Alo -> Blo
-    seg[0].dir.x = ( Blo.x - Alo.x )/Lt; seg[0].dir.z = ( Blo.z - Alo.z )/Lt; seg[0].len = Lt;
-    seg[1].arc = 1; seg[1].c = cB; seg[1].r = rB;     // B arc, CCW, wrap pi-2a
-    seg[1].a0 = atan2( mlo.z, mlo.x ); seg[1].dw = M_PI - 2*alpha; seg[1].len = rB*seg[1].dw;
-    seg[2].arc = 0; seg[2].p0 = Bup;                  // top run Bup -> Aup
-    seg[2].dir.x = ( Aup.x - Bup.x )/Lt; seg[2].dir.z = ( Aup.z - Bup.z )/Lt; seg[2].len = Lt;
-    seg[3].arc = 1; seg[3].c = cA; seg[3].r = rA;     // A arc, CCW, wrap pi+2a
-    seg[3].a0 = atan2( mup.z, mup.x ); seg[3].dw = M_PI + 2*alpha; seg[3].len = rA*seg[3].dw;
-
-    return seg[0].len + seg[1].len + seg[2].len + seg[3].len;
+// Build the taut belt around the CONVEX HULL of every roller circle (band on
+// the OUTSIDE of all of them); fill seg[] with alternating tangent runs and
+// wrap arcs in counter-clockwise circulation order, and return the perimeter.
+//
+// WHY THE HULL AND NOT JUST THE TWO END PULLEYS, which is what this used to do.
+// A two-pulley path is the taut band around the sprocket and idler alone, so
+// every other roller pokes through it -- on m113 the five road wheels per side
+// hung 0.25 m below the lower run and the perimeter came out 9.474 m against
+// the declared 63 x 0.154 = 9.702, i.e. 2.4% short by almost exactly the
+// road-wheel wrap that was left out. The band was therefore too SHORT to reach
+// its own road wheels, and rigid links cannot stretch, so the shortfall had to
+// appear as interpenetration somewhere.
+//
+// Pin-against-circle contact hid that: the deficit spread over ~40 pins that
+// could each slide around a circle, and settled to a few centimetres. Contact
+// against the shoe's flat running face cannot hide it -- the overlap
+// concentrates on the one or two shoes actually under each wheel, at 2e5 x 0.25
+// = 5e4 N on an 18 kg shoe -- and the band was destroyed during settling. Which
+// is how the idealization finally had to be paid for.
+//
+// The algorithm is a gift wrap over circles. From a circle known to be on the
+// hull, repeatedly take the outer tangent that turns the least counter-
+// clockwise; circles inside the hull are never selected and drop out on their
+// own. For an outer tangent from circle i to circle j the outward normal sits
+// at angle base - acos( (r_i - r_j) / D ), which reduces to the old two-pulley
+// construction exactly when n = 2.
+//
+// Ties matter here and are not hypothetical: m113's five road wheels are
+// collinear with equal radii, so they share one lower tangent line and every
+// turn between them is zero. Ties break toward the FARTHEST circle, the same
+// rule Jarvis march uses for collinear points, or the walk would stall on the
+// nearest one.
+static double trkWrap2pi( double a ) {
+    while ( a < 0 )        a += 2.0 * M_PI;
+    while ( a >= 2.0*M_PI ) a -= 2.0 * M_PI;
+    return a;
 }
 
-// Point at arc length s along the closed 4-segment path; also its tangent angle.
-static TrkV2 trkPoint( const TrkSeg seg[4], double s, double *phi ) {
-    for ( int k = 0 ; k < 4 ; k++ ) {
-        if ( s < seg[k].len || k == 3 ) {
+static void trkWalkHull( const TrkV2 *cen, const double *rad, int n,
+                         int startIdx, double startAng,
+                         TrkSeg *seg, int maxSeg, int *nsegOut, double *perim ) {
+    int    cur   = startIdx;
+    double ang   = startAng;
+    double total = 0;
+    int    nseg  = 0, guard = 0;
+
+    for ( ;; ) {
+        int    best = -1;
+        double bestTurn = 0, bestLen = 0, bestAng = 0;
+
+        for ( int j = 0 ; j < n ; j++ ) {
+            if ( j == cur ) continue;
+            double dx = cen[j].x - cen[cur].x, dz = cen[j].z - cen[cur].z;
+            double D  = sqrt( dx*dx + dz*dz );
+            double dr = rad[cur] - rad[j];
+            if ( D <= 1e-12 || D <= fabs( dr ) ) continue;   // concentric or nested
+            double phi  = atan2( dz, dx ) - acos( dr / D );
+            double turn = trkWrap2pi( phi - ang );
+            double len  = sqrt( D*D - dr*dr );
+            // Farthest wins a tie, or collinear equal-radius circles stall.
+            if ( best < 0 || turn < bestTurn - 1e-12
+                          || ( turn < bestTurn + 1e-12 && len > bestLen ) ) {
+                best = j; bestTurn = turn; bestLen = len; bestAng = phi;
+            }
+        }
+        if ( best < 0 ) break;                                // single circle
+        if ( nseg + 2 > maxSeg ) break;
+
+        seg[ nseg ].arc = 1;
+        seg[ nseg ].c   = cen[ cur ];
+        seg[ nseg ].r   = rad[ cur ];
+        seg[ nseg ].a0  = ang;
+        seg[ nseg ].dw  = bestTurn;
+        seg[ nseg ].len = rad[ cur ] * bestTurn;
+        total += seg[ nseg ].len;
+        nseg++;
+
+        // Travel is the outward normal turned +90 degrees, which is what makes
+        // the circulation counter-clockwise.
+        double m[2] = { cos( bestAng ), sin( bestAng ) };
+        seg[ nseg ].arc   = 0;
+        seg[ nseg ].p0.x  = cen[ cur ].x + rad[ cur ] * m[0];
+        seg[ nseg ].p0.z  = cen[ cur ].z + rad[ cur ] * m[1];
+        seg[ nseg ].dir.x = -m[1];
+        seg[ nseg ].dir.z =  m[0];
+        seg[ nseg ].len   = bestLen;
+        total += bestLen;
+        nseg++;
+
+        ang = bestAng;
+        cur = best;
+        // Back at the start circle means the loop is closed: a convex hull
+        // visits each circle at most once. Do NOT gate this on how far the
+        // normal has swept -- two equal circles sweep exactly pi by the time
+        // they close, and a "swept > M_PI" test sends the walk round a second
+        // time. track_demo did exactly that: 11.14 m for a 5.57 m belt.
+        if ( cur == startIdx ) break;
+        if ( ++guard > 4 * n + 8 ) break;                     // never spin
+    }
+
+    if ( nseg + 1 <= maxSeg ) {
+        double closeTurn = trkWrap2pi( startAng - ang );
+        seg[ nseg ].arc = 1;
+        seg[ nseg ].c   = cen[ cur ];
+        seg[ nseg ].r   = rad[ cur ];
+        seg[ nseg ].a0  = ang;
+        seg[ nseg ].dw  = closeTurn;
+        seg[ nseg ].len = rad[ cur ] * closeTurn;
+        total += seg[ nseg ].len;
+        nseg++;
+    }
+
+    *nsegOut = nseg;
+    *perim   = total;
+}
+
+static double trkBuildBelt( const TrkV2 *cen, const double *rad, int n,
+                            TrkSeg *seg, int maxSeg, int *nsegOut ) {
+    *nsegOut = 0;
+    if ( n < 1 ) return 0;
+
+    // A circle achieving the minimum of (z - r) touches the lowest supporting
+    // line, so it is on the hull and its bottom point is a hull point with
+    // outward normal pointing straight down.
+    int lowest = 0;
+    for ( int i = 1 ; i < n ; i++ )
+        if ( cen[i].z - rad[i] < cen[lowest].z - rad[lowest] ) lowest = i;
+
+    double perim = 0;
+    trkWalkHull( cen, rad, n, lowest, -M_PI/2.0, seg, maxSeg, nsegOut, &perim );
+    return perim;
+}
+
+// Point at arc length s along the closed path; also its tangent angle.
+static TrkV2 trkPoint( const TrkSeg *seg, int nseg, double s, double *phi ) {
+    for ( int k = 0 ; k < nseg ; k++ ) {
+        if ( s < seg[k].len || k == nseg - 1 ) {
             TrkV2 p;
             if ( !seg[k].arc ) {
                 p.x = seg[k].p0.x + s*seg[k].dir.x;
@@ -502,7 +629,7 @@ static TrkV2 trkPoint( const TrkSeg seg[4], double s, double *phi ) {
                 *phi = atan2( seg[k].dir.z, seg[k].dir.x );
             } else {
                 double sgn = seg[k].dw >= 0 ? 1.0 : -1.0;
-                double a = seg[k].a0 + sgn*( s / seg[k].r );
+                double a = seg[k].a0 + ( seg[k].r > 1e-12 ? sgn*( s / seg[k].r ) : 0 );
                 p.x = seg[k].c.x + seg[k].r*cos( a );
                 p.z = seg[k].c.z + seg[k].r*sin( a );
                 *phi = atan2( sgn*cos( a ), -sgn*sin( a ) );
@@ -511,9 +638,8 @@ static TrkV2 trkPoint( const TrkSeg seg[4], double s, double *phi ) {
         }
         s -= seg[k].len;
     }
-    TrkV2 z; z.x = 0; z.z = 0; *phi = 0; return z;    // unreachable
+    TrkV2 z; z.x = 0; z.z = 0; *phi = 0; return z;            // nseg == 0
 }
-
 // Design-pose position of body b in body 'root's frame. Valid because every
 // joint between them is at q=0 (identity rotation) in the design pose, so the
 // position is just the sum of tree translations. Returns 0 on success, nonzero
@@ -792,6 +918,8 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
             } else if ( !strcmp( key, "pad" ) ) {
                 if ( sscanf( rest, "%lf %lf %lf", &curTrack->padZ, &curTrack->padLen, &curTrack->padWid ) != 3 ) goto badArgs;
                 curTrack->hasPad = 1;
+            } else if ( !strcmp( key, "thickness" ) ) {
+                if ( sscanf( rest, "%lf", &curTrack->thickness ) != 1 ) goto badArgs;
             } else {
                 snprintf( err, errSize, "%s:%d: unknown keyword '%s' in track block", path, lineNo, key );
                 goto fail;
@@ -1069,6 +1197,21 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
                       path, tr->name, tr->padLen, tr->padWid );
             goto fail;
         }
+        // Any non-end roller rolls on the shoe's inner running face, which is
+        // located as padZ + thickness -- so a band carrying road wheels needs
+        // both. Without a thickness the running face would coincide with the
+        // pad and the wheels would ride the outside of the track.
+        {
+            int nRoad = 0;
+            for ( int r = 0 ; r < tr->nroller ; r++ ) if ( !tr->roller[r].isEnd ) nRoad++;
+            if ( nRoad && ( !tr->hasPad || tr->thickness <= 0 ) ) {
+                snprintf( err, errSize, "%s: track '%s': %d road wheel(s) roll on the shoe's inner "
+                                        "running face, so the block needs both 'pad' and a positive "
+                                        "'thickness' (the face sits at padZ + thickness)",
+                          path, tr->name, nRoad );
+                goto fail;
+            }
+        }
         // A band with a pad but no ground has nothing to press against, and a
         // ground with no padded band has nothing pressing on it. Neither is an
         // error -- a model may legitimately be run in free fall, which is what
@@ -1096,18 +1239,31 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
             snprintf( err, errSize, "%s: track '%s': need exactly 2 'end' rollers (sprocket + idler), got %d", path, tr->name, nend );
             goto fail;
         }
-        double pA[ 3 ], pB[ 3 ];
-        if ( trkBodyPosInRoot( m, tr->roller[ endIdx[0] ].body, tr->root, pA ) ||
-             trkBodyPosInRoot( m, tr->roller[ endIdx[1] ].body, tr->root, pB ) ) {
-            snprintf( err, errSize, "%s: track '%s': an end pulley is not rigidly located in the root frame", path, tr->name );
-            goto fail;
+        // Every roller shapes the path now, not just the two end pulleys, so
+        // every one of them has to be locatable in the root frame at the design
+        // pose -- road wheels included, which sit at the end of a trailing arm.
+        TrkV2 cen[ MODEL_MAX_ROLLERS ];
+        double rad[ MODEL_MAX_ROLLERS ];
+        double yband = 0;
+        for ( int r = 0 ; r < tr->nroller ; r++ ) {
+            double p[3];
+            if ( trkBodyPosInRoot( m, tr->roller[ r ].body, tr->root, p ) ) {
+                snprintf( err, errSize, "%s: track '%s': roller body %d is not rigidly located in the "
+                                        "root frame at the design pose", path, tr->name, tr->roller[r].body );
+                goto fail;
+            }
+            cen[ r ].x = p[0]; cen[ r ].z = p[2];
+            rad[ r ]   = tr->roller[ r ].radius;
+            if ( tr->roller[ r ].isEnd ) yband = p[1];   // the band's lateral offset
         }
-        TrkV2 cA, cB; cA.x = pA[0]; cA.z = pA[2]; cB.x = pB[0]; cB.z = pB[2];
-        double rA = tr->roller[ endIdx[0] ].radius, rB = tr->roller[ endIdx[1] ].radius;
-        double Dc = sqrt( ( cB.x - cA.x )*( cB.x - cA.x ) + ( cB.z - cA.z )*( cB.z - cA.z ) );
-        if ( Dc <= fabs( rA - rB ) ) {
-            snprintf( err, errSize, "%s: track '%s': end pulleys overlap (centers too close for the belt)", path, tr->name );
-            goto fail;
+        {
+            TrkV2 cA = cen[ endIdx[0] ], cB = cen[ endIdx[1] ];
+            double rA = rad[ endIdx[0] ], rB = rad[ endIdx[1] ];
+            double Dc = sqrt( ( cB.x - cA.x )*( cB.x - cA.x ) + ( cB.z - cA.z )*( cB.z - cA.z ) );
+            if ( Dc <= fabs( rA - rB ) ) {
+                snprintf( err, errSize, "%s: track '%s': end pulleys overlap (centers too close for the belt)", path, tr->name );
+                goto fail;
+            }
         }
         int N = tr->shoes;
         if ( m->nbod + N > MODEL_MAX_BODIES ) {
@@ -1119,50 +1275,73 @@ static int modelLoad( const char *path, Model *m, char *err, size_t errSize ) {
             goto fail;
         }
 
-        TrkSeg seg[ 4 ];
-        double P = trkBuildBelt( cA, rA, cB, rB, seg );
+        TrkSeg seg[ 2 * MODEL_MAX_ROLLERS + 2 ];
+        int nseg = 0;
+        double P = trkBuildBelt( cen, rad, tr->nroller, seg,
+                                 (int)( sizeof seg / sizeof seg[0] ), &nseg );
+        if ( nseg < 2 || P <= 0 ) {
+            snprintf( err, errSize, "%s: track '%s': could not build a belt around %d roller(s)",
+                      path, tr->name, tr->nroller );
+            goto fail;
+        }
         double ds = P / N;                             // even spacing == shoe length
-        double yband = pA[1];
         tr->linkLen = ds;
-        for ( int i = 0 ; i < N ; i++ ) { double ph; trkPin[ i ] = trkPoint( seg, i*ds, &ph ); }
+        for ( int i = 0 ; i < N ; i++ ) { double ph; trkPin[ i ] = trkPoint( seg, nseg, i*ds, &ph ); }
 
-        // A drive sprocket's teeth must be spaced like the shoes, or tooth
-        // engagement is meaningless: the pockets sit at arc pitch 2*pi*R/teeth
-        // and the pins arrive at linkLen. m113 is 2.4% off (0.153938 vs
-        // 0.150388) because the belt wraps only the two end pulleys and so
-        // comes out short by the road-wheel wrap it leaves out -- small enough
-        // that the phase error over the ~5 engaged pins stays bounded. A gross
-        // mismatch means the model's teeth count and radius were never chosen
-        // for its shoe count, and any tooth force computed from them is noise.
-        // Warn rather than fail: the band itself is still dynamically valid,
-        // and track_demo says outright that its geometry is placeholder.
-        // A roller is carried by the PINS either side of it, so the shoe pitch
-        // has to be small against the roller. Two adjacent pins on a chord of
-        // length ds sit a distance sqrt(R^2 - ds^2/4) from the axle, so once
+        // The declared pitch is advisory, but a band built around the full hull
+        // should now land close to it -- that is what the hull buys. A large gap
+        // means the shoe count and the roller layout disagree about how long the
+        // track is, which no contact law can fix.
+        if ( tr->pitch > 0 ) {
+            double rel = fabs( ds - tr->pitch ) / tr->pitch;
+            if ( rel > 0.05 )
+                fprintf( stderr, "%s: warning: track '%s': belt perimeter %.5f m over %d shoes gives "
+                                 "a %.6f m link, %.0f%% off the declared pitch %.6f -- check the "
+                                 "shoe count against the roller layout\n",
+                         path, tr->name, P, N, ds, rel*100.0, tr->pitch );
+        }
+
+        // An END roller is carried by the PINS either side of it, so for those
+        // the shoe pitch has to be small against the roller. Two adjacent pins
+        // on a chord of length ds sit sqrt(R^2 - ds^2/4) from the axle, so once
         // ds >= 2R that distance is imaginary: the roller passes clean between
-        // consecutive pins and can never carry load, however stiff the contact
-        // is. Below that it still sags by R - sqrt(R^2 - ds^2/4), which is 3.4%
-        // of R at ds = R and grows fast.
+        // consecutive pins and can never carry load, however stiff the contact.
+        //
+        // This applies to the SPROCKET AND IDLER ONLY. The road wheels roll on
+        // the shoe's inner running face, not on the pins, and a face cannot be
+        // fallen between at any pitch -- so warning about them would be warning
+        // about the old contact primitive rather than about the model. (That
+        // mistake was made: track_demo was rebuilt from 12 shoes to 40 to
+        // satisfy a constraint its road wheels never had.)
         //
         // Warn rather than fail, like the tooth-pitch check below: the band is
-        // dynamically valid either way, and it is the vehicle standing up that
-        // silently stops working. (This is exactly how track_demo's road wheels
-        // were found to be unsupportable -- 0.464 m shoes on 0.15 m wheels.)
+        // dynamically valid either way; it is the vehicle standing up that
+        // silently stops working.
         for ( int r = 0 ; r < tr->nroller ; r++ ) {
             const ModelTrackRoller *rr = &tr->roller[ r ];
+            if ( !rr->isEnd ) continue;
             if ( ds >= 2.0 * rr->radius )
                 fprintf( stderr, "%s: warning: track '%s': shoe pitch %.6f m is at least twice the "
-                                 "radius %.4f of the roller on body %d -- that roller falls between "
-                                 "consecutive pins and can never carry load\n",
+                                 "radius %.4f of the END roller on body %d -- its pins fall between "
+                                 "consecutive shoes and it can never carry load\n",
                          path, tr->name, ds, rr->radius, rr->body );
             else if ( ds > rr->radius )
                 fprintf( stderr, "%s: warning: track '%s': shoe pitch %.6f m exceeds the radius "
-                                 "%.4f of the roller on body %d -- the band sags %.1f%% of the "
-                                 "radius between pins\n",
+                                 "%.4f of the END roller on body %d -- the pin polygon sags %.1f%% "
+                                 "of the radius between pins\n",
                          path, tr->name, ds, rr->radius, rr->body,
                          100.0 * ( 1.0 - sqrt( 1.0 - ds*ds/( 4.0*rr->radius*rr->radius ) ) ) );
         }
 
+        // A drive sprocket's teeth must be spaced like the shoes, or tooth
+        // engagement is meaningless: the pockets sit at arc pitch 2*pi*R/teeth
+        // and the pins arrive at linkLen. Building the belt around the full
+        // roller hull is what finally made these agree on m113 -- 2*pi*0.245/10
+        // = 0.153938 against a link that now comes out near the declared 0.154,
+        // where the old two-pulley path left it 2.4% short. A gross mismatch
+        // means the teeth count and radius were never chosen for the shoe count,
+        // and any tooth force computed from them is noise. Warn rather than
+        // fail: the band itself is still dynamically valid.
         for ( int r = 0 ; r < tr->nroller ; r++ ) {
             const ModelTrackRoller *rr = &tr->roller[ r ];
             if ( !rr->isDrive || rr->teeth <= 0 ) continue;

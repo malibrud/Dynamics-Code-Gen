@@ -74,6 +74,14 @@ typedef struct {
     // Lateral (guide-horn) stiffness as a fraction of kn.
     double kLatFrac;
 
+    // Half-width of the road-wheel face weight's fade, as a fraction of
+    // linkLen. Adjacent shoes' weights are complementary over it, so this sets
+    // how far a wheel's load is shared across a joint and nothing else: at 0.25
+    // the middle half of every face carries full weight and the outer quarters
+    // hand over. It cannot be zero -- that is the hard in/out test the weight
+    // exists to avoid.
+    double faceFade;
+
     // Angular position of pocket centre 0 in the sprocket's own frame. Pockets
     // sit at th0 + k*2*pi/teeth.
     double toothPhase;
@@ -98,6 +106,7 @@ static void trackContactDefaults( const Model *mdl, TrackContactParams *p ) {
     p->gateFade   = 0.030;
     p->vEps       = 1.0e-2;
     p->kLatFrac   = 0.1;
+    p->faceFade   = 0.25;
     p->toothPhase = 0.0;
     p->enableTooth = p->enableFriction = p->enableNonEnd = 1;
 }
@@ -266,11 +275,307 @@ static int trkPairForce( const TrackContactParams *prm, const ModelTrack *tr,
     return 1;
 }
 
+// ---------------------------------------------------------------------------
+// ROAD WHEEL AGAINST THE SHOE'S INNER RUNNING FACE.
+//
+// The other primitive, and the one that applies to every roller NOT marked
+// 'end'. A road wheel does not roll on the pins -- it rolls on the flat inner
+// surface of the shoe, between them. Modelling it as pin-against-circle gets
+// two things wrong, both of which showed up in practice:
+//
+//   - At rest the shoe faces cut R - sqrt(R^2 - ds^2/4) INTO the wheel: 9.4 mm
+//     on m113 (ds 0.1504, R 0.305). The wheel is embedded in the surface it is
+//     supposed to be rolling on, and the error grows as the square of pitch.
+//   - A wheel resting on points can fall BETWEEN two of them once the pitch
+//     reaches 2R. A wheel resting on a face cannot, at any pitch. modelLoad
+//     used to warn about this for every roller; that warning was diagnosing
+//     the primitive, not the model, and now covers 'end' rollers only.
+//
+// Worked entirely in the SHOE's frame, where the face is flat and axis-aligned:
+// the running face is the plane z = runZ (= padZ + thickness) spanning
+// x in [0, linkLen], and the rollers are on its +z side because the band wraps
+// the outside.
+//
+//   c   roller axle centre, shoe coordinates
+//   uc  velocity of the roller's AXLE relative to the shoe, shoe coordinates
+//   us  SLIP at the contact foot: the wheel's material point there against the
+//       shoe's, shoe coordinates
+//
+// Those are two different vectors and the law needs both. The normal damper is
+// the rate conjugate of the penetration, which is set by the axle closing on
+// the face (uc); the wheel's spin does not press it in. Friction is the slip of
+// the surfaces in contact (us), which is what a rolling wheel drives to zero
+// while its axle is moving quite fast.
+//
+// THE WEIGHT, and why a plain in-range test will not do. Shoes tile the band
+// end to end, so a hard test on x in [0, linkLen] hands the load from one shoe
+// to the next discontinuously -- the total stays put but each body's share
+// jumps, which is exactly what makes an explicit integrator chatter. Nor is a
+// symmetric fade enough: shoe i+1's face BEGINS where shoe i's ends, so fading
+// both out near a joint would leave a support dip at every pin.
+//
+// What works is a partition of unity. Each face's weight is allowed to reach
+// fade metres PAST both of its own ends, and the two smoothsteps are
+// complementary, so for a locally straight band
+//
+//     w_i(x) + w_{i+1}(x - linkLen) == 1
+//
+// identically across the joint: at x = linkLen both are exactly 1/2. Support
+// transfers smoothly and is never doubled or dropped.
+//
+// AND THE WEIGHT MAKES THIS A GATED POTENTIAL, U = 1/2 w(x) k delta^2, so
+// -grad U has a TANGENTIAL part 1/2 k delta^2 w'(x) alongside the normal one.
+// This is the same trap as the sprocket tooth law's missing g'(delta)*U0 term,
+// in a new place; it is included below and src/contact/main.c checks the whole
+// gradient by finite difference rather than waiting for a trajectory to notice.
+// ---------------------------------------------------------------------------
+// The two halves are kept apart because they act at DIFFERENT POINTS: the
+// conservative part is a function of the axle's position in the shoe frame and
+// so acts at the axle, while friction is a surface effect and acts at the foot,
+// which is the only way it can spin the wheel.
+typedef struct {
+    double fCons[3];  // conservative + normal damping, at the AXLE, shoe coords
+    double fFric[3];  // friction, at the FOOT, shoe coords
+    double f[3];      // their sum, for sweeps and tests
+    double fN;        // normal magnitude (>= 0), along -z on the shoe
+    double delta;     // penetration, positive = wheel inside the face
+    double w;         // partition-of-unity weight
+    double foot[3];   // contact point on the face, shoe coordinates
+} TrkFaceForce;
+
+// Partition-of-unity weight and its derivative for a face spanning [0, L],
+// fading over +/- fade about each end.
+static double trkFaceW( double x, double L, double fade, double *dw ) {
+    double a = ( x + fade ) / ( 2.0 * fade );            // rises 0 -> 1 about x = 0
+    double b = ( x - L + fade ) / ( 2.0 * fade );        // rises 0 -> 1 about x = L
+    double sa = a <= 0 ? 0 : a >= 1 ? 1 : a*a*( 3.0 - 2.0*a );
+    double sb = b <= 0 ? 0 : b >= 1 ? 1 : b*b*( 3.0 - 2.0*b );
+    double da = a <= 0 || a >= 1 ? 0 : 6.0*a*( 1.0 - a ) / ( 2.0*fade );
+    double db = b <= 0 || b >= 1 ? 0 : 6.0*b*( 1.0 - b ) / ( 2.0*fade );
+    if ( dw ) *dw = da * ( 1.0 - sb ) - sa * db;
+    return sa * ( 1.0 - sb );
+}
+
+static int trkFaceForce( const TrackContactParams *prm, const ModelTrack *tr,
+                         const ModelTrackRoller *ro, const double c[3],
+                         const double uc[3], const double us[3], TrkFaceForce *out ) {
+    memset( out, 0, sizeof *out );
+
+    double runZ = tr->padZ + tr->thickness;
+    double d    = c[2] - runZ;                 // axle height above the face
+    // d <= 0 means the wheel has passed clean through to the outside of the
+    // band. That is a broken state, not a contact, and there is no smooth force
+    // that recovers from it -- which is what the settling gain ramp is for.
+    if ( d <= 0 ) return 0;
+
+    double delta = ro->radius - d;
+    out->delta = delta;
+    if ( delta <= 0 ) return 0;                // one-sided
+
+    double fade = prm->faceFade * tr->linkLen;
+    double dw, w = trkFaceW( c[0], tr->linkLen, fade, &dw );
+    out->w = w;
+    if ( w <= 0 ) return 0;
+
+    double m    = tr->mass;
+    double kn   = prm->gain * tr->kn;
+    double cn   = 2.0 * prm->zeta * sqrt( kn * m );
+    double kLat = prm->gain * prm->kLatFrac * tr->kn;
+    double cLat = 2.0 * prm->zeta * sqrt( kLat * m );
+
+    // delta grows as the axle descends toward the face, so d(delta)/dt = -uc[2].
+    double ramp = delta < prm->deltaRamp ? delta / prm->deltaRamp : 1.0;
+    double fN   = w * ( kn * delta + cn * ramp * ( -uc[2] ) );
+    if ( fN < 0 ) fN = 0;
+    out->fN = fN;
+
+    out->foot[0] = c[0]; out->foot[1] = c[1]; out->foot[2] = runZ;
+
+    // Lateral guide. Sign: c[1] is the AXLE's offset in the SHOE's frame, so a
+    // roller sitting at +y means the shoe is displaced to -y and must be pulled
+    // back toward +y -- the opposite sign from the pin law, where the offset is
+    // measured the other way round. Its potential is 1/2 w kLat c[1]^2, so it
+    // contributes to the tangential term below as well.
+    double fy = w * ( kLat * c[1] + cLat * uc[1] );
+
+    // Tangential completion of -grad( w(x) * U0 ), with
+    // U0 = 1/2 kn delta^2 + 1/2 kLat c[1]^2. Without it the weight makes the
+    // law non-conservative: a wheel crossing a joint enters on one shoe's
+    // ramp-up and leaves on the other's ramp-down, closing a loop with net work.
+    double U0 = 0.5 * kn * delta * delta + 0.5 * kLat * c[1] * c[1];
+    double fx = U0 * dw;
+    double fz = -fN;
+
+    // --- friction ---------------------------------------------------------
+    // The slip of the surfaces, in the face plane. Applied at the FOOT and not
+    // at the axle: this is the term that spins the wheel, and on the axle it
+    // would have no moment about the axle at all.
+    //
+    // SIGN, and it is the opposite of the pin law's. There the relative
+    // velocity is the SHOE against the roller and the output is the force on
+    // the shoe, so friction opposes u and the coefficient is negative. Here us
+    // is the ROLLER against the shoe -- the same flip the lateral guide above
+    // has -- while the output is still the force on the shoe, so friction must
+    // DRAG the shoe along with the wheel and the coefficient is positive.
+    //
+    // Getting this backwards is not a small error, it reverses the sign of the
+    // power: with force on the shoe f = sc*us and -f on the roller, the pair
+    // does work at -f.us = -sc|us|^2, so a negative sc injects mu*fN*|us|
+    // watts instead of dissipating them. On track_min that drove the band
+    // round under its own friction and grew total energy by 5e6 J.
+    double ffx = 0, ffy = 0;
+    if ( prm->enableFriction && fN > 0 ) {
+        double sp = sqrt( us[0]*us[0] + us[1]*us[1] );
+        double sc = tr->mu * fN / sqrt( sp*sp + prm->vEps*prm->vEps );
+        ffx = sc * us[0];
+        ffy = sc * us[1];
+    }
+
+    out->fCons[0] = fx;  out->fCons[1] = fy;  out->fCons[2] = fz;
+    out->fFric[0] = ffx; out->fFric[1] = ffy; out->fFric[2] = 0;
+    for ( int k = 0 ; k < 3 ; k++ ) out->f[k] = out->fCons[k] + out->fFric[k];
+    return 1;
+}
+
+// Wrench bookkeeping for one road wheel against every shoe of its band. Split
+// out of trackContactFext because the geometry is the shoe's, not the roller's:
+// everything below is built in the shoe frame and pushed back to base.
+static void trkFaceRoller( const TrackContactParams *prm, const ModelTrack *tr,
+                           const ModelTrackRoller *ro, double Xa[][6][6], double v[][6],
+                           double *fext ) {
+    int s = ro->body;
+
+    double Es[3][3], cw[3], wr[3], vr[3];
+    for ( int a = 0 ; a < 3 ; a++ )
+    for ( int b = 0 ; b < 3 ; b++ ) Es[a][b] = Xa[s][a][b];
+    xformOrigin( Xa[s], cw );
+    for ( int k = 0 ; k < 3 ; k++ ) {
+        wr[k] = Es[0][k]*v[s][0] + Es[1][k]*v[s][1] + Es[2][k]*v[s][2];  // omega, world
+        vr[k] = Es[0][k]*v[s][3] + Es[1][k]*v[s][4] + Es[2][k]*v[s][5];  // axle velocity
+    }
+
+    for ( int i = 0 ; i < tr->shoes ; i++ ) {
+        int j = tr->shoe0 + i;
+
+        double Ej[3][3], rw[3], wj[3], vj[3];
+        for ( int a = 0 ; a < 3 ; a++ )
+        for ( int b = 0 ; b < 3 ; b++ ) Ej[a][b] = Xa[j][a][b];
+        xformOrigin( Xa[j], rw );
+        for ( int k = 0 ; k < 3 ; k++ ) {
+            wj[k] = Ej[0][k]*v[j][0] + Ej[1][k]*v[j][1] + Ej[2][k]*v[j][2];
+            vj[k] = Ej[0][k]*v[j][3] + Ej[1][k]*v[j][4] + Ej[2][k]*v[j][5];
+        }
+
+        // Axle in shoe coordinates.
+        double rel[3], c[3];
+        for ( int k = 0 ; k < 3 ; k++ ) rel[k] = cw[k] - rw[k];
+        for ( int k = 0 ; k < 3 ; k++ )
+            c[k] = Ej[k][0]*rel[0] + Ej[k][1]*rel[1] + Ej[k][2]*rel[2];
+
+        // Axle velocity relative to the shoe's material point there.
+        double ucw[3], uc[3];
+        ucw[0] = vr[0] - ( vj[0] + wj[1]*rel[2] - wj[2]*rel[1] );
+        ucw[1] = vr[1] - ( vj[1] + wj[2]*rel[0] - wj[0]*rel[2] );
+        ucw[2] = vr[2] - ( vj[2] + wj[0]*rel[1] - wj[1]*rel[0] );
+        for ( int k = 0 ; k < 3 ; k++ )
+            uc[k] = Ej[k][0]*ucw[0] + Ej[k][1]*ucw[1] + Ej[k][2]*ucw[2];
+
+        // A first pass fixes the foot, which the slip is then measured at. The
+        // foot depends only on the axle position, so this is not an iteration.
+        double runZ = tr->padZ + tr->thickness;
+        double footL[3] = { c[0], c[1], runZ }, footW[3];
+        for ( int k = 0 ; k < 3 ; k++ )
+            footW[k] = rw[k] + Ej[0][k]*footL[0] + Ej[1][k]*footL[1] + Ej[2][k]*footL[2];
+
+        double ar[3], aj[3], usw[3], us[3];
+        for ( int k = 0 ; k < 3 ; k++ ) { ar[k] = footW[k] - cw[k]; aj[k] = footW[k] - rw[k]; }
+        usw[0] = ( vr[0] + wr[1]*ar[2] - wr[2]*ar[1] ) - ( vj[0] + wj[1]*aj[2] - wj[2]*aj[1] );
+        usw[1] = ( vr[1] + wr[2]*ar[0] - wr[0]*ar[2] ) - ( vj[1] + wj[2]*aj[0] - wj[0]*aj[2] );
+        usw[2] = ( vr[2] + wr[0]*ar[1] - wr[1]*ar[0] ) - ( vj[2] + wj[0]*aj[1] - wj[1]*aj[0] );
+        for ( int k = 0 ; k < 3 ; k++ )
+            us[k] = Ej[k][0]*usw[0] + Ej[k][1]*usw[1] + Ej[k][2]*usw[2];
+
+        TrkFaceForce ff;
+        if ( !trkFaceForce( prm, tr, ro, c, uc, us, &ff ) ) continue;
+
+        // Two application points, so two wrench pairs -- each computed once and
+        // negated, the same discipline as the pin path.
+        double Fc[3], Ff[3];
+        for ( int k = 0 ; k < 3 ; k++ ) {
+            Fc[k] = Ej[0][k]*ff.fCons[0] + Ej[1][k]*ff.fCons[1] + Ej[2][k]*ff.fCons[2];
+            Ff[k] = Ej[0][k]*ff.fFric[0] + Ej[1][k]*ff.fFric[1] + Ej[2][k]*ff.fFric[2];
+        }
+
+        double mc[3], mf[3];
+        mc[0] = cw[1]*Fc[2] - cw[2]*Fc[1];
+        mc[1] = cw[2]*Fc[0] - cw[0]*Fc[2];
+        mc[2] = cw[0]*Fc[1] - cw[1]*Fc[0];
+        mf[0] = footW[1]*Ff[2] - footW[2]*Ff[1];
+        mf[1] = footW[2]*Ff[0] - footW[0]*Ff[2];
+        mf[2] = footW[0]*Ff[1] - footW[1]*Ff[0];
+
+        for ( int k = 0 ; k < 3 ; k++ ) {
+            fext[ j*6 + k     ] += mc[k] + mf[k];
+            fext[ j*6 + 3 + k ] += Fc[k] + Ff[k];
+            fext[ s*6 + k     ] -= mc[k] + mf[k];
+            fext[ s*6 + 3 + k ] -= Fc[k] + Ff[k];
+        }
+    }
+}
+
 // Every body that receives a contact wrench must have been generated with
 // external-force support, or its slots are silently never read: the force
 // would vanish from the dynamics while still summing to zero in the fext
 // array, so the Newton's-third-law check would keep passing. Fail loudly
 // instead. Returns 0 if the model is usable.
+// Largest explicit step this BAND is stable at, the counterpart of
+// groundContactStabilityStep and for the same reason: the binding constraint is
+// the friction regularization, not kn. What changed with the face primitive is
+// which of the two binds.
+//
+// Under pin contact a wrapped roller engaged ~10 pins at once and they shared
+// its load, so the per-pair normal force -- and hence the tangential slope
+// mu*fN/vEps -- stayed low. The running face is a partition of unity whose
+// weights sum to exactly 1, so ONE shoe's worth of contact now carries a whole
+// road wheel. m113's per-pair load went up about tenfold with it, and with it
+// the step limit: 1.11e4 N on a wheel gives mu*fN/vEps = 8.9e5 N.s/m against an
+// 18 kg shoe, so dt < 2m/c = 4.1e-5 s -- tighter than the ground's 1.2e-4 and
+// tighter than the 6.2e-5 the harness was choosing from the ground alone. The
+// symptom was not a blow-up but a slow drip of ~0.05 J single-step energy
+// rises on a run whose NET energy was still falling, which is exactly the
+// signature a marginally unstable explicit damper leaves.
+//
+// fN is the static share over the road wheels, erring short the same way the
+// ground estimate does: bands with no road wheels return 0 and leave the step
+// to the ground.
+static double trackContactStabilityStep( const Model *mdl, const TrackContactParams *prm ) {
+    double mTotal = 0, gMag = 0;
+    for ( int i = 0 ; i < mdl->nbod ; i++ ) mTotal += mdl->body[ i ].mass;
+    for ( int k = 0 ; k < 3 ; k++ ) gMag += mdl->gravity[k] * mdl->gravity[k];
+    gMag = sqrt( gMag );
+    if ( gMag <= 0 || mTotal <= 0 ) return 0;
+
+    int nRoad = 0;
+    for ( int t = 0 ; t < mdl->ntrack ; t++ )
+        for ( int r = 0 ; r < mdl->track[t].nroller ; r++ )
+            if ( !mdl->track[t].roller[r].isEnd ) nRoad++;
+    if ( nRoad == 0 ) return 0;
+
+    double fN = mTotal * gMag / nRoad;               // one wheel's static share
+    double worst = 0;
+    for ( int t = 0 ; t < mdl->ntrack ; t++ ) {
+        const ModelTrack *tr = &mdl->track[ t ];
+        double kn = prm->gain * tr->kn;
+        double cn = 2.0 * prm->zeta * sqrt( kn * tr->mass );
+        double cT = prm->enableFriction ? tr->mu * fN / prm->vEps : 0;
+        double cBody = cn + cT;                      // the weights sum to one shoe
+        if ( cBody <= 0 ) continue;
+        double dt = 2.0 * tr->mass / cBody;
+        if ( worst == 0 || dt < worst ) worst = dt;
+    }
+    return worst;
+}
+
 static int trackContactCheckModel( const Model *mdl, char *err, int errSize ) {
     for ( int t = 0 ; t < mdl->ntrack ; t++ ) {
         const ModelTrack *tr = &mdl->track[ t ];
@@ -316,6 +621,14 @@ static void trackContactFext( const Model *mdl, const TrackContactParams *prm,
             for ( int k = 0 ; k < 3 ; k++ ) {
                 ws[k] = Es[0][k]*v[s][0] + Es[1][k]*v[s][1] + Es[2][k]*v[s][2];
                 vs[k] = Es[0][k]*v[s][3] + Es[1][k]*v[s][4] + Es[2][k]*v[s][5];
+            }
+
+            // Road wheels roll on the shoe's inner face, not on the pins; the
+            // whole pin-against-circle path below applies to the sprocket and
+            // idler only. See the note above trkFaceForce for why.
+            if ( !ro->isEnd ) {
+                trkFaceRoller( prm, tr, ro, Xa, v, fext );
+                continue;
             }
 
             for ( int i = 0 ; i < tr->shoes ; i++ ) {
@@ -396,6 +709,32 @@ static double trackContactPotential( const Model *mdl, const TrackContactParams 
             for ( int a = 0 ; a < 3 ; a++ )
             for ( int b = 0 ; b < 3 ; b++ ) Es[a][b] = Xa[s][a][b];
             xformOrigin( Xa[s], c );
+
+            // Road wheels: mirror trkFaceForce's elastic terms, in the shoe's
+            // frame. U = w(x) * ( 1/2 kn delta^2 + 1/2 kLat cy^2 ).
+            if ( !ro->isEnd ) {
+                double runZ = tr->padZ + tr->thickness;
+                double fade = prm->faceFade * tr->linkLen;
+                for ( int i = 0 ; i < tr->shoes ; i++ ) {
+                    int j = tr->shoe0 + i;
+                    double Ej[3][3], rw[3], rel[3], cc[3];
+                    for ( int a = 0 ; a < 3 ; a++ )
+                    for ( int b = 0 ; b < 3 ; b++ ) Ej[a][b] = Xa[j][a][b];
+                    xformOrigin( Xa[j], rw );
+                    for ( int k = 0 ; k < 3 ; k++ ) rel[k] = c[k] - rw[k];
+                    for ( int k = 0 ; k < 3 ; k++ )
+                        cc[k] = Ej[k][0]*rel[0] + Ej[k][1]*rel[1] + Ej[k][2]*rel[2];
+
+                    double dd = cc[2] - runZ;
+                    if ( dd <= 0 ) continue;
+                    double delta = ro->radius - dd;
+                    if ( delta <= 0 ) continue;
+                    double w = trkFaceW( cc[0], tr->linkLen, fade, NULL );
+                    if ( w <= 0 ) continue;
+                    U += w * ( 0.5 * kn * delta * delta + 0.5 * kLat * cc[1] * cc[1] );
+                }
+                continue;
+            }
 
             for ( int i = 0 ; i < tr->shoes ; i++ ) {
                 int j = tr->shoe0 + i;

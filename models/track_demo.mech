@@ -1,7 +1,16 @@
-# Minimal tracked chassis to exercise the 'track' generator block. A floating
-# hull carries a drive sprocket, an idler (the two 'end' pulleys), and two road
-# wheels. The track block expands into a closed band of 12 shoes riding on them.
-# Geometry is placeholder; the point is the expansion, not real HMMWV data.
+# Tracked chassis exercising the 'track' generator block. A floating hull carries
+# a drive sprocket, an idler (the two 'end' pulleys), and two road wheels; the
+# track block expands into a closed band of 40 shoes riding on them. Geometry is
+# placeholder; the point is the expansion, not real HMMWV data.
+#
+# The band is CENTRED ON THE HULL (y = 0) rather than offset to one side. A real
+# vehicle has two of these straddling the centreline, and their loads balance in
+# roll; one band alone, offset 0.5 m from a centreline CG, is a monocycle stood
+# on its edge -- it never reaches a static attitude and the settled ground load
+# ran 11% over the vehicle weight while it kept toppling. Centring it makes the
+# single band statically sound, which is what this model needs to be. m113 is
+# where two real bands are exercised. See track_min.mech for the smallest model
+# that exercises road-wheel face contact at all.
 
 gravity 0 0 -9.81
 stab 0.05
@@ -18,7 +27,7 @@ fext 1
 body                     # 1: drive sprocket (rear end pulley)
 parent 0
 joint revolute y
-tree -1.0 0.5 0.30
+tree -1.0 0 0.30
 mass 80
 cg 0 0 0
 inertia 4 7 4 0 0 0
@@ -27,7 +36,7 @@ fext 1                   # contact reaction from the track band
 body                     # 2: idler (front end pulley)
 parent 0
 joint revolute y
-tree 1.0 0.5 0.30
+tree 1.0 0 0.30
 mass 60
 cg 0 0 0
 inertia 3 5 3 0 0 0
@@ -36,7 +45,7 @@ fext 1                   # contact reaction from the track band
 body                     # 3: road wheel 1
 parent 0
 joint revolute y
-tree -0.35 0.5 0.20      # z chosen so the wheel is TANGENT to the belt's lower
+tree -0.35 0 0.20      # z chosen so the wheel is TANGENT to the belt's lower
                          # run: the end pulleys sit at z 0.30 with radius 0.25,
                          # so the run is at z 0.05, and 0.20 + 0.15 puts this
                          # wheel exactly on it. Unlike m113 this model has no
@@ -51,7 +60,7 @@ fext 1
 body                     # 4: road wheel 2
 parent 0
 joint revolute y
-tree 0.35 0.5 0.20       # tangent to the lower run, as above
+tree 0.35 0 0.20       # tangent to the lower run, as above
 mass 50
 cg 0 0 0
 inertia 2 3 2 0 0 0
@@ -60,13 +69,18 @@ fext 1
 track demo_band
 root 0
 plane xz
-shoes 40                            # not 12: a roller is carried by the pins
+shoes 40                            # not 12: an END roller is carried by the pins
                                     # either side of it, so the shoe pitch has
-                                    # to stay well under the roller DIAMETER or
-                                    # the wheel falls straight between two pins.
-                                    # 12 shoes gave a 0.464 m pitch against
-                                    # 0.30 m road wheels and the hull sank right
-                                    # through its own track. 40 gives 0.139 m
+                                    # to stay under the sprocket/idler DIAMETER
+                                    # or those pulleys fall straight between two
+                                    # pins. 12 shoes gave a 0.464 m pitch against
+                                    # 0.50 m end pulleys; 40 gives 0.139 m.
+                                    # This says nothing about the ROAD wheels --
+                                    # they roll on the shoe's flat inner face,
+                                    # which cannot be fallen between at any
+                                    # pitch. The original note here reasoned
+                                    # from the road wheels and was wrong about
+                                    # why the number had to change.
 pitch 0.139
 mass 5.0
 cg 0 0 0
@@ -80,6 +94,9 @@ roller 4 0.15                       # road wheel 2
 pad -0.05 0.11 0.30                 # ground pad: 0.05 below the pin line, inset
                                     # from the 0.139 link so adjacent pads do
                                     # not put corners on the shared pins
+thickness 0.05                      # running face on the pin plane; the road
+                                    # wheels roll on it, the pins engage only
+                                    # the sprocket and idler
 kn 3.5e6
 kt 1.0e6
 mu 0.8

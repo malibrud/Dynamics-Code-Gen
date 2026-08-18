@@ -7,7 +7,13 @@ set SRC=%ROOT%src
 
 rem Every model in this list is generated, validated against the dense
 rem reference, and benchmarked. The build fails on any disagreement.
-set MODELS=threelink fourlink elbow stanford gantry pendulums bintree satellite fourbar rrrs slidercrank quartercar springpend halfcar hmmwv hmmwv_pitman track_demo m113
+set MODELS=threelink fourlink elbow stanford gantry pendulums bintree satellite fourbar rrrs slidercrank quartercar springpend halfcar hmmwv hmmwv_pitman track_min track_demo m113
+
+rem Named models on the command line replace that list, so one model can be taken
+rem through the whole pipeline on its own while it is being debugged:
+rem     build.bat track_min
+
+if not "%~1"=="" set MODELS=%*
 
 if not exist "%BUILD%" mkdir "%BUILD%"
 

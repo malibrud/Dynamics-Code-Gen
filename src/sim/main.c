@@ -109,12 +109,40 @@ static double bandWorstPenetration( const Model *mdl, const TrackContactParams *
     *nLoaded = 0;
     for ( int t = 0 ; t < mdl->ntrack ; t++ ) {
         const ModelTrack *tr = &mdl->track[t];
+        double runZ = tr->padZ + tr->thickness;
+        double fade = prm->faceFade * tr->linkLen;
         for ( int r = 0 ; r < tr->nroller ; r++ ) {
             const ModelTrackRoller *ro = &tr->roller[r];
             int s = ro->body;
             double Es[3][3], c[3];
             for ( int a = 0 ; a < 3 ; a++ ) for ( int e = 0 ; e < 3 ; e++ ) Es[a][e] = Xa[s][a][e];
             xformOrigin( Xa[s], c );
+
+            // The metric has to match the primitive. A road wheel rolls on the
+            // shoe's inner running face, so its penetration is measured to that
+            // face -- and its PINS are not constrained at all, sitting a chord's
+            // worth OUTSIDE the pitch circle by construction. Measuring them
+            // against the circle would report a large penetration for a wheel
+            // resting exactly where it should.
+            if ( !ro->isEnd ) {
+                for ( int i = 0 ; i < tr->shoes ; i++ ) {
+                    int j = tr->shoe0 + i;
+                    double Ej[3][3], rw[3], rel[3], cc[3];
+                    for ( int a = 0 ; a < 3 ; a++ ) for ( int e = 0 ; e < 3 ; e++ ) Ej[a][e] = Xa[j][a][e];
+                    xformOrigin( Xa[j], rw );
+                    for ( int k = 0 ; k < 3 ; k++ ) rel[k] = c[k] - rw[k];
+                    for ( int k = 0 ; k < 3 ; k++ )
+                        cc[k] = Ej[k][0]*rel[0] + Ej[k][1]*rel[1] + Ej[k][2]*rel[2];
+                    double dd = cc[2] - runZ;
+                    if ( dd <= 0 ) continue;
+                    if ( trkFaceW( cc[0], tr->linkLen, fade, NULL ) <= 0 ) continue;
+                    double delta = ro->radius - dd;
+                    if ( delta > worst ) worst = delta;
+                    if ( delta > 0 ) (*nLoaded)++;
+                }
+                continue;
+            }
+
             for ( int i = 0 ; i < tr->shoes ; i++ ) {
                 int j = tr->shoe0 + i;
                 double p[3], rel[3], d[3];
@@ -235,9 +263,29 @@ static int runTrackSim( const Model *mdl, const char *path ) {
     // 4 s, not the 0.6 s the band alone needed. Standing the vehicle up excites
     // a slow heave/pitch mode on the torsion bars -- about 1 s per cycle on
     // m113 -- and the settled load is not meaningful until that has rung down.
-    const double T_RAMP = 0.2, T_SETTLE = 4.0;
+    // T_RAMP IS SHORT ON PURPOSE, and it used to be 0.2 s. The ramp existed to
+    // relax a band jammed 0.22 m into its own rollers by the two-pulley belt
+    // idealization. Now that the belt is built around the full roller hull the
+    // design pose starts within 0.009 m of equilibrium, and a long ramp does
+    // the opposite of what it was for: while contact is still at low gain the
+    // whole vehicle free-falls, and 0.2 s of that is 1/2*9.81*0.2^2 = 0.196 m
+    // -- almost exactly the depth the road wheels were then found buried in the
+    // band. The gains still ease in, over a window short enough that the drop
+    // is sub-millimetre, and the artificial viscosity still drains what is left.
+    const double T_RAMP = 0.02, T_SETTLE = 4.0;
+    //
+    // BOTH engines get a say, and which one binds depends on the model. The
+    // ground's friction sets it for a light-shoe band like track_demo; the
+    // band's own face friction sets it for m113, where the partition of unity
+    // puts a whole road wheel's load on one shoe. Taking only the ground's
+    // estimate chose 6.2e-5 s for m113 against the band's 4.1e-5 limit, and the
+    // run answered with 10469 single-step energy rises of ~0.05 J while its NET
+    // energy still fell -- a marginally unstable damper, not truncation.
     double DT = 1e-4;
-    double dtStab = groundContactStabilityStep( mdl, &gprm );
+    double dtGnd = groundContactStabilityStep( mdl, &gprm );
+    double dtBand = trackContactStabilityStep( mdl, &prm );
+    double dtStab = dtGnd;
+    if ( dtBand > 0 && ( dtStab == 0 || dtBand < dtStab ) ) dtStab = dtBand;
     if ( dtStab > 0 && 0.5 * dtStab < DT ) DT = 0.5 * dtStab;
     if ( gDtOverride > 0 ) DT = gDtOverride;
     int nsteps = (int)( T_SETTLE / DT );
@@ -245,8 +293,9 @@ static int runTrackSim( const Model *mdl, const char *path ) {
     for ( int i = 0 ; i < mdl->nbod ; i++ ) mTotal += mdl->body[i].mass;
     if ( mdl->ground.has )
         printf( "sim: %s: ground: %d pads, kn %.3g N/m/pt, mu %.3g, mEff %.3g kg, "
-                "stability dt %.2e s -> using dt %.2e s\n",
-                path, mdl->ground.npoint, mdl->ground.kn, mdl->ground.mu, gprm.mEff, dtStab, DT );
+                "stability dt %.2e s (ground %.2e, band %.2e) -> using dt %.2e s\n",
+                path, mdl->ground.npoint, mdl->ground.kn, mdl->ground.mu, gprm.mEff,
+                dtStab, dtGnd, dtBand, DT );
 
     double ePrev = 0, eFirst = 0, eLast = 0, keScale = 0;
     int    energyRises = 0;

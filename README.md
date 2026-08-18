@@ -115,10 +115,19 @@ directly, rather than shelling out to a C compiler.
     nv = 44, nc = 33, mobility 11; 17 loops — the most of any model). Shows the
     format expressing a genuine spatial steering linkage from tree revolutes
     plus loop closures
-  - `track_demo` — a minimal tracked chassis (floating hull, sprocket, idler,
-    two road wheels) carrying a 12-shoe band: the smallest model that
-    exercises the `track` block end to end (see [Track bands](#track-bands)
-    below). Placeholder geometry; the point is the expansion
+  - `track_min` — the smallest model that exercises **road-wheel face
+    contact**: one band, one road wheel, 16 shoes, everything at `y = 0` and
+    every dimension chosen so the design pose *is* the equilibrium pose to
+    within the static deflection. `m113` carries 882 pin pairs and 504 ground
+    pads; this carries 48 and 64, with one face pair loaded at a time, so a
+    failing pair can be printed by hand. This is the model to reach for when a
+    contact gate trips
+  - `track_demo` — a tracked chassis (floating hull, sprocket, idler, two road
+    wheels) carrying a 40-shoe band: exercises the `track` block end to end
+    (see [Track bands](#track-bands) below) with more than one road wheel.
+    Placeholder geometry; the point is the expansion. Its band is centred on
+    the hull, because a single band offset to one side is a monocycle stood on
+    its edge and never reaches a static attitude
   - `m113` — the M113 armored personnel carrier, the first tracked vehicle
     here and by far the largest model: a `floating` hull (7819.24 kg) carrying
     two track assemblies, each a drive sprocket, a translational idler on a
@@ -385,9 +394,14 @@ into `tau`; the rest of the table is untouched and was measured in a single
 earlier session, so it is left as it was rather than half-rewritten.)
 
 (The `track_demo` row also predates [Ground contact](#ground-contact), which
-raised that model from 12 shoes to 40 — 17 bodies to 45 — because 12 could not
-physically stand. Its generated call went 1.6 -> 22.9 us with it. That is the
-model getting bigger, not the solver getting worse.)
+raised that model from 12 shoes to 40 — 17 bodies to 45 — because its sprocket
+and idler could not otherwise carry load. Its generated call went 1.6 -> 22.9 us
+with it. That is the model getting bigger, not the solver getting worse.)
+
+(`track_min` postdates the table entirely: 20 bodies, nv 30, **2.69 us**
+generated against 18.9 us dense, 7.0x. Its whole contact-in-the-loop step is
+5.8 us — 172k steps/s — which is what makes it usable for the kind of repeated
+settle runs that debugging a contact law needs.)
 
 **Where a contact step actually goes.** `bench_<model>.exe` reports a step
 budget for any model with a band or a ground, since the producers are
@@ -570,27 +584,43 @@ from. Everything else in the format is translation-only at the design pose;
 
 Two things to know:
 
-- **The belt wraps the two `end` pulleys only.** The path is the taut band
-  around the sprocket and idler circles: two tangent runs plus two wrap arcs,
-  with shoes laid evenly by arc length. Other rollers are declared for the
-  contact engine and do not shape the path. For a real tracked vehicle the
-  road wheels push the lower run down onto themselves, so on `m113` they poke
-  ~0.15 m through the design-pose lower run and the perimeter comes out
-  9.474 m rather than 63 x 0.154 = 9.702 (2.3% short — almost exactly the
-  road-wheel wrap the idealization leaves out). The band is dynamically
-  correct either way; it is the initial geometry that is idealized.
+- **The belt is the convex hull of every roller circle.** The path is the taut
+  band around all of them — gift-wrapped by outer tangents, so it comes out as a
+  sequence of tangent runs and wrap arcs, with shoes laid evenly by arc length.
+  Every roller shapes the path, not just the two `end` pulleys, which is why
+  every one of them has to be locatable in the root frame at the design pose.
+
+  This used to wrap the two `end` pulleys only, and the difference was not
+  cosmetic. A two-pulley belt runs straight from sprocket to idler, so `m113`'s
+  five road wheels poked up to **0.22 m** through their own track before
+  anything had moved, and the perimeter came out 9.474 m against
+  63 x 0.154 = 9.702 (2.3% short — almost exactly the road-wheel wrap the
+  idealization left out). Wrapping the hull closes both gaps: the design pose
+  now sits within **0.009 m** of equilibrium, and `linkLen` agrees with the
+  declared pitch and with the sprocket's tooth pitch. For two rollers the hull
+  walk reproduces the old two-pulley path exactly (9.474466 against 9.474470),
+  which is how it was checked.
+
+  The one subtlety is the tie-break: `m113`'s five road wheels are collinear and
+  equal-radius, so the gift-wrap has to prefer the *farthest* candidate among
+  those tied on turn angle, or it staples itself to the nearest wheel and skips
+  the rest.
 - **`pitch` is advisory.** The link length actually used is perimeter / N,
   reported as `linkLen`, since the shoes must close on the path exactly.
 - The contact data (`pad`, `kn`, `kt`, `mu`, `teeth`) is parsed and kept for the
   contact force engines, which live outside this loader — see
   [Track contact](#track-contact) and [Ground contact](#ground-contact).
-- **Shoe pitch has to stay well under the roller diameter.** A roller is carried
-  by the pins either side of it, so once the pitch reaches `2R` the roller passes
-  clean between two consecutive pins and can never carry load, however stiff the
-  contact is. `modelLoad` warns. This is not hypothetical: `track_demo` used to
-  declare 12 shoes on a 5.57 m perimeter — a 0.464 m pitch against 0.30 m road
-  wheels — and its hull sank straight through its own track the moment there was
-  a ground to stand on. It now has 40.
+- **Shoe pitch has to stay well under the `end` rollers' diameter.** A sprocket
+  or idler is carried by the pins either side of it, so once the pitch reaches
+  `2R` it passes clean between two consecutive pins and can never carry load,
+  however stiff the contact is. `modelLoad` warns.
+
+  This applies to the **`end` rollers only**. Road wheels roll on the shoe's flat
+  inner face, which cannot be fallen between at any pitch, so warning about them
+  is warning about the contact primitive rather than about the model. The warning
+  used to cover every roller, and `track_demo` was rebuilt from 12 shoes to 40 to
+  satisfy a constraint its road wheels never had. 40 is still right, but for the
+  other reason: 12 gives a 0.464 m pitch against 0.50 m end pulleys.
 
 ## Track contact
 
@@ -637,7 +667,63 @@ persistent-anchor stick model, which could not be evaluated at a random state
 at all. The honest cost is that a loaded stationary vehicle creeps at up to
 `vEps` ≈ 1 cm/s.
 
-**One primitive for every roller.** The shoe frame's *origin is a pin*
+**Two primitives, not one, and which applies is set by `end`.** Pins engage the
+sprocket and idler; road wheels roll on the flat inner face of the shoe between
+them. Modelling a road wheel as pin-against-circle gets two things wrong, both
+of which showed up:
+
+- At rest the pin polygon cuts a sagitta `R − √(R² − ds²/4)` **into** the wheel
+  — 9.4 mm on `m113` — so the wheel is embedded in the surface it is meant to
+  be rolling on, and the error grows as the square of the pitch.
+- A wheel resting on points can fall between two of them once the pitch reaches
+  `2R`. A wheel resting on a face cannot, at any pitch.
+
+The face law is worked entirely in the **shoe's** frame, where the running
+surface is flat and axis-aligned: the plane `z = padZ + thickness`, spanning
+`x ∈ [0, linkLen]`, with the rollers on its `+z` side because the band wraps the
+outside. `thickness` is a new `track` key, and it is declared alongside `pad`
+rather than independently precisely so the two cannot drift: the face is derived
+from the pad, at `padZ + thickness`.
+
+**Shoes tile the band end to end, so the face weight is a partition of unity.**
+A hard `x ∈ [0, linkLen]` test hands a wheel's load from one shoe to the next
+discontinuously; a symmetric fade leaves a support dip at every pin, since shoe
+*i+1*'s face *begins* where shoe *i*'s ends. Instead each face's weight reaches
+`fade` past both of its own ends with complementary smoothsteps, so
+`w_i(x) + w_{i+1}(x − linkLen) ≡ 1` across the joint and both are exactly ½ at
+the pin. Support transfers smoothly and is never doubled or dropped.
+
+That weight makes this a **gated potential** `U = ½·w(x)·k·δ²`, so `−∇U` carries
+a tangential term `½·k·δ²·w′(x)` beside the normal one — structurally the same
+trap as the tooth law's missing `g′(δ)·U₀`, in a new place. It is included, and
+the harness finite-differences the whole gradient rather than waiting for a
+trajectory to notice.
+
+**The two halves act at different points, so they take different velocities.**
+The conservative part is a function of the axle's position in the shoe frame and
+acts **at the axle**, conjugate to the axle's velocity relative to the shoe.
+Friction is a surface effect and acts **at the foot** — the only place it can
+spin the wheel — conjugate to the surface slip there. A rolling wheel drives the
+slip to zero while its axle is still moving quite fast, so these are genuinely
+two different vectors and the law needs both.
+
+**A sign that cost a debugging session.** Both of the face law's velocities are
+the *roller* against the shoe, where the pin law's `u` is the *shoe* against the
+roller — while both report the force *on the shoe*. So friction's coefficient is
+**positive** here and negative there. Copying the pin law's line verbatim turns
+the friction into an anti-damper: with force `f = sc·u_s` on the shoe and `−f` on
+the roller, the pair does work at `−f·u_s`, so a negative `sc` *injects*
+`μ·f_N·|u_s|` watts. On `track_min` that drove the band round under its own
+friction and grew total energy by 5e6 J over a four-second settle.
+
+Every check in the harness passed while it did so, because all of them drove
+`trkPairForce` — the pin path, which road wheels no longer take. The passivity
+check in particular reported `worst power 0.000e+00 W`. There are now three
+checks that drive `trkFaceForce` directly (partition of unity, `F = ∇U`, and
+passivity + cone), and the passivity one catches the bug at a *state*, naming
+the position and both velocities, rather than after a trajectory.
+
+**One pin primitive for the `end` rollers.** The shoe frame's *origin is a pin*
 (`model.h`: "the shoe frame is at its own pin, the next pin is at +linkLen on
 x"), so walking shoes `shoe0 .. shoe0+N-1` visits all N pins exactly once
 with no local-point transform, and a pin's world velocity is exactly
@@ -719,8 +805,10 @@ refuses to run on a model whose roller bodies lack the flag, since the failure
 mode is otherwise invisible: the wrench still sums to zero in the `fext` array
 while quietly never reaching the dynamics.
 
-**Three things about the design pose**, all consequences of the belt wrapping
-only the two `end` pulleys:
+**Three things about the design pose.** All three were consequences of the belt
+wrapping only the two `end` pulleys; the hull generalisation has since closed the
+second and third, and they are kept here because they are what the design-pose
+regression is shaped around:
 
 - Pins do **not** sit exactly on the pitch circle. The loader takes each
   shoe's direction from the chord between pins but its length from the *arc*
@@ -729,24 +817,40 @@ only the two `end` pulleys:
   the reconstructed pins drift a few millimetres *outside*. The radial force
   is zero there because the one-sided clamp fires, not because δ = 0 — so the
   regression asserts `δ ≤ 0`, never `|δ| ≈ 0`.
-- The five road wheels per side poke **0.17–0.25 m** through the design-pose
-  lower run (the "~0.15 m" quoted under [Track bands](#track-bands) understates
-  it). At full stiffness that is order 1e6 N per side against a 1.1e5 N
-  vehicle weight, so the settling run ramps the gains in over 0.2 s with heavy
-  initial damping, letting the band relax through the same force law that runs
-  afterwards rather than through a separate assembly path.
+- The five road wheels per side used to poke **0.17–0.25 m** through the
+  design-pose lower run. Wrapping the hull brings that to **0.0087 m**, which
+  is what lets the gain ramp be short: it existed to relax a band jammed into
+  its own rollers, and while the gains are low the whole vehicle free-falls, so
+  0.2 s of ramp drops it 0.196 m — almost exactly the depth the wheels were then
+  found buried at. The ramp is now 0.02 s and the drop is sub-millimetre.
 - The sprocket's tooth arc pitch `2πR/N` = 0.153938 m is *exactly* the real
-  0.154 m shoe pitch, but `linkLen` comes out 2.36% short for the same
-  wrap-shortfall reason, so the phase error over the ~5 engaged pins spans
-  about ±5.8% of a pitch. Net torque largely cancels; per-pin forces do not.
-  `modelLoad` now warns when a drive sprocket's tooth pitch is more than 5%
-  off the shoe pitch — `m113` is fine at 2.4%, `track_demo` is 62% off and
-  says outright that its geometry is placeholder.
+  0.154 m shoe pitch, and `linkLen` used to come out 2.36% short for the same
+  wrap-shortfall reason. The hull belt makes the two agree. `modelLoad` warns
+  when a drive sprocket's tooth pitch is more than 5% off the shoe pitch, and
+  separately when the belt perimeter over `shoes` lands more than 5% off the
+  declared `pitch` — that second warning only became meaningful once the belt
+  wrapped everything, and it is what says the shoe count and the roller layout
+  disagree about how long the track is.
 
-The permanent fix for all three — generalising `trkBuildBelt` to the convex
-hull of every roller circle rather than just the two end pulleys — is
-deferred, so that a large geometric change is not debugged at the same time
-as a new force law.
+**A stiffness consequence of the face primitive, worth stating separately.**
+`kn` is per contact pair, and the two primitives share load very differently. A
+pin wrap engages ~10 pins at once and they split the roller's load; the running
+face is a partition of unity whose weights sum to exactly **1**, so one shoe's
+stiffness carries a whole road wheel. `m113`'s `kn = 2e5` was sized for the pin
+path and left the wheels deflecting 55 mm into the band once they moved to the
+face — it is now `2.5e6`, giving 4.4 mm under a 1.11e4 N wheel share. `track_min`
+and `track_demo`, both authored after the face law, sit at 3.5e6 already, which
+is why neither showed the problem.
+
+That also moves the **step-size limit**. As on the ground, it is the friction
+regularisation and not `kn` that binds: `μ·f_N/vEps` against the shoe mass. A
+tenfold rise in per-pair load is a tenfold rise in that slope, so
+`trackContactStabilityStep` now exists beside `groundContactStabilityStep` and
+`src/sim/main.c` takes the tighter of the two. On `m113` the band asks for
+4.1e-5 s against the ground's 1.2e-4; choosing from the ground alone gave 6.2e-5
+and the run answered with 10469 single-step energy rises of ~0.05 J while its
+*net* energy still fell — the signature of a marginally unstable explicit damper
+rather than of truncation.
 
 **Verification, and why not against Chrono.** Chrono's `ChSprocketSinglePin`
 runs its own narrowphase callback against a hand-authored tooth profile from
@@ -927,11 +1031,11 @@ terrain — the honest replacement for `hmmwv`'s four shaker posts and `distance
 "tire" rods — reintroduces exactly the gradient subtlety the vertical-gap point
 formulation avoids, so it waits.
 
-The remaining fidelity gap is unchanged and is the band's, not the ground's: the
-belt still wraps only the two `end` pulleys, so m113's road wheels start 0.22 m
-through the lower run and the settle has to relax that before it can stand. It
-does — 0.2237 → 0.0348 m over 4 s — but generalizing `trkBuildBelt` to the convex
-hull of every roller circle is what would make it clean.
+The fidelity gap that stood here — the belt wrapping only the two `end` pulleys,
+leaving m113's road wheels 0.22 m through the lower run for the settle to relax —
+is closed. `trkBuildBelt` gift-wraps the convex hull of every roller circle, and
+the road wheels roll on the shoe's flat inner face rather than on its pins; the
+design pose now starts 0.0087 m from equilibrium and settles to 0.0049 m.
 
 ## Force elements and points of interest
 
