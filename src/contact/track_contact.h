@@ -545,9 +545,29 @@ static void trkFaceRoller( const TrackContactParams *prm, const ModelTrack *tr,
 // rises on a run whose NET energy was still falling, which is exactly the
 // signature a marginally unstable explicit damper leaves.
 //
-// fN is the static share over the road wheels, erring short the same way the
-// ground estimate does: bands with no road wheels return 0 and leave the step
-// to the ground.
+// fN is the static share over EVERY roller, not just the road wheels. Which
+// rollers actually carry ground load is a property of the layout, not of the
+// primitive: on a hull-wrapped belt the sprocket and idler sit on the lower run
+// too, and on track_demo all four rollers are tangent to it. Counting road
+// wheels only doubled track_demo's estimate of the per-pair load and quartered
+// its step, taking its settle from 288k steps to 1.4M for no stability gain.
+//
+// BUT KNOW WHAT THIS COSTS. Counting every roller assumes every roller shares
+// the ground load, and on m113 that is false: its sprocket and idler sit well
+// above the road wheels and carry none of it, so the true denominator there is
+// 5 per band and not 7. Measured on m113, the worst single-step energy rise
+// goes 0.00029 J at dt 2.02e-5, 0.00161 J at 2.83e-5 and 0.05535 J at 6.22e-5
+// -- about dt^5, far steeper than the dt^2..dt^3 of truncation, which puts the
+// real boundary near 4e-5. This function now returns 5.65e-5 for m113, ABOVE
+// that boundary; only the caller's 0.5 factor brings it back under. The old
+// road-wheel denominator returned 4.04e-5 and the halving bought real margin.
+//
+// So the safety factor is no longer belt-and-braces here, it is load-bearing.
+// The principled version counts the rollers actually near the lower run --
+// modelLoad already has every roller's centre and radius in the root frame from
+// the hull walk, so "bottom within a radius of the lowest bottom" is a few
+// lines there -- and would give m113 5 and track_demo 4, which is what each
+// model physically has. Models with no band return 0 and leave it to the ground.
 static double trackContactStabilityStep( const Model *mdl, const TrackContactParams *prm ) {
     double mTotal = 0, gMag = 0;
     for ( int i = 0 ; i < mdl->nbod ; i++ ) mTotal += mdl->body[ i ].mass;
@@ -555,13 +575,11 @@ static double trackContactStabilityStep( const Model *mdl, const TrackContactPar
     gMag = sqrt( gMag );
     if ( gMag <= 0 || mTotal <= 0 ) return 0;
 
-    int nRoad = 0;
-    for ( int t = 0 ; t < mdl->ntrack ; t++ )
-        for ( int r = 0 ; r < mdl->track[t].nroller ; r++ )
-            if ( !mdl->track[t].roller[r].isEnd ) nRoad++;
-    if ( nRoad == 0 ) return 0;
+    int nRoller = 0;
+    for ( int t = 0 ; t < mdl->ntrack ; t++ ) nRoller += mdl->track[t].nroller;
+    if ( nRoller == 0 ) return 0;
 
-    double fN = mTotal * gMag / nRoad;               // one wheel's static share
+    double fN = mTotal * gMag / nRoller;             // one roller's static share
     double worst = 0;
     for ( int t = 0 ; t < mdl->ntrack ; t++ ) {
         const ModelTrack *tr = &mdl->track[ t ];

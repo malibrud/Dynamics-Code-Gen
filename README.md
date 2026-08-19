@@ -846,11 +846,33 @@ That also moves the **step-size limit**. As on the ground, it is the friction
 regularisation and not `kn` that binds: `μ·f_N/vEps` against the shoe mass. A
 tenfold rise in per-pair load is a tenfold rise in that slope, so
 `trackContactStabilityStep` now exists beside `groundContactStabilityStep` and
-`src/sim/main.c` takes the tighter of the two. On `m113` the band asks for
-4.1e-5 s against the ground's 1.2e-4; choosing from the ground alone gave 6.2e-5
-and the run answered with 10469 single-step energy rises of ~0.05 J while its
-*net* energy still fell — the signature of a marginally unstable explicit damper
-rather than of truncation.
+`src/sim/main.c` takes the tighter of the two. Choosing from the ground alone
+gave `m113` 6.2e-5 s and the run answered with 10469 single-step energy rises of
+~0.05 J while its *net* energy still fell — the signature of a marginally
+unstable explicit damper rather than of truncation.
+
+**How the load is assumed to share is the whole content of that estimate, and
+it is currently the weak part.** `f_N` is the vehicle weight over the roller
+count. Dividing by road wheels only is right for `m113`, whose sprocket and
+idler sit above the road wheels and carry no ground load; dividing by *all*
+rollers is right for `track_demo`, where all four are tangent to the lower run.
+The code does the latter, which halves `track_demo`'s settle (1.4M steps to
+698k) and cuts `m113`'s by 28%, at the price of over-estimating `m113`'s step:
+
+| `m113` dt | worst single-step rise | bound | |
+| --- | --- | --- | --- |
+| 2.02e-5 (road wheels) | 0.00029 J | 0.0088 J | pass, 30x margin |
+| 2.83e-5 (all rollers) | 0.00161 J | 0.0094 J | pass, 5.8x margin |
+| 6.22e-5 (ground only) | 0.05535 J | 0.0116 J | **fail** |
+
+The rise goes as roughly `dt⁵` there, not the `dt²`–`dt³` of truncation, which
+puts the real boundary near 4e-5 — *below* the 5.65e-5 the function returns.
+The caller's 0.5 safety factor is what brings it back under, so that factor is
+now load-bearing rather than belt-and-braces. The principled fix is to count the
+rollers actually near the lower run: `modelLoad` already has every roller's
+centre and radius in the root frame from the hull walk, so "bottom within a
+radius of the lowest bottom" is a few lines and gives each model the number it
+physically has.
 
 **Verification, and why not against Chrono.** Chrono's `ChSprocketSinglePin`
 runs its own narrowphase callback against a hand-authored tooth profile from
