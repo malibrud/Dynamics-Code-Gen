@@ -71,6 +71,12 @@ typedef struct {
     // creeps at up to about this rate -- the honest cost of staying stateless.
     double vEps;
 
+    // The caller's step, for SEMI-IMPLICIT FRICTION. Zero means the plain
+    // explicit law, which is what every fixed-state test wants; a positive dt
+    // makes each friction site solve its own damper implicitly over that step,
+    // so no dt can make it inject energy. See the note above trkFricScale.
+    double dt;
+
     // Lateral (guide-horn) stiffness as a fraction of kn.
     double kLatFrac;
 
@@ -105,6 +111,10 @@ static void trackContactDefaults( const Model *mdl, TrackContactParams *p ) {
     p->gateOut    = 0.005;
     p->gateFade   = 0.030;
     p->vEps       = 1.0e-2;
+    // Explicit by default. A stepper sets this to its own dt; everything that
+    // evaluates the law at a fixed state leaves it zero and gets the plain
+    // explicit form, which is what those tests are written against.
+    p->dt         = 0.0;
     p->kLatFrac   = 0.1;
     p->faceFade   = 0.25;
     p->toothPhase = 0.0;
@@ -139,6 +149,48 @@ static double trkGateSlope( double delta, double gateOut, double gateFade ) {
     double x = ( delta + gateOut + gateFade ) / gateFade;
     if ( x <= 0 || x >= 1 ) return 0;
     return 6.0 * x * ( 1.0 - x ) / gateFade;
+}
+
+// ---------------------------------------------------------------------------
+// SEMI-IMPLICIT FRICTION. Returns k, the magnitude of the tangential stiffness
+// to apply as f = k * u_t (the caller owns the sign, which differs between the
+// pin and face laws -- see the note in trkFaceForce).
+//
+// Regularized Coulomb, f = mu*fN*u/sqrt(u^2 + vEps^2), has slope mu*fN/vEps at
+// zero slip. That is a viscous damper of that coefficient, and integrating it
+// explicitly needs dt < 2*m/c. So the step is proportional to vEps, and vEps is
+// ALSO the creep rate of a parked vehicle: the only way to run faster was to
+// creep more, and overstepping did not blow up loudly but dripped single-step
+// energy rises into a run whose net energy still fell.
+//
+// Solving the damper implicitly over the caller's own step removes that
+// coupling. Backward Euler on mEff*du/dt = -k*u gives u' = u/(1 + k*dt/mEff),
+// so the force that produces it is
+//
+//     k_implicit = k / ( 1 + k*dt/mEff )
+//
+// The velocity change it implies is u*(k*dt/mEff)/(1 + k*dt/mEff), a factor
+// strictly inside [0, 1): friction can slow the slip to zero but can never
+// reverse it, at ANY dt. Three things fall out and all three matter:
+//
+//   - dt == 0 reproduces the explicit law exactly, so every fixed-state test
+//     keeps testing precisely what it tested before, unweakened.
+//   - the divisor exceeds 1, so |f| stays strictly inside the cone mu*fN and
+//     the cone checks need no loosening.
+//   - it is smooth in u. An explicit impulse cap, min(k*u, mEff*u/dt), has the
+//     same stability but a kink for the integrator to chatter on.
+//
+// WHAT THIS DOES NOT BUY. The effective regularization velocity becomes about
+// vEps + mu*fN*dt/mEff, so a big step still creeps -- on m113 at dt = 2.8e-4
+// that is ~14 cm/s, roughly what vEps = 0.14 would give. The gain is that the
+// trade is now safe, local and ADAPTIVE: overstepping degrades creep smoothly
+// instead of injecting energy, lightly loaded contacts keep their small vEps
+// because the added term scales with fN, and the step is no longer hostage to
+// whichever single pair happens to be most heavily loaded.
+static double trkFricScale( double mufN, double sp, double vEps, double dt, double mEff ) {
+    double k = mufN / sqrt( sp*sp + vEps*vEps );
+    if ( dt > 0 && mEff > 0 ) k /= 1.0 + k * dt / mEff;
+    return k;
 }
 
 // ---------------------------------------------------------------------------
@@ -267,7 +319,10 @@ static int trkPairForce( const TrackContactParams *prm, const ModelTrack *tr,
     if ( prm->enableFriction && fN > 0 && !ro->isDrive ) {
         double tux = u[0] - un*nx, tuy = u[1], tuz = u[2] - un*nz;
         double sp  = sqrt( tux*tux + tuy*tuy + tuz*tuz );
-        double sc  = -tr->mu * fN / sqrt( sp*sp + prm->vEps*prm->vEps );
+        // mEff is the shoe mass: the shoe frame's origin IS a pin, so a shoe
+        // brings exactly one pin to this law and the impulse it receives
+        // accelerates the whole shoe.
+        double sc  = -trkFricScale( tr->mu * fN, sp, prm->vEps, prm->dt, tr->mass );
         fx += sc*tux; fy += sc*tuy; fz += sc*tuz;
     }
 
@@ -426,7 +481,10 @@ static int trkFaceForce( const TrackContactParams *prm, const ModelTrack *tr,
     double ffx = 0, ffy = 0;
     if ( prm->enableFriction && fN > 0 ) {
         double sp = sqrt( us[0]*us[0] + us[1]*us[1] );
-        double sc = tr->mu * fN / sqrt( sp*sp + prm->vEps*prm->vEps );
+        // mEff is the shoe mass: the face weights are a partition of unity, so
+        // one shoe's worth of contact carries this wheel and the impulse
+        // accelerates that shoe.
+        double sc = trkFricScale( tr->mu * fN, sp, prm->vEps, prm->dt, tr->mass );
         ffx = sc * us[0];
         ffy = sc * us[1];
     }
@@ -552,22 +610,23 @@ static void trkFaceRoller( const TrackContactParams *prm, const ModelTrack *tr,
 // wheels only doubled track_demo's estimate of the per-pair load and quartered
 // its step, taking its settle from 288k steps to 1.4M for no stability gain.
 //
-// BUT KNOW WHAT THIS COSTS. Counting every roller assumes every roller shares
-// the ground load, and on m113 that is false: its sprocket and idler sit well
-// above the road wheels and carry none of it, so the true denominator there is
-// 5 per band and not 7. Measured on m113, the worst single-step energy rise
-// goes 0.00029 J at dt 2.02e-5, 0.00161 J at 2.83e-5 and 0.05535 J at 6.22e-5
-// -- about dt^5, far steeper than the dt^2..dt^3 of truncation, which puts the
-// real boundary near 4e-5. This function now returns 5.65e-5 for m113, ABOVE
-// that boundary; only the caller's 0.5 factor brings it back under. The old
-// road-wheel denominator returned 4.04e-5 and the halving bought real margin.
+// BUT KNOW WHAT THAT COSTS, and it is the reason semi-implicit friction exists.
+// Counting every roller assumes every roller shares the ground load, and on
+// m113 that is false: its sprocket and idler sit well above the road wheels and
+// carry none of it, so the true denominator there is 5 per band and not 7.
+// Measured on m113 with EXPLICIT friction, the worst single-step energy rise
+// went 0.00029 J at dt 2.02e-5, 0.00161 J at 2.83e-5 and 0.05535 J at 6.22e-5
+// -- about dt^5, far steeper than the dt^2..dt^3 of truncation, which put the
+// real boundary near 4e-5 against an estimate of 5.65e-5. Only the caller's 0.5
+// factor kept that under, so the safety factor had become load-bearing and the
+// estimate had to be right to within a factor of two.
 //
-// So the safety factor is no longer belt-and-braces here, it is load-bearing.
-// The principled version counts the rollers actually near the lower run --
-// modelLoad already has every roller's centre and radius in the root frame from
-// the hull walk, so "bottom within a radius of the lowest bottom" is a few
-// lines there -- and would give m113 5 and track_demo 4, which is what each
-// model physically has. Models with no band return 0 and leave it to the ground.
+// WHICH BRANCH RUNS DEPENDS ON prm->dt. With dt > 0 the friction damper is
+// solved implicitly (see trkFricScale) and cannot destabilize at any step, so
+// including its slope here would report a limit that no longer exists; what is
+// left is the normal spring, one to two orders of magnitude looser. With
+// dt == 0 the friction term is live and this returns the explicit limit as
+// before. Models with no band return 0 and leave the step to the ground.
 static double trackContactStabilityStep( const Model *mdl, const TrackContactParams *prm ) {
     double mTotal = 0, gMag = 0;
     for ( int i = 0 ; i < mdl->nbod ; i++ ) mTotal += mdl->body[ i ].mass;
@@ -580,15 +639,24 @@ static double trackContactStabilityStep( const Model *mdl, const TrackContactPar
     if ( nRoller == 0 ) return 0;
 
     double fN = mTotal * gMag / nRoller;             // one roller's static share
+    int implicitFric = prm->dt > 0;
     double worst = 0;
     for ( int t = 0 ; t < mdl->ntrack ; t++ ) {
         const ModelTrack *tr = &mdl->track[ t ];
         double kn = prm->gain * tr->kn;
         double cn = 2.0 * prm->zeta * sqrt( kn * tr->mass );
-        double cT = prm->enableFriction ? tr->mu * fN / prm->vEps : 0;
+        double cT = ( prm->enableFriction && !implicitFric )
+                        ? tr->mu * fN / prm->vEps : 0;
         double cBody = cn + cT;                      // the weights sum to one shoe
         if ( cBody <= 0 ) continue;
         double dt = 2.0 * tr->mass / cBody;
+        // With friction implicit the spring's own period, not its damper, is
+        // what an explicit step has to resolve: 2/omega = 2*sqrt(m/kn) is an
+        // order tighter than 2m/cn at zeta 0.2 and is the honest bound.
+        if ( implicitFric && kn > 0 ) {
+            double dtOsc = 2.0 * sqrt( tr->mass / kn );
+            if ( dtOsc < dt ) dt = dtOsc;
+        }
         if ( worst == 0 || dt < worst ) worst = dt;
     }
     return worst;

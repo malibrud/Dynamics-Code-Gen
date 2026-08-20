@@ -81,8 +81,24 @@ typedef struct {
 
     // Regularization speed for Coulomb friction. Also the creep rate of a
     // parked vehicle, and -- see groundContactStabilityStep -- the quantity
-    // that actually sets the usable step size.
+    // that used to set the usable step size on its own.
     double vEps;
+
+    // The caller's step, for SEMI-IMPLICIT FRICTION. Zero means the plain
+    // explicit law, which is what every fixed-state test wants. See the note
+    // above gndFricScale.
+    double dt;
+
+    // Mass the friction impulse at ONE contact point actually accelerates.
+    //
+    // THIS IS NOT mEff ABOVE, and the two must not be confused. mEff is the
+    // SUPPORTED mass, M_total/n_loaded, which sizes the normal damper so the
+    // vehicle heave mode gets the declared zeta -- it is deliberately much
+    // larger than any one body. What the friction impulse accelerates is the
+    // local body's share: a shoe over its four pad corners. Using the
+    // supported mass here would under-limit the impulse and forfeit exactly
+    // the stability guarantee the implicit form exists to provide.
+    double mImpulse;
 
     int enableFriction;
 } GroundContactParams;
@@ -140,6 +156,19 @@ static void groundContactDefaults( const Model *mdl, GroundContactParams *p ) {
     for ( int i = 0 ; i < mdl->nbod ; i++ ) mTotal += mdl->body[ i ].mass;
     int n = groundLoadedEstimate( mdl );
     p->mEff = n > 0 ? mTotal / n : mTotal;
+
+    // And the OTHER mass, the one the friction impulse accelerates: a shoe's
+    // share over its four pad corners. Smallest across the bands, since the
+    // limit has to hold for the lightest shoe in the model. Falls back to mEff
+    // for a padded model with no band, which cannot happen today but would
+    // otherwise leave this zero and silently disable the implicit form.
+    double mIm = 0;
+    for ( int t = 0 ; t < mdl->ntrack ; t++ ) {
+        if ( !mdl->track[t].hasPad ) continue;
+        double m = mdl->track[t].mass / 4.0;
+        if ( mIm == 0 || m < mIm ) mIm = m;
+    }
+    p->mImpulse = mIm > 0 ? mIm : p->mEff;
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +189,38 @@ typedef struct {
     double fN;         // true normal load magnitude, = s*|grad g|
     double n[3];       // unit surface normal
 } GndPointForce;
+
+// ---------------------------------------------------------------------------
+// SEMI-IMPLICIT FRICTION. Returns k, the tangential stiffness magnitude to
+// apply as f = -k*u_t. Written out here rather than shared with
+// track_contact.h's trkFricScale, on the same reasoning as the rest of this
+// file: the two-independent-routes discipline is worth more than four
+// deduplicated lines.
+//
+// Regularized Coulomb has slope mu*fN/vEps at zero slip, which is a viscous
+// damper of that coefficient, so an explicit step needs dt < 2*m/c. That makes
+// the step proportional to vEps -- and vEps is also the parked vehicle's creep
+// rate, so speed could only be bought with creep. Backward Euler on
+// mEff*du/dt = -k*u gives u' = u/(1 + k*dt/mEff), hence
+//
+//     k_implicit = k / ( 1 + k*dt/mEff )
+//
+// whose implied velocity change is a factor strictly inside [0, 1): friction
+// can bring the slip to zero but never reverse it, at any dt. dt == 0 gives
+// back the explicit law exactly, the divisor keeps |f| strictly inside the cone
+// mu*fN, and it is smooth in u (an explicit impulse cap min(k*u, mEff*u/dt)
+// would be stable too, but with a kink the integrator can chatter on).
+//
+// It does not make big steps free: the effective regularization velocity
+// becomes about vEps + mu*fN*dt/mEff, so a large dt still creeps. What it buys
+// is that the trade degrades smoothly instead of over a stability cliff, and
+// that it is local -- lightly loaded points keep their small vEps, because the
+// added term is proportional to fN.
+static double gndFricScale( double mufN, double sp, double vEps, double dt, double mEff ) {
+    double k = mufN / sqrt( sp*sp + vEps*vEps );
+    if ( dt > 0 && mEff > 0 ) k /= 1.0 + k * dt / mEff;
+    return k;
+}
 
 static int gndPointForce( const GroundContactParams *prm, const ModelGround *gnd,
                           const double p[3], const double u[3], GndPointForce *out ) {
@@ -206,7 +267,8 @@ static int gndPointForce( const GroundContactParams *prm, const ModelGround *gnd
         double ut[3];
         for ( int k = 0 ; k < 3 ; k++ ) ut[k] = u[k] - un * out->n[k];
         double sp = sqrt( ut[0]*ut[0] + ut[1]*ut[1] + ut[2]*ut[2] );
-        double sc = -gnd->mu * out->fN / sqrt( sp*sp + prm->vEps*prm->vEps );
+        double sc = -gndFricScale( gnd->mu * out->fN, sp, prm->vEps,
+                                   prm->dt, prm->mImpulse );
         for ( int k = 0 ; k < 3 ; k++ ) out->f[k] += sc * ut[k];
     }
     return 1;
@@ -369,6 +431,12 @@ static double groundContactPotential( const Model *mdl, const GroundContactParam
 // fN is the static share over groundLoadedEstimate points -- deliberately the
 // low count, so the per-point load and hence the tangential slope come out high
 // and the estimate errs short.
+//
+// WITH prm->dt > 0 the friction damper is solved implicitly (see gndFricScale)
+// and cannot destabilize at any step, so its slope is dropped from the estimate
+// and what remains is the normal spring -- which the comment above already
+// notes is an order of magnitude looser. That is the whole point of the change:
+// the quantity that "actually sets the usable step size" stops doing so.
 static double groundContactStabilityStep( const Model *mdl, const GroundContactParams *prm ) {
     if ( !mdl->ground.has || mdl->ground.npoint <= 0 ) return 0;
 
@@ -380,7 +448,8 @@ static double groundContactStabilityStep( const Model *mdl, const GroundContactP
     double kn = prm->gain * mdl->ground.kn;
     double cn = 2.0 * prm->zeta * sqrt( kn * prm->mEff );
     double fN = mTotal * gMag / groundLoadedEstimate( mdl );
-    double cT = prm->enableFriction ? mdl->ground.mu * fN / prm->vEps : 0;
+    double cT = ( prm->enableFriction && prm->dt <= 0 )
+                    ? mdl->ground.mu * fN / prm->vEps : 0;
 
     double worst = 0;
     for ( int t = 0 ; t < mdl->ntrack ; t++ ) {
@@ -388,6 +457,13 @@ static double groundContactStabilityStep( const Model *mdl, const GroundContactP
         if ( !tr->hasPad ) continue;
         double cBody = 4.0 * ( cn + cT );            // four corners on one shoe
         double dt = 2.0 * tr->mass / cBody;
+        // Friction implicit: the spring's own period is what an explicit step
+        // has to resolve, not its damper. Four points share one shoe, so the
+        // stiffness the shoe sees is 4*kn.
+        if ( prm->dt > 0 && kn > 0 ) {
+            double dtOsc = 2.0 * sqrt( tr->mass / ( 4.0 * kn ) );
+            if ( dtOsc < dt ) dt = dtOsc;
+        }
         if ( worst == 0 || dt < worst ) worst = dt;
     }
     return worst;

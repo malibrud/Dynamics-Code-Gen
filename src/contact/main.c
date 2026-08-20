@@ -526,7 +526,7 @@ static int checkPassivity( const Model *mdl, const TrackContactParams *prm ) {
         }
     }
     printf( "contact: passivity: velocity-dependent force dissipates at every sampled state "
-            "(worst power %.3e W)\n", worst );
+            "(worst power %.3e W, dt %.0e)\n", worst, prm->dt );
     return 0;
 }
 
@@ -752,8 +752,101 @@ static int checkFacePassivity( const Model *mdl, const TrackContactParams *prm )
         }
     }
     printf( "contact: face: velocity-dependent force dissipates at every sampled state (worst "
-            "power %.3e W over %d loaded states); friction inside the cone (worst excess %.3e)\n",
-            worst, tested, worstCone );
+            "power %.3e W over %d loaded states, dt %.0e); friction inside the cone (worst "
+            "excess %.3e)\n", worst, tested, prm->dt, worstCone );
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// 11: SEMI-IMPLICIT FRICTION, tested where the property actually lives.
+//
+// Both engines route their Coulomb term through a scale helper, and the claim
+// those helpers make is a hard inequality rather than a tolerance:
+//
+//     k * dt <= mEff        for every dt, so |f|*dt <= mEff*|u|
+//
+// i.e. the friction impulse over one step can never exceed the momentum needed
+// to bring the slip to zero. That is what makes the law unconditionally stable,
+// and it is the whole reason the step size stopped being proportional to vEps.
+// Two more claims come with it: dt == 0 must reproduce the explicit law bit for
+// bit, since every fixed-state test in this file depends on that; and the
+// implicit scale must never EXCEED the explicit one, or the cone checks would
+// be testing a bound the law can now cross.
+//
+// Swept over decades of every argument, both helpers, because a sign or a
+// misplaced reciprocal here would not show up as a failure until a trajectory
+// ran long enough to notice -- which is exactly the trap this change exists to
+// remove.
+// ---------------------------------------------------------------------------
+static int checkFrictionImplicit( void ) {
+    static const double mufNs[] = { 1e-2, 1.0, 5.34e2, 1.11e4, 1e6 };
+    static const double sps[]   = { 0.0, 1e-6, 1e-3, 1e-2, 0.5, 5.0, 50.0 };
+    static const double vEpss[] = { 1e-4, 1e-2, 1e-1 };
+    static const double dts[]   = { 0.0, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2 };
+    static const double mEffs[] = { 1.25, 5.0, 18.02, 1e3 };
+
+    double worstRatio = 0, worstExplicit = 0;
+    int n = 0;
+
+    for ( size_t a = 0 ; a < sizeof mufNs / sizeof *mufNs ; a++ )
+    for ( size_t b = 0 ; b < sizeof sps   / sizeof *sps   ; b++ )
+    for ( size_t c = 0 ; c < sizeof vEpss / sizeof *vEpss ; c++ )
+    for ( size_t d = 0 ; d < sizeof dts   / sizeof *dts   ; d++ )
+    for ( size_t e = 0 ; e < sizeof mEffs / sizeof *mEffs ; e++ ) {
+        double mufN = mufNs[a], sp = sps[b], vEps = vEpss[c];
+        double dt = dts[d], mEff = mEffs[e];
+        n++;
+
+        double kT = trkFricScale( mufN, sp, vEps, dt, mEff );
+        double kG = gndFricScale( mufN, sp, vEps, dt, mEff );
+        if ( kT != kG ) {
+            printf( "contact: FAIL: the two friction scale helpers disagree: "
+                    "track %.17g vs ground %.17g at mufN %g, sp %g, vEps %g, dt %g, mEff %g\n",
+                    kT, kG, mufN, sp, vEps, dt, mEff );
+            return 1;
+        }
+
+        double kExplicit = mufN / sqrt( sp*sp + vEps*vEps );
+
+        // dt == 0 is the explicit law exactly -- bitwise, not to a tolerance.
+        if ( dt == 0 && kT != kExplicit ) {
+            printf( "contact: FAIL: at dt = 0 the friction scale is %.17g, not the "
+                    "explicit %.17g (mufN %g, sp %g, vEps %g)\n",
+                    kT, kExplicit, mufN, sp, vEps );
+            return 1;
+        }
+
+        // Never above the explicit scale, so the cone bound still holds.
+        if ( kT > kExplicit ) {
+            double over = ( kT - kExplicit ) / kExplicit;
+            if ( over > worstExplicit ) worstExplicit = over;
+            if ( over > 1e-15 ) {
+                printf( "contact: FAIL: implicit friction scale %.6g exceeds the explicit "
+                        "%.6g at mufN %g, sp %g, vEps %g, dt %g, mEff %g\n",
+                        kT, kExplicit, mufN, sp, vEps, dt, mEff );
+                return 1;
+            }
+        }
+
+        // The impulse bound. k*dt/mEff is the fraction of the slip removed in
+        // one step and it must stay under 1, or friction reverses the slip and
+        // the damper is unstable.
+        double ratio = kT * dt / mEff;
+        if ( ratio > worstRatio ) worstRatio = ratio;
+        if ( ratio >= 1.0 ) {
+            printf( "contact: FAIL: friction would remove %.6g of the slip in one step "
+                    "(>= 1 reverses it) at mufN %g, sp %g, vEps %g, dt %g, mEff %g\n",
+                    ratio, mufN, sp, vEps, dt, mEff );
+            return 1;
+        }
+    }
+    // Printed as the MARGIN, not the fraction: the worst case here is a huge
+    // load against a tiny vEps and a long step, where the fraction removed is
+    // 0.99999999 and rounds to 1.000000 in any readable format. What the check
+    // asserts is that it stays strictly under, so show how far under.
+    printf( "contact: friction is unconditionally stable over %d (load, slip, vEps, dt, mass) "
+            "combinations: worst step removes 1 - %.3e of the slip and never all of it, "
+            "never exceeds the explicit scale, exact at dt = 0\n", n, 1.0 - worstRatio );
     return 0;
 }
 
@@ -1128,9 +1221,9 @@ static int checkGroundPassivityAndCone( const Model *mdl, const GroundContactPar
             return 1;
         }
     }
-    printf( "contact: ground: passivity holds everywhere (worst power %.3e W); friction stays "
-            "inside the cone (worst excess %.3e relative) and normal to the surface (%.3e)\n",
-            worstPower, worstCone, worstPerp );
+    printf( "contact: ground: passivity holds everywhere (worst power %.3e W, dt %.0e); friction "
+            "stays inside the cone (worst excess %.3e relative) and normal to the surface "
+            "(%.3e)\n", worstPower, prm->dt, worstCone, worstPerp );
     return 0;
 }
 
@@ -1172,6 +1265,18 @@ int main( int argc, char **argv ) {
     if ( checkFaceGradient( &mdl, &prm ) )     return 1;
     if ( checkFacePassivity( &mdl, &prm ) )    return 1;
 
+    // Semi-implicit friction. The helper property first, then the passivity and
+    // cone checks AGAIN at a stepper's dt -- both must hold in either mode, and
+    // running them only at dt = 0 would leave the mode the simulator actually
+    // uses untested.
+    if ( checkFrictionImplicit() )             return 1;
+    {
+        TrackContactParams prmDt = prm;
+        prmDt.dt = 1.0e-4;
+        if ( checkPassivity( &mdl, &prmDt ) )     return 1;
+        if ( checkFacePassivity( &mdl, &prmDt ) ) return 1;
+    }
+
     // Ground. Every one of these is inert on a model with no 'ground' block,
     // except the balance check, which asserts the engine produces nothing at
     // all -- the same thing the track checks assert for a model with no band.
@@ -1180,6 +1285,11 @@ int main( int argc, char **argv ) {
     if ( checkGroundGradient( &mdl, &gprm ) )         return 1;
     if ( checkTerrainGradient( &mdl ) )               return 1;
     if ( checkGroundPassivityAndCone( &mdl, &gprm ) ) return 1;
+    {
+        GroundContactParams gprmDt = gprm;
+        gprmDt.dt = 1.0e-4;
+        if ( checkGroundPassivityAndCone( &mdl, &gprmDt ) ) return 1;
+    }
 
     printf( "contact: PASS\n" );
     return 0;

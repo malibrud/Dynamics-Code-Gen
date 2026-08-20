@@ -281,6 +281,15 @@ static int runTrackSim( const Model *mdl, const char *path ) {
     // estimate chose 6.2e-5 s for m113 against the band's 4.1e-5 limit, and the
     // run answered with 10469 single-step energy rises of ~0.05 J while its NET
     // energy still fell -- a marginally unstable damper, not truncation.
+    //
+    // FRICTION IS SOLVED IMPLICITLY HERE, so both estimates below report the
+    // normal spring rather than the friction damper, and the step they return
+    // is one to two orders of magnitude looser than it used to be. Setting
+    // prm.dt / gprm.dt is what selects that; leaving them zero would give the
+    // old explicit law and the old (much tighter) estimates. The two are set
+    // twice on purpose -- once here so the estimate sees the right mode, then
+    // again to the chosen DT below.
+    prm.dt = gprm.dt = 1.0;                  // any positive value: mode select
     double DT = 1e-4;
     double dtGnd = groundContactStabilityStep( mdl, &gprm );
     double dtBand = trackContactStabilityStep( mdl, &prm );
@@ -288,14 +297,16 @@ static int runTrackSim( const Model *mdl, const char *path ) {
     if ( dtBand > 0 && ( dtStab == 0 || dtBand < dtStab ) ) dtStab = dtBand;
     if ( dtStab > 0 && 0.5 * dtStab < DT ) DT = 0.5 * dtStab;
     if ( gDtOverride > 0 ) DT = gDtOverride;
+    prm.dt = gprm.dt = DT;
     int nsteps = (int)( T_SETTLE / DT );
     double mTotal = 0;
     for ( int i = 0 ; i < mdl->nbod ; i++ ) mTotal += mdl->body[i].mass;
     if ( mdl->ground.has )
         printf( "sim: %s: ground: %d pads, kn %.3g N/m/pt, mu %.3g, mEff %.3g kg, "
-                "stability dt %.2e s (ground %.2e, band %.2e) -> using dt %.2e s\n",
+                "implicit friction (mImpulse %.3g kg), stability dt %.2e s "
+                "(ground %.2e, band %.2e) -> using dt %.2e s\n",
                 path, mdl->ground.npoint, mdl->ground.kn, mdl->ground.mu, gprm.mEff,
-                dtStab, dtGnd, dtBand, DT );
+                gprm.mImpulse, dtStab, dtGnd, dtBand, DT );
 
     double ePrev = 0, eFirst = 0, eLast = 0, keScale = 0;
     int    energyRises = 0;
@@ -305,7 +316,7 @@ static int runTrackSim( const Model *mdl, const char *path ) {
     // term multiplies the whole of qd, rigid-body modes included, so while it
     // is active it is an external force and dP/dt = M*g does not hold. Latch a
     // reference state at the moment it switches off and measure from there.
-    double Pref[3] = { 0, 0, 0 }, tRef = 0;
+    double Pref[3] = { 0, 0, 0 }, tRef = 0, pRef[3] = { 0, 0, 0 };
     int    haveRef = 0;
 
     // Ground impulse, and its value latched at the same instant as Pref. The
@@ -354,6 +365,13 @@ static int runTrackSim( const Model *mdl, const char *path ) {
             simMomentum( mdl, q, qd, Pref );
             for ( int k = 0 ; k < 3 ; k++ ) gImpRef[k] = gImp[k];
             tRef = t + DT;              // state is post-step
+            // Where the vehicle was when it stopped being pushed around, so the
+            // CREEP over the settled window can be measured. Friction is
+            // regularized, so a parked vehicle drifts rather than sticking, and
+            // with the damper solved implicitly the effective regularization
+            // velocity grows with dt -- meaning a bigger step buys speed at the
+            // price of creep. That price has to be measured, not assumed.
+            for ( int k = 0 ; k < 3 ; k++ ) pRef[k] = q[ mdl->qidx[0] + 4 + k ];
             haveRef = 1;
         }
 
@@ -451,6 +469,19 @@ static int runTrackSim( const Model *mdl, const char *path ) {
     double P[3], worstMom = 0;
     double span = nsteps * DT - tRef;
     simMomentum( mdl, q, qd, P );
+
+    // Creep: how far the hull drifted horizontally over the settled window,
+    // and at what mean rate. On a level plane with no drive torque this should
+    // be zero, and it is not, because regularized Coulomb has no true stick.
+    // The rate is what to compare against vEps.
+    if ( mdl->ground.has && span > 0 ) {
+        double dx = q[ mdl->qidx[0] + 4 ] - pRef[0];
+        double dy = q[ mdl->qidx[0] + 5 ] - pRef[1];
+        double drift = sqrt( dx*dx + dy*dy );
+        printf( "sim: %s: creep: hull drifted %.4g m horizontally over the %.2f s settled "
+                "window, a mean %.3g m/s against vEps %.3g\n",
+                path, drift, span, drift / span, gprm.vEps );
+    }
     // Normalize against the momentum actually present, not against the
     // component's own target: gravity is z-only, so dividing by |M*g_k*span|
     // would make the x and y components an absolute test with a denominator

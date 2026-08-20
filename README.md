@@ -665,7 +665,9 @@ regularized Coulomb rather than a bristle model, and why **`kt` remains
 unused**: `kt` is dimensionally a tangential stiffness belonging to a
 persistent-anchor stick model, which could not be evaluated at a random state
 at all. The honest cost is that a loaded stationary vehicle creeps at up to
-`vEps` ≈ 1 cm/s.
+`vEps` ≈ 1 cm/s — measured at 0.88 cm/s on a settled `m113`. `vEps` used to set
+the step size as well; see [Ground contact](#ground-contact) for the implicit
+treatment that decoupled the two.
 
 **Two primitives, not one, and which applies is set by `end`.** Pins engage the
 sprocket and idler; road wheels roll on the flat inner face of the shoe between
@@ -867,12 +869,21 @@ The code does the latter, which halves `track_demo`'s settle (1.4M steps to
 
 The rise goes as roughly `dt⁵` there, not the `dt²`–`dt³` of truncation, which
 puts the real boundary near 4e-5 — *below* the 5.65e-5 the function returns.
-The caller's 0.5 safety factor is what brings it back under, so that factor is
-now load-bearing rather than belt-and-braces. The principled fix is to count the
-rollers actually near the lower run: `modelLoad` already has every roller's
-centre and radius in the root frame from the hull walk, so "bottom within a
-radius of the lowest bottom" is a few lines and gives each model the number it
-physically has.
+The caller's 0.5 safety factor is what brings it back under, so that factor had
+become load-bearing rather than belt-and-braces.
+
+**That is the problem implicit friction solved**, and it is why the table above
+is a historical record rather than current behaviour. With the damper solved
+implicitly there is no friction stability boundary to estimate, both functions
+report the normal spring instead, and 6.2e-5 passes with 48x margin. See
+[Ground contact](#ground-contact) for the mechanism and the current sweep. Two
+things from this episode still stand, though: the estimate's denominator is
+still the roller count, which is right for `track_demo` and wrong for `m113`
+(whose sprocket and idler carry no ground load), and the principled fix is still
+to count the rollers actually near the lower run — `modelLoad` already has every
+roller's centre and radius in the root frame from the hull walk, so "bottom
+within a radius of the lowest bottom" is a few lines. It simply stopped being
+urgent once the quantity it feeds stopped being the binding constraint.
 
 **Verification, and why not against Chrono.** Chrono's `ChSprocketSinglePin`
 runs its own narrowphase callback against a hand-authored tooth profile from
@@ -893,13 +904,27 @@ So the checks are self-contained (`src/contact/main.c`, on `m113`):
 | design pose on the path-defining pulleys | a band jammed into the geometry that defines it | no penetration, worst clearance 0.4 mm |
 | sprocket axle torque, assembled from `fext` vs summed directly | a wrong moment reference point — which the balance check *cannot* see, since a wrong reference still cancels between the two bodies | 6.4e-15 relative |
 | passivity of the velocity-dependent force | an energy-injecting damper | dissipates everywhere, worst power 0 W |
+| face weights partition unity across a joint | support dropped or doubled at every pin, which an explicit integrator answers with chatter | 4.4e-16 on the sum, 3.5e-14 on the slopes |
+| face elastic force vs `∇U` by finite difference against an independently written potential | the gated potential's missing tangential term `U₀·w′(x)` — the tooth law's trap in a new place | 1.3e-6 relative over 32004 loaded states |
+| face passivity and friction cone | **the friction sign inversion**, which every check above missed because they all drive the *pin* path | dissipates everywhere, cone excess 0 |
+| friction impulse bound over 2520 (load, slip, `v_eps`, `dt`, mass) combinations | an implicit-friction sign or reciprocal error, invisible until a trajectory ran long enough to notice | worst step removes `1 − 1.25e-8` of the slip, never all |
 
-and one trajectory check (`src/sim/main.c`): settle the band from `q0` with
-ramped gains, then assert the interpenetration went down, that the energy
-budget shrinks once the ramp is over, and that linear momentum tracks `M·g·Δt`.
-On `m113` that is worst pin penetration 0.224 → 0.0078 m over 0.6 s, momentum
-matching to 9.1e-4 relative, and a net energy change of −2.06e4 J with the
-largest single-step rise 0.102 J against a 15.5 J truncation bound.
+The last four postdate the road-wheel face primitive and semi-implicit friction.
+The face ones exist because *every* check above them drives `trkPairForce`, which
+road wheels stopped using — so all of them stayed clean, `passivity` included,
+while the face law injected 5e6 J over a four-second settle. Passivity and the
+cone are additionally re-run at `dt = 1e-4`, since the explicit and implicit
+modes are different laws and the simulator uses the second one.
+
+And the trajectory checks (`src/sim/main.c`): settle the band from `q0` with
+ramped gains, then assert the band was never crushed onto its axles, that the
+ground carries the vehicle's weight, that linear momentum tracks
+`∫(M·g + F_gnd)dt`, and that the energy budget shrinks once the ramp is over.
+On `m113`, at `dt` = 1e-4 over 40000 steps: worst pin penetration 0.0087 →
+0.0049 m, settled ground load 0.40% off the vehicle weight, momentum matching to
+1.9e-5 relative (16.6 N·s against an 8.8e5 N·s scale), creep 0.88 cm/s, and a net
+energy change of −62.15 J with the largest single-step rise 0.005823 J against a
+0.01264 J truncation bound.
 
 The energy assertion is deliberately *not* strict monotonicity. Semi-implicit
 Euler's energy error oscillates within an O(`dt`) band rather than decreasing,
@@ -991,13 +1016,69 @@ is taken as a quarter of the declared pads: the conservative end, since assuming
 fewer points both stiffens the damping and shortens the step estimate. The
 harness prints the realized ζ after settling so the assumption is checkable.
 
-**The step size is set by friction, not by stiffness.** Regularized Coulomb has
-tangential slope `μ·f_n/v_eps`, which on m113 is four points of 4.3e4 N·s/m on an
-18 kg shoe — `dt < 2m/c ≈ 1.2e-4 s`, an order of magnitude tighter than the
-normal damper. The harness derives its `dt` from that rather than hard-coding one
-that happens to suit m113, which is how `track_demo` ends up at 1.4e-5 s. The
-tempting move of shrinking `v_eps` so a parked vehicle creeps less costs step
-size linearly.
+**The step size used to be set by friction, not by stiffness — and no longer is.**
+Regularized Coulomb has tangential slope `μ·f_n/v_eps`, which on m113 is four
+points of 4.3e4 N·s/m on an 18 kg shoe: `dt < 2m/c`, an order of magnitude
+tighter than the normal damper. Since `dt ∝ v_eps` and `v_eps` is *also* the
+creep rate of a parked vehicle, speed could only ever be bought with creep, and
+overstepping did not fail loudly — it dripped single-step energy rises into a run
+whose net energy still fell.
+
+**Friction is now solved implicitly at each contact.** Writing the slope as
+`k = μ·f_n/√(u² + v_eps²)`, both engines apply
+
+```
+k_implicit = k / ( 1 + k·dt/m_eff )
+```
+
+the backward-Euler solution of `m_eff·u̇ = −k·u` over the caller's own step,
+divided back out to a force. The velocity change it implies is
+`u·(k·dt/m_eff)/(1 + k·dt/m_eff)`, a factor strictly inside `[0,1)` — friction
+can bring the slip to zero but never reverse it, at **any** `dt`. Three things
+follow: `dt = 0` reproduces the explicit law bit for bit, so every fixed-state
+test keeps testing what it tested before; the divisor exceeds 1, so `|f_t|` stays
+strictly inside the cone and no cone bound had to be loosened; and it is smooth
+in `u`, unlike the impulse cap `min(k·u, m_eff·u/dt)` which has the same
+stability but a kink to chatter on. `src/contact/main.c` asserts all three over
+2520 combinations of load, slip, `v_eps`, `dt` and mass.
+
+`m_eff` is the mass the impulse actually accelerates — the shoe for a band
+contact, a quarter of it per ground pad corner. **That is not the ground engine's
+`mEff`**, which is `M_total/n_loaded`, the *supported* mass that sizes the normal
+damper for the vehicle heave mode. The two are deliberately separate fields.
+
+Measured on m113, sweeping `dt` with everything else fixed:
+
+| `dt` | worst single-step rise / bound | equilibrium | creep | |
+| --- | --- | --- | --- | --- |
+| 2.83e-5 | 2.4e-5 / 1.12e-2 J | 0.36% off | 0.0106 m/s | pass |
+| 6.22e-5 | 1.2e-3 / 1.18e-2 J | 0.42% off | 0.0095 m/s | pass |
+| **1e-4** | **5.8e-3 / 1.26e-2 J** | **0.40% off** | **0.0088 m/s** | **pass** |
+| 2e-4 | 1.5e-2 / 1.36e-2 J | 0.38% off | 0.0081 m/s | fail |
+| 5e-4 | 1.9e-1 / 1.30e-2 J | 0.33% off | 0.0075 m/s | fail |
+| 1e-3 | 2.2 / 1.21e-2 J | 0.29% off | 0.0061 m/s | fail |
+
+At 6.22e-5 — the step that *failed* under explicit friction with a 0.05535 J
+rise — the rise is now 1.157e-3 J, **48x smaller**. Nothing diverges even at
+1e-3, 35x the old step: net energy still falls and the vehicle still stands to
+0.29%. The failures from 2e-4 are the truncation gate (bound = 0.01% of the KE
+scale), which is the *accuracy* limit reporting itself, and the right response is
+a smaller step rather than a looser bound.
+
+**Two things worth not glossing.** First, creep goes *down* with `dt`, which is
+the opposite of the naive prediction that the effective regularization velocity
+becomes `v_eps + μ·f_n·dt/m_eff`. That estimate assumes saturated friction; near
+equilibrium the residual driving force is small, and more to the point the
+implicit impulse tends to `m_eff·u` as `dt` grows, removing essentially the whole
+slip each step. Large `dt` is therefore *stickier* than reality — ordinary
+backward-Euler over-damping — so the low creep at 1e-3 is a numerical artifact,
+not a better answer. Second, none of this makes true stick reachable: the law is
+still stateless and still creeps, which is still the price of being testable at
+random states.
+
+Net effect on m113: `dt` goes 2.83e-5 → 1e-4 at a step cost of 175.4 µs, so the
+real-time factor goes **0.16 → 0.57** — from 6.3x slower than real time to 1.75x.
+The next limit is truncation, not stability.
 
 **What the harnesses had to change, and what got stronger.** The ground is not a
 body, so ground reactions are external and two long-standing checks stopped
