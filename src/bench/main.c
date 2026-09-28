@@ -15,6 +15,7 @@
 #include "../validate/dense.h"
 #include "../contact/track_contact.h"
 #include "../contact/ground_contact.h"
+#include "../sim/integrate.h"
 
 // The generated implementation (compiled from build/dynamics.c).
 void fwd_dyn_crba( double *q, double *qd, double *tau, double *fext, double *act, double *out_qdd );
@@ -117,6 +118,24 @@ static void cGround( int s ) {
     g_sink += ft[5];
 }
 
+// The integrator itself: one Verlet step is drift, kick, drift. It used to be
+// left out of the budget below, which was fair enough when a step was one axpy
+// plus one integrateQ -- but a scheme that drifts TWICE should be measured
+// rather than asserted to be free, since the whole real-time case for it rests
+// on the extra half-step costing nothing next to fwd_dyn_crba.
+//
+// Timed absolutely, not by differencing against cBase: it shares no work with
+// the kinematics. The drift alternates sign with s so the scratch state
+// oscillates instead of wandering off over millions of calls.
+static double iq[ MODEL_MAX_Q ], iqd[ MODEL_MAX_V ], iqdd[ MODEL_MAX_V ];
+static void cIntegrate( int s ) {
+    double h = ( s & 1 ) ? 1e-4 : -1e-4;
+    simDrift( &g_mdl, iq, iqd, 0.5 * h );
+    simKick ( &g_mdl, iqd, iqdd, h );
+    simDrift( &g_mdl, iq, iqd, 0.5 * h );
+    g_sink += iq[0];
+}
+
 // Same batching discipline as benchOne, but min-of-3 because these figures are
 // produced by differencing and so carry twice the noise.
 static double benchContact( ContactFn fn, double minSeconds ) {
@@ -160,7 +179,12 @@ static void reportContact( const char *path, double nsGen ) {
     if ( nsTrk < 0 ) nsTrk = 0;
     if ( nsGnd < 0 ) nsGnd = 0;
 
-    double step = nsBase + nsTrk + nsGnd + nsGen;
+    memcpy( iq,  qs [0], g_mdl.nq * sizeof *iq  );
+    memcpy( iqd, qds[0], g_mdl.nv * sizeof *iqd );
+    for ( int k = 0 ; k < g_mdl.nv ; k++ ) iqdd[k] = 0.1;
+    double nsInt = benchContact( cIntegrate, 0.30 );
+
+    double step = nsBase + nsTrk + nsGnd + nsGen + nsInt;
     printf( "bench: %s: contact-in-the-loop step budget\n", path );
     printf( "bench:   denseKinematics    %8.1f ns  %5.1f%%\n", nsBase, 100.0*nsBase/step );
     if ( pairs )
@@ -170,6 +194,8 @@ static void reportContact( const char *path, double nsGen ) {
         printf( "bench:   groundContactFext  %8.1f ns  %5.1f%%   %d points, %.1f ns/point\n",
                 nsGnd, 100.0*nsGnd/step, pts, nsGnd / pts );
     printf( "bench:   fwd_dyn_crba       %8.1f ns  %5.1f%%\n", nsGen, 100.0*nsGen/step );
+    printf( "bench:   simDrift x2 + kick %8.1f ns  %5.1f%%   the Verlet step itself\n",
+            nsInt, 100.0*nsInt/step );
     printf( "bench:   full step          %8.1f ns  (contact %.1f%%, %.0f steps/s)\n",
             step, 100.0*( nsBase + nsTrk + nsGnd )/step, 1e9/step );
     if ( g_sink == 12345.6789 ) printf( "bench: (unreachable %g)\n", g_sink );

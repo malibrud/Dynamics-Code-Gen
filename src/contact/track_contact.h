@@ -662,6 +662,43 @@ static double trackContactStabilityStep( const Model *mdl, const TrackContactPar
     return worst;
 }
 
+// The step ACCURACY wants, as opposed to the one stability tolerates. These are
+// different questions and the gap between them is now what sets the run.
+//
+// trackContactStabilityStep above returns 2/omega for the stiffest contact
+// oscillator once friction is implicit, and an explicit scheme really does
+// survive right up to it -- but surviving is not resolving. A penalty contact
+// is a spring at omega = sqrt(kn/m), and integrating a spring to an ENERGY
+// tolerance needs a number of samples per PERIOD.
+//
+// samplesPerPeriod is empirical, calibrated against the energy gate rather than
+// derived, and the calibration is why this exists at all. src/sim/main.c used
+// to cap the step at a flat 1e-4 s. That constant happened to fit m113 and was
+// 20% too loose for track_min, whose single road wheel carries what m113
+// spreads over five -- and the whole point of the minimal model is that it is
+// NOT a scaled-down m113. Measured largest passing step against contact period:
+//
+//     m113       2.0e-4 s of a 16.9 ms period   84 samples
+//     track_min  1.2e-4 s of a  9.5 ms period   79 samples
+//
+// Two models landing on the same number is what makes a period fraction the
+// right shape for the cap, and one magic constant the wrong one.
+static double trackContactAccuracyStep( const Model *mdl, const TrackContactParams *prm,
+                                        double samplesPerPeriod ) {
+    if ( samplesPerPeriod <= 0 ) return 0;
+    double worst = 0;
+    for ( int t = 0 ; t < mdl->ntrack ; t++ ) {
+        const ModelTrack *tr = &mdl->track[ t ];
+        double kn = prm->gain * tr->kn;
+        if ( kn <= 0 || tr->mass <= 0 ) continue;
+        // The face weights sum to one shoe, so one shoe against one roller is
+        // the oscillator -- the same mass trackContactStabilityStep uses.
+        double dt = 2.0 * 3.14159265358979323846 * sqrt( tr->mass / kn ) / samplesPerPeriod;
+        if ( worst == 0 || dt < worst ) worst = dt;
+    }
+    return worst;
+}
+
 static int trackContactCheckModel( const Model *mdl, char *err, int errSize ) {
     for ( int t = 0 ; t < mdl->ntrack ; t++ ) {
         const ModelTrack *tr = &mdl->track[ t ];

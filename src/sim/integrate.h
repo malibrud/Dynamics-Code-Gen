@@ -6,21 +6,67 @@
 // compile. The track contact engine cannot be developed or tested without a
 // stepper, so integrateQ is ported here with no dependencies beyond the model.
 //
-// The scheme is semi-implicit (symplectic) Euler, the same one
-// stepGenerated() uses in the Chrono cross-check:
+// TWO SCHEMES LIVE HERE, and both are symplectic -- energy oscillates within a
+// bounded band instead of growing secularly the way explicit Euler does.
 //
-//     qdd = f( q, qd, ... );   qd += qdd*dt;   q = integrateQ( q, qd, dt );
+//   simStep   semi-implicit (symplectic) Euler, FIRST order. Velocity is
+//             updated first and the NEW velocity advances the position:
 //
-// Velocity is updated first and the NEW velocity advances the position; that
-// is what makes the scheme symplectic, so energy oscillates within a bounded
-// band instead of growing secularly the way explicit Euler does.
+//                 qd += qdd*dt;   q = drift( q, qd, dt )
 //
-// The subtlety this file exists for is integrateQ. For a single-DOF joint q is
-// a plain angle or displacement and q += qd*dt is exact. For a FLOATING body
-// it is not: qd carries the body's spatial velocity in its OWN frame while q
-// carries a base-frame quaternion plus a base-frame position, so the rates are
+//             This is the scheme stepGenerated() uses in the Chrono
+//             cross-check. It is kept as the CONTROL for the order gate in
+//             src/sim/main.c, which asserts one scheme against the other.
+//
+//   drift/kick/drift   Stormer-Verlet, SECOND order, composed by the caller:
+//
+//                 q = drift( q, qd, dt/2 )
+//                 qdd = f( q, qd + qdd_prev*dt/2 )      <- ONE dynamics call
+//                 qd += qdd*dt
+//                 q = drift( q, qd, dt/2 )
+//
+//             Why the caller composes it rather than a simStep-shaped
+//             function doing it: the forces have to be evaluated in the MIDDLE
+//             of the step, and between the kinematics and the dynamics the
+//             contact engine runs. A callback would be the only function
+//             pointer in the repo, so simDrift and simKick are exposed instead
+//             and each caller writes the five lines out.
+//
+//             The force evaluation sits at the midpoint, which is the reason
+//             for this form rather than the algebraically equivalent velocity-
+//             Verlet (kick/drift/kick): every damper here, the contact normal
+//             damping and the friction law are all VELOCITY dependent, and
+//             kick/drift/kick wants the force at the end state whose velocity
+//             is the one being solved for. At the midpoint the position is
+//             exact and the velocity comes from the previous step's
+//             acceleration, which costs nothing.
+//
+//             THE VELOCITY PREDICTOR IS THE CALLER'S CALL, and the two callers
+//             in src/sim/main.c genuinely differ. It is what makes the scheme
+//             second order -- drop it and the tree models fall from an energy
+//             drift ratio of 4.000 to 2.000 -- but a predicted velocity fed to
+//             an EXPLICIT DAMPER is an energy source, because the delta between
+//             the predicted and the updated velocity enters as forcing rather
+//             than as damping. The contact-in-the-loop run therefore omits it
+//             and keeps only the second-order position; see the note beside
+//             its drift. That asymmetry is a property of the force model, not
+//             of the integrator, which is why it lives there and not here.
+//
+// WHY THE DRIFT HAS TO BE EXACT. Verlet is second order because it is a
+// SYMMETRIC composition, and that needs the half-drift to be self-adjoint. For
+// a single-DOF joint q += qd*tau already is, exactly. For a FLOATING body it
+// is not automatic, and this is the subtlety integrateQ exists for: qd carries
+// the body's spatial velocity in its OWN frame while q carries a base-frame
+// quaternion plus a base-frame position, so the rates are
 //
 //     Qdot = 0.5 * Q x (0, w_body)        rdot = R(Q) * v_body
+//
+// Held at constant qd the first of those has a closed form -- the exponential
+// map -- so the attitude drift is written EXACTLY rather than to first order
+// with a renormalisation afterwards, and the position drift uses the MID-drift
+// attitude (the midpoint rule, self-adjoint and locally O(tau^3)) rather than
+// the pre-step one. The earlier first-order pair was fine under Euler and
+// would have quietly capped the order of the composition above.
 //
 // Getting this wrong is invisible to src/validate (which never integrates) and
 // to the acceleration cross-check (which compares at a fixed state) -- exactly
@@ -31,6 +77,36 @@
 #include <math.h>
 #include <string.h>
 #include "../model/kinematics.h"
+
+// Hamilton product, (w,x,y,z) order as everywhere else in the repo. The body-
+// frame increment POST-multiplies: Qdot = 0.5 * Q x (0, w_body) is a right
+// multiplication, so the flow it generates is Q(tau) = Q0 x exp(0.5*w*tau).
+static void simQuatMul( const double a[4], const double b[4], double out[4] ) {
+    double w = a[0]*b[0] - a[1]*b[1] - a[2]*b[2] - a[3]*b[3];
+    double x = a[0]*b[1] + a[1]*b[0] + a[2]*b[3] - a[3]*b[2];
+    double y = a[0]*b[2] - a[1]*b[3] + a[2]*b[0] + a[3]*b[1];
+    double z = a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + a[3]*b[0];
+    out[0] = w; out[1] = x; out[2] = y; out[3] = z;
+}
+
+// dq = exp( 0.5 * w_body * t ) = ( cos(th), sin(th)*w_hat ) with th = |w|*t/2.
+// The exact attitude increment for a constant body-frame angular velocity, and
+// a unit quaternion by construction -- which is what retires the renormalise-
+// after-truncating step the first-order update needed.
+//
+// Written through sin(th)/|w| rather than sin(th)*w_hat so the |w| -> 0 limit
+// is finite: below the branch the two-term series is already exact to double
+// precision (th < 1e-8 leaves th^4/120 far under the ulp of 1).
+static void simRotIncrement( const double *wb, double t, double dq[4] ) {
+    double a  = 0.5 * t;
+    double s2 = wb[0]*wb[0] + wb[1]*wb[1] + wb[2]*wb[2];
+    double th = sqrt( s2 ) * a;
+    double sc = th < 1e-8 ? a * ( 1.0 - th*th/6.0 ) : sin( th ) / sqrt( s2 );
+    dq[0] = cos( th );
+    dq[1] = sc * wb[0];
+    dq[2] = sc * wb[1];
+    dq[3] = sc * wb[2];
+}
 
 // q_out = q advanced by qd over dt. q_out may alias q.
 static void simIntegrateQ( const Model *mdl, const double *q, const double *qd,
@@ -46,43 +122,58 @@ static void simIntegrateQ( const Model *mdl, const double *q, const double *qd,
             continue;
         }
 
-        // Quaternion rate Qdot = 0.5 * Q x (0, w_body), with the Hamilton
-        // product written out (w,x,y,z order, as everywhere else in the repo).
-        double w = qs[0], x = qs[1], y = qs[2], z = qs[3];
-        double n = 1.0 / sqrt( w*w + x*x + y*y + z*z );
-        w *= n; x *= n; y *= n; z *= n;
+        // Attitude: the EXACT flow, Q(dt) = Q0 x exp( 0.5 * w_body * dt ).
+        // Applied as two half-increments rather than one whole one, which is
+        // free (they share an axis, so they commute and compose exactly) and
+        // hands the position update below the mid-drift attitude it wants.
+        double qn[4] = { qs[0], qs[1], qs[2], qs[3] };
+        double n = 1.0 / sqrt( qn[0]*qn[0] + qn[1]*qn[1] + qn[2]*qn[2] + qn[3]*qn[3] );
+        for ( int k = 0 ; k < 4 ; k++ ) qn[k] *= n;
 
-        double ox = vs[0], oy = vs[1], oz = vs[2];   // w_body
-        double dw = 0.5 * ( -x*ox - y*oy - z*oz );
-        double dx = 0.5 * (  w*ox + y*oz - z*oy );
-        double dy = 0.5 * (  w*oy + z*ox - x*oz );
-        double dz = 0.5 * (  w*oz + x*oy - y*ox );
+        double dqH[4], qMid[4], qNew[4];
+        simRotIncrement( vs, 0.5 * dt, dqH );
+        simQuatMul( qn,   dqH, qMid );
+        simQuatMul( qMid, dqH, qNew );
 
-        double nw = w + dw*dt, nx = x + dx*dt, ny = y + dy*dt, nz = z + dz*dt;
-        double nn = 1.0 / sqrt( nw*nw + nx*nx + ny*ny + nz*nz );
-
-        // rdot = R(Q) * v_body, using the PRE-step attitude (the position and
-        // attitude updates are both first order, so mixing them buys nothing).
-        double R[3][3];
-        double qn4[4] = { w, x, y, z };
-        quatToR( qn4, R );
-        double rd[3];
+        // rdot = R(Q) * v_body. R is taken at the MIDDLE of the drift, not at
+        // its start: the midpoint rule is self-adjoint and locally O(tau^3),
+        // and that is exactly what a symmetric Verlet composition needs from
+        // its half-drifts. The pre-step attitude used here before was O(tau^2)
+        // and would have held the whole scheme to first order.
+        double R[3][3], rd[3];
+        quatToR( qMid, R );
         for ( int k = 0 ; k < 3 ; k++ )
             rd[k] = R[k][0]*vs[3] + R[k][1]*vs[4] + R[k][2]*vs[5];
 
-        out[0] = nw*nn; out[1] = nx*nn; out[2] = ny*nn; out[3] = nz*nn;
-        out[4] = qs[4] + rd[0]*dt;
-        out[5] = qs[5] + rd[1]*dt;
-        out[6] = qs[6] + rd[2]*dt;
+        // Position read before the attitude is written: qOut may alias q.
+        double r0 = qs[4], r1 = qs[5], r2 = qs[6];
+        for ( int k = 0 ; k < 4 ; k++ ) out[k] = qNew[k];
+        out[4] = r0 + rd[0]*dt;
+        out[5] = r1 + rd[1]*dt;
+        out[6] = r2 + rd[2]*dt;
     }
 }
 
-// One semi-implicit Euler step. qdd comes from the caller's force model, which
-// is why this takes it rather than calling fwd_dyn_crba itself: the contact
-// engine has to run between the kinematics and the dynamics.
-static void simStep( const Model *mdl, double *q, double *qd, const double *qdd, double dt ) {
+// The two halves of a step, exposed separately because a symmetric (Verlet)
+// composition has to evaluate the forces BETWEEN them -- see the header note.
+// Both are cheap: the drift is O(nbod) scalar arithmetic with no matrix work
+// beyond one 3x3 per floating body, and the kick is an nv-length axpy.
+static void simDrift( const Model *mdl, double *q, const double *qd, double tau ) {
+    simIntegrateQ( mdl, q, qd, tau, q );
+}
+
+static void simKick( const Model *mdl, double *qd, const double *qdd, double dt ) {
     for ( int k = 0 ; k < mdl->nv ; k++ ) qd[k] += qdd[k] * dt;
-    simIntegrateQ( mdl, q, qd, dt, q );
+}
+
+// One semi-implicit Euler step: kick, then drift on the NEW velocity. qdd comes
+// from the caller's force model, which is why this takes it rather than calling
+// fwd_dyn_crba itself: the contact engine has to run between the kinematics and
+// the dynamics. First order, and kept as the control the order gate in
+// src/sim/main.c measures the Verlet composition against.
+static void simStep( const Model *mdl, double *q, double *qd, const double *qdd, double dt ) {
+    simKick( mdl, qd, qdd, dt );
+    simDrift( mdl, q, qd, dt );
 }
 
 // ---------------------------------------------------------------------------

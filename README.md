@@ -298,16 +298,16 @@ directly, rather than shelling out to a C compiler.
   below. The harness links no generated code — it tests the force laws, not the
   dynamics — so `build.bat` runs it on every model, and models without a band or
   without a ground assert they produce no forces.
-- `src/sim` — the trajectory harness: a plain-C semi-implicit Euler stepper
-  (`integrate.h`, with the quaternion update ported out of the Chrono
-  cross-check so it needs no SDK) plus the checks that only a trajectory can
-  make. Before this, nothing in `build.bat` stepped time at all — `validate`
-  and `bench` evaluate at fixed states, and the only integrator in the repo
-  lived inside the Chrono harness. Tree models are gated on the energy error
-  being first order in `dt` (halving `dt` must halve the drift, which it does
-  to 3 digits on all eight, `satellite` included — the only thing that
-  exercises the quaternion path). Track models get the contact-in-the-loop
-  settling run instead.
+- `src/sim` — the trajectory harness: a plain-C stepper (`integrate.h`, with
+  the quaternion update ported out of the Chrono cross-check so it needs no
+  SDK) plus the checks that only a trajectory can make. Before this, nothing in
+  `build.bat` stepped time at all — `validate` and `bench` evaluate at fixed
+  states, and the only integrator in the repo lived inside the Chrono harness.
+  Two schemes live here, semi-implicit Euler and Störmer–Verlet, and tree models
+  are gated on **both** — Euler's energy drift must scale as `dt`, Verlet's as
+  `dt²`. All eight report 2.000 and 4.000 to three digits, `satellite` included,
+  which is the only thing that exercises the quaternion path. Track models get
+  the contact-in-the-loop settling run instead.
 - `src/numeric` — an earlier, currently non-building attempt at a runtime
   (non-generated) numeric implementation of the same algorithms. Kept for
   reference; `system.h` was removed mid-refactor and never replaced, so this
@@ -920,18 +920,18 @@ And the trajectory checks (`src/sim/main.c`): settle the band from `q0` with
 ramped gains, then assert the band was never crushed onto its axles, that the
 ground carries the vehicle's weight, that linear momentum tracks
 `∫(M·g + F_gnd)dt`, and that the energy budget shrinks once the ramp is over.
-On `m113`, at `dt` = 1e-4 over 40000 steps: worst pin penetration 0.0087 →
-0.0049 m, settled ground load 0.40% off the vehicle weight, momentum matching to
-1.9e-5 relative (16.6 N·s against an 8.8e5 N·s scale), creep 0.88 cm/s, and a net
-energy change of −62.15 J with the largest single-step rise 0.005823 J against a
-0.01264 J truncation bound.
+On `m113`, at `dt` = 1.87e-4 over 21341 steps: worst pin penetration 0.0087 →
+0.0049 m, settled ground load 0.38% off the vehicle weight, momentum matching to
+1.2e-5 relative (10.3 N·s against an 8.8e5 N·s scale), creep 0.81 cm/s, and a net
+energy change of −55.35 J with the largest single-step rise 0.008983 J against a
+0.01354 J truncation bound.
 
-The energy assertion is deliberately *not* strict monotonicity. Semi-implicit
-Euler's energy error oscillates within an O(`dt`) band rather than decreasing,
-so a first-order integrator on a stiff penalty law ripples upward
-occasionally no matter how correct the forces are; what is asserted is that the
-net change is a loss and that no single step adds a truncation-scale fraction
-of the kinetic energy. The budget has to be complete for any of that to mean
+The energy assertion is deliberately *not* strict monotonicity. A symplectic
+scheme's energy error oscillates within a bounded band rather than decreasing,
+so an explicit integrator on a stiff penalty law ripples upward occasionally no
+matter how correct the forces are; what is asserted is that the net change is a
+loss and that no single step adds a truncation-scale fraction of the kinetic
+energy. The budget has to be complete for any of that to mean
 anything — kinetic, gravitational, the model's own 18 springs, *and* the
 contact springs. Omitting the force elements alone made the tensioners' stored
 energy look like energy appearing from nowhere.
@@ -1078,7 +1078,8 @@ random states.
 
 Net effect on m113: `dt` goes 2.83e-5 → 1e-4 at a step cost of 175.4 µs, so the
 real-time factor goes **0.16 → 0.57** — from 6.3x slower than real time to 1.75x.
-The next limit is truncation, not stability.
+The next limit is truncation, not stability, and that is what the section below
+goes after.
 
 **What the harnesses had to change, and what got stronger.** The ground is not a
 body, so ground reactions are external and two long-standing checks stopped
@@ -1139,6 +1140,140 @@ leaving m113's road wheels 0.22 m through the lower run for the settle to relax 
 is closed. `trkBuildBelt` gift-wraps the convex hull of every roller circle, and
 the road wheels roll on the shoe's flat inner face rather than on its pins; the
 design pose now starts 0.0087 m from equilibrium and settles to 0.0049 m.
+
+## Second-order stepping
+
+Once friction was solved implicitly, nothing about *stability* bound the step any
+more — both contact engines reported limits of 1e-3 to 5e-3 s, one to two orders
+looser than the step in use. What bound it was **accuracy**: first-order
+truncation, measured against a gate set at 0.01% of the kinetic energy scale. The
+remaining 1.75x to real time was therefore an integrator problem, not a contact
+problem.
+
+`src/sim/integrate.h` now carries two schemes. Semi-implicit Euler is unchanged
+and is kept as the control. The new one is **Störmer–Verlet**, composed by the
+caller as drift / kick / drift:
+
+```
+q  = drift( q, qd, dt/2 )
+qdd = f( q, qd_mid )                  <- ONE dynamics call, at the midpoint
+qd += qdd * dt
+q  = drift( q, qd, dt/2 )
+```
+
+**One force evaluation per step is the whole point.** `fwd_dyn_crba` is 82% of
+the step budget, so a scheme needing two evaluations must more than double `dt`
+just to break even. This needs one; the extra cost is a second `simIntegrateQ`,
+measured by `bench_<model>.exe` at **292 ns of a 175 µs step — 0.2%**. The force
+lands at the midpoint, which is why this form and not the algebraically
+equivalent kick/drift/kick: every damper here is velocity-dependent, and
+kick/drift/kick wants the force at the end state whose velocity is the unknown.
+
+Order is asserted, not claimed. `energyDrift()` runs **both** schemes at `dt` and
+`dt/2`, and each is gated on its own ratio — Euler ~2, Verlet ~4. Eight tree
+models report 2.000 and 4.000 to three digits. Running both is what makes it a
+measurement: if Verlet were quietly still first order, the two would agree, and
+simply retargeting one band from 2 to 4 could not tell that apart from the real
+thing. The absolute drift is the more striking half — `satellite` at `dt` = 1e-4
+goes from 2.63e-1 J to 2.22e-6 J.
+
+That accuracy also broke the gate's own noise floor, which was a flat 1e-12 J.
+`gantry` lands at 4e-12 J and reports *more* drift at `dt/2` than at `dt` — the
+signature of round-off accumulating over twice as many steps, not a scheme that
+got worse. The floor is now relative, 1e-11 of the KE scale.
+
+### The predictor, and why the track loop does not use one
+
+Verlet is second order only if the force is evaluated at the midpoint in **both**
+slots. The position comes free from the half-drift. The velocity needs
+`qd + qdd_prev·dt/2`, and on the tree models that predictor is exactly what earns
+the order: drop it and all eight fall from 4.000 to 2.000.
+
+On the contact models it does the opposite, by a lot. A damper `-c·v` evaluated
+at `v + δ` but applied to `v` gives `Δv = -(c·dt/m)(v + δ)`; the `δ` part is not
+damping at all, it is forcing, and it does not care which way `v` points. The
+implicit friction law's guarantee — an impulse that can zero the slip but never
+reverse it — is stated about the velocity the impulse is *applied* to, so
+predicting breaks it outright. Near equilibrium the true slip is on the order of
+`v_eps` while `qdd_prev·dt/2` is set by the contact stiffness, so the predicted
+slip can arrive with the wrong sign. Worst single-step energy rise on m113,
+against a bound of ~0.013 J:
+
+| `dt` | no predictor | predictor on both | predictor on `fwd_dyn_crba` only |
+| --- | --- | --- | --- |
+| 5e-5 | 0.000513 | 0.006219 | — |
+| 1e-4 | 0.002437 | 0.034680 | 0.003175 |
+| 2e-4 | 0.010160 | 0.270600 | 0.019170 |
+
+Predicting got *relatively worse* as `dt` shrank, which is injection and not
+truncation — a higher-order scheme cannot be uniformly worse and lose ground as
+the step falls. The third column kills the tempting split, too: predict for the
+dynamics, whose velocity dependence is conservative Coriolis, and not for
+contact, whose velocity dependence is dissipative. It does not work because
+m113's own ten torsion bars and six shocks are dampers as well, and they live
+*inside* `fwd_dyn_crba`.
+
+So the track loop keeps the second-order position and pays first order in the
+velocity slot. That still beats semi-implicit Euler by **2.4x** at `dt` = 1e-4
+and passes at 2e-4 where Euler does not. Recovering the full order here means
+treating the contact damper and the model's own dampers implicitly, the way
+friction already is — a separate change, and now one with a measured reason.
+
+### The step is chosen by accuracy now
+
+`src/sim/main.c` used to cap the step at a flat `1e-4` and let the stability
+estimates lower it. With stability no longer binding, that constant *was* the
+step for all three track models — and it only fit one of them. The cap is now a
+fixed number of samples per contact **period**, `2π·sqrt(m/kn)/N`, from
+`trackContactAccuracyStep` and its ground twin.
+
+| model | contact period | largest passing `dt` | samples | `dt` chosen at N = 90 |
+| --- | --- | --- | --- | --- |
+| `m113` | 16.9 ms | 2.0e-4 (fails at 2.5e-4) | 84 | 1.87e-4 |
+| `track_min` | 9.5 ms | 1.2e-4 (fails at 1.5e-4) | 79 | 1.06e-4 |
+| `track_demo` | 7.5 ms | ≥ 2e-4 (never failed) | — | 8.34e-5 |
+
+`track_demo` is the one the cap costs something. It settles at 2e-4 without a
+single upward energy step and still gets 8.34e-5, because its band has the
+highest natural frequency per shoe of the three and the cap only knows about
+that. Conservative in the safe direction, and `argv[2]` is there for anyone who
+wants to spend the margin.
+
+Two models landing on the same number is what makes a period fraction the right
+shape and one magic constant the wrong one. `track_min` has a single road wheel
+carrying what m113 spreads over five, so it is not a scaled-down m113 — and
+under semi-implicit Euler that never showed, because 1e-4 was inside every
+model's limit. `N` = 90 is the default rather than the 77–84 the sweep marks as
+the boundary: at 90, m113 uses 66% of its single-step energy budget, about the
+margin Euler had at 1e-4, where 80 would use 83% and sit a few percent from the
+cliff.
+
+### Result
+
+| | step | cost | real-time factor |
+| --- | --- | --- | --- |
+| explicit friction, Euler | 2.83e-5 | 178.6 µs | 0.16 (6.3x slower) |
+| implicit friction, Euler | 1e-4 | 175.4 µs | 0.57 (1.75x slower) |
+| **implicit friction, Verlet** | **1.87e-4** | **174.9 µs** | **1.07 (real time)** |
+
+Those factors are `dt` divided by the benchmarked step cost, which is what the
+earlier rows measured too, so the column is comparable down its length. It is
+**not** the same as `sim_m113.exe`'s wall clock, and the difference is worth
+stating rather than rounding away: the harness settles 4.00 s in 4.21–4.34 s
+over five runs, **0.94x**, because it also pays for its own gates. The energy
+budget runs on the last 35% of steps and costs an extra `denseKinematics`
+(13.9 µs) plus `simEnergyK`, which calls `denseKinematics` a second time, plus
+both contact potentials — about 0.23 s of that 4.24 s. Subtract just that and
+the harness lands at 1.00x, where the step-cost figure says it should.
+
+So m113 — 153 bodies, 882 shoe-roller pairs, 504 ground points, contact in the
+loop — runs at real time within measurement noise: a bare step loop clears it,
+the verification harness sits ~6% short. Run-to-run spread is ~3% on the wall
+clock and ~4% on the benchmark, so "about 1.0" is as tight a claim as the
+numbers support. `track_demo` runs at 2.3x real time and `track_min` at 10.2x.
+
+The gates all of this passes are the ones that were already there, at the same
+tolerances; none was loosened to get here.
 
 ## Force elements and points of interest
 
@@ -1247,6 +1382,22 @@ rdot = R(Q) * v              v = qd[3..5], body frame
 
 That is the integrator's job, outside the generated function.
 `integrateQ()` in `src/chrono/main.cpp` is a worked reference for both cases.
+
+`simIntegrateQ()` in `src/sim/integrate.h` writes the floating case **exactly**
+rather than to first order, because a Verlet composition needs its half-steps to
+be self-adjoint (see *Second-order stepping* above):
+
+```
+Q(tau) = Q0 x exp( 0.5 * w * tau )      exact for constant body-frame w
+r(tau) = r0 + R( Q(tau/2) ) * v * tau   midpoint rule, self-adjoint
+```
+
+The exponential is a unit quaternion by construction, so the renormalisation the
+truncated update needed is gone. Reversibility is the cheap way to see the
+difference: drift by `+tau` then `-tau` and the exact map returns to the start to
+1e-10, while the first-order one leaves a position residual of 9.4e-3 — and it
+was the *position* half that was at fault, since the truncated quaternion update
+is already self-adjoint on its own.
 
 ### Why the transpose is explicit
 

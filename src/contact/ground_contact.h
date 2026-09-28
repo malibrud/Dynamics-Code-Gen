@@ -469,6 +469,27 @@ static double groundContactStabilityStep( const Model *mdl, const GroundContactP
     return worst;
 }
 
+// The step accuracy wants, the ground-side twin of trackContactAccuracyStep --
+// see the note there for what the sample count means and how it was calibrated.
+// Four pad corners share one shoe, so the stiffness that shoe sees is 4*kn,
+// exactly as in the stability estimate above.
+static double groundContactAccuracyStep( const Model *mdl, const GroundContactParams *prm,
+                                         double samplesPerPeriod ) {
+    if ( !mdl->ground.has || mdl->ground.npoint <= 0 || samplesPerPeriod <= 0 ) return 0;
+    double kn = prm->gain * mdl->ground.kn;
+    if ( kn <= 0 ) return 0;
+
+    double worst = 0;
+    for ( int t = 0 ; t < mdl->ntrack ; t++ ) {
+        const ModelTrack *tr = &mdl->track[ t ];
+        if ( !tr->hasPad || tr->mass <= 0 ) continue;
+        double dt = 2.0 * 3.14159265358979323846
+                  * sqrt( tr->mass / ( 4.0 * kn ) ) / samplesPerPeriod;
+        if ( worst == 0 || dt < worst ) worst = dt;
+    }
+    return worst;
+}
+
 // Convenience wrapper: kinematics + ground contact from a raw state, for
 // callers that do not already have X and v (the tests). Zeroes fext.
 static void groundContactFromState( const Model *mdl, const GroundContactParams *prm,

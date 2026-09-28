@@ -38,14 +38,21 @@ static void seedDesignPose( const Model *mdl, double *q, double *qd ) {
     memset( qd, 0, mdl->nv * sizeof *qd );
 }
 
-// Runs nsteps of semi-implicit Euler from the design pose with no applied
-// load, and returns the largest |E(t) - E(0)| seen along the way.
+// Runs nsteps from the design pose with no applied load, and returns the
+// largest |E(t) - E(0)| seen along the way. verlet selects the scheme: 0 is
+// semi-implicit Euler, 1 is the drift/kick/drift Verlet composition.
 //
 // tau, fext and act are all zero, so the only forces are gravity and whatever
 // the model's own force elements produce. Damping is what would break the
 // check, so models carrying dampers are excluded by the caller.
-static double energyDrift( const Model *mdl, double dt, int nsteps ) {
+//
+// The two schemes share every line except the step itself, deliberately: the
+// caller runs BOTH and asserts each one's order separately, so any difference
+// between them has to come from the composition and not from the setup.
+static double energyDrift( const Model *mdl, double dt, int nsteps, int verlet,
+                           double *keScale ) {
     static double q[ MODEL_MAX_Q ], qd[ MODEL_MAX_V ], qdd[ MODEL_MAX_V ];
+    static double qddPrev[ MODEL_MAX_V ], qdMid[ MODEL_MAX_V ];
     static double tau[ MODEL_MAX_V ], fext[ MODEL_MAX_BODIES * 6 ], act[ MODEL_MAX_ELEM ];
 
     seedDesignPose( mdl, q, qd );
@@ -58,13 +65,35 @@ static double energyDrift( const Model *mdl, double dt, int nsteps ) {
     // trajectory is actually exercised.
     for ( int k = 0 ; k < mdl->nv ; k++ ) qd[k] = 0.3;
 
-    double e0 = simEnergy( mdl, q, qd ), worst = 0;
-    for ( int s = 0 ; s < nsteps ; s++ ) {
-        fwd_dyn_crba( q, qd, tau, fext, act, qdd );
-        simStep( mdl, q, qd, qdd, dt );
-        double e = fabs( simEnergy( mdl, q, qd ) - e0 );
-        if ( e > worst ) worst = e;
+    // Seed the midpoint velocity predictor. One extra dynamics call, amortised
+    // to nothing over nsteps -- and leaving qddPrev zero instead would make the
+    // very first step first order, which is not a thing to do to a gate that
+    // exists to measure the order.
+    if ( verlet ) {
+        fwd_dyn_crba( q, qd, tau, fext, act, qddPrev );
     }
+
+    double ke0 = 0;
+    double e0 = simEnergyK( mdl, q, qd, &ke0 ), worst = 0, keMax = ke0;
+    for ( int s = 0 ; s < nsteps ; s++ ) {
+        if ( verlet ) {
+            simDrift( mdl, q, qd, 0.5 * dt );
+            for ( int k = 0 ; k < mdl->nv ; k++ )
+                qdMid[k] = qd[k] + qddPrev[k] * 0.5 * dt;
+            fwd_dyn_crba( q, qdMid, tau, fext, act, qdd );
+            memcpy( qddPrev, qdd, mdl->nv * sizeof *qdd );
+            simKick( mdl, qd, qdd, dt );
+            simDrift( mdl, q, qd, 0.5 * dt );
+        } else {
+            fwd_dyn_crba( q, qd, tau, fext, act, qdd );
+            simStep( mdl, q, qd, qdd, dt );
+        }
+        double ke;
+        double e = fabs( simEnergyK( mdl, q, qd, &ke ) - e0 );
+        if ( e > worst ) worst = e;
+        if ( ke > keMax ) keMax = ke;
+    }
+    if ( keScale ) *keScale = keMax;
     return worst;
 }
 
@@ -290,11 +319,37 @@ static int runTrackSim( const Model *mdl, const char *path ) {
     // twice on purpose -- once here so the estimate sees the right mode, then
     // again to the chosen DT below.
     prm.dt = gprm.dt = 1.0;                  // any positive value: mode select
-    double DT = 1e-4;
     double dtGnd = groundContactStabilityStep( mdl, &gprm );
     double dtBand = trackContactStabilityStep( mdl, &prm );
     double dtStab = dtGnd;
     if ( dtBand > 0 && ( dtStab == 0 || dtBand < dtStab ) ) dtStab = dtBand;
+
+    // THE STEP IS CHOSEN BY ACCURACY, NOT STABILITY, and that is a change worth
+    // being explicit about. With friction implicit, the stability estimates
+    // above come back at 1e-3 to 5e-3 s and nothing about them binds -- the run
+    // would survive there and be worthless. What binds is resolving the contact
+    // spring's oscillation, so the cap is a fixed number of samples per contact
+    // PERIOD (see trackContactAccuracyStep for the calibration).
+    //
+    // This replaces a flat DT = 1e-4. That constant fit m113 and was 20% too
+    // loose for track_min, which the sweep only exposed once second-order
+    // stepping raised every model's usable step; under semi-implicit Euler
+    // 1e-4 was inside all three models' limits and the difference never showed.
+    // 90 rather than the 77-84 the sweep showed as the boundary: at 90 samples
+    // m113 uses 66% of its single-step energy budget, which is about the margin
+    // semi-implicit Euler had at its own 1e-4. At 80 it uses 83% and the
+    // measured failure is at 68, so the default would be sitting a few percent
+    // from the cliff. The override (argv[2]) is there for anyone who wants the
+    // last 12%.
+    const double SAMPLES = 90.0;
+    double dtAccG = groundContactAccuracyStep( mdl, &gprm, SAMPLES );
+    double dtAccB = trackContactAccuracyStep ( mdl, &prm,  SAMPLES );
+    double DT = dtAccB;
+    if ( dtAccG > 0 && ( DT == 0 || dtAccG < DT ) ) DT = dtAccG;
+    if ( DT <= 0 ) DT = 1e-4;                            // no band, no pads
+    // Stability still gets a veto. It does not bind on any model today, but a
+    // stiffer damper or a heavier shoe could put it back under the accuracy
+    // limit, and finding that out from a diverged run would be the wrong way.
     if ( dtStab > 0 && 0.5 * dtStab < DT ) DT = 0.5 * dtStab;
     if ( gDtOverride > 0 ) DT = gDtOverride;
     prm.dt = gprm.dt = DT;
@@ -304,9 +359,12 @@ static int runTrackSim( const Model *mdl, const char *path ) {
     if ( mdl->ground.has )
         printf( "sim: %s: ground: %d pads, kn %.3g N/m/pt, mu %.3g, mEff %.3g kg, "
                 "implicit friction (mImpulse %.3g kg), stability dt %.2e s "
+                "(ground %.2e, band %.2e), accuracy dt %.2e s at %.0f samples/period "
                 "(ground %.2e, band %.2e) -> using dt %.2e s\n",
                 path, mdl->ground.npoint, mdl->ground.kn, mdl->ground.mu, gprm.mEff,
-                gprm.mImpulse, dtStab, dtGnd, dtBand, DT );
+                gprm.mImpulse, dtStab, dtGnd, dtBand,
+                dtAccG > 0 && ( dtAccB == 0 || dtAccG < dtAccB ) ? dtAccG : dtAccB,
+                SAMPLES, dtAccG, dtAccB, DT );
 
     double ePrev = 0, eFirst = 0, eLast = 0, keScale = 0;
     int    energyRises = 0;
@@ -328,31 +386,95 @@ static int runTrackSim( const Model *mdl, const char *path ) {
     int    nAvg = 0, avgFrom = nsteps - nsteps / 10;
 
     for ( int s = 0 ; s < nsteps ; s++ ) {
-        double t = s * DT;
-        double x = t < T_RAMP ? t / T_RAMP : 1.0;
+        // Drift / kick / drift, with the forces evaluated at the midpoint
+        // POSITION -- the half-drift below puts q at t + DT/2. The gain ramp
+        // is sampled at t + DT/2 too, since it is a coefficient of that same
+        // force. The velocity is deliberately NOT advanced to the midpoint;
+        // see the long note below the drift.
+        double t  = s * DT;
+        double tm = t + 0.5 * DT;
+        double x = tm < T_RAMP ? tm / T_RAMP : 1.0;
         double sm = x*x*( 3.0 - 2.0*x );
         prm.gain = sm;
         prm.zeta = 1.0 + ( 0.2 - 1.0 ) * sm;      // over-damped early, 0.2 running
         gprm.gain = sm;
         gprm.zeta = 1.0 + ( 0.3 - 1.0 ) * sm;
 
+        simDrift( mdl, q, qd, 0.5 * DT );
+
+        // NO MIDPOINT VELOCITY PREDICTOR HERE, and that is the one real
+        // difference between this loop and the one in energyDrift. It is worth
+        // the paragraph, because the obvious "improvement" is a large
+        // regression and it took a sweep to see that.
+        //
+        // Verlet is second order only if the force is evaluated at the MIDPOINT
+        // of the step, in both slots. The position slot comes free from the
+        // half-drift above. The velocity slot needs qd + qdd_prev*DT/2, and on
+        // the tree models that predictor is exactly what earns the order: drop
+        // it there and all eight fall from ratio 4.000 to 2.000.
+        //
+        // Here it does the opposite, because a predicted velocity in an
+        // EXPLICIT DAMPER is an energy source. A damper -c*v evaluated at
+        // v + delta but applied to v gives dv = -(c*DT/m)*(v + delta): the
+        // delta part is not damping at all, it is forcing, and it does not care
+        // which way v points. The implicit friction law's guarantee -- an
+        // impulse that can zero the slip but never reverse it -- is stated
+        // about the velocity the impulse is APPLIED to, so predicting breaks it
+        // outright. Near equilibrium the true slip is on the order of vEps
+        // while qdd_prev*DT/2 is set by the contact stiffness, so the predicted
+        // slip can arrive with the wrong sign.
+        //
+        // Measured on m113, worst single-step energy rise (bound ~0.013 J):
+        //
+        //     dt      no predictor   predictor on both   predictor on crba only
+        //     5e-5      0.000513          0.006219                 --
+        //     1e-4      0.002437          0.034680             0.003175
+        //     2e-4      0.010160          0.270600             0.019170
+        //
+        // Predicting got RELATIVELY worse as dt shrank, which is injection and
+        // not truncation. The third column is why the tempting split -- predict
+        // for the dynamics, whose velocity dependence is conservative Coriolis,
+        // and not for contact, whose velocity dependence is dissipative -- does
+        // not work either: m113's own ten torsion bars and six shocks are
+        // dampers too, and they live INSIDE fwd_dyn_crba.
+        //
+        // So the track loop keeps the second-order POSITION and pays first
+        // order in the velocity slot, which still beats semi-implicit Euler by
+        // 2.4x at 1e-4 and passes at 2e-4 where Euler does not. Getting the
+        // full order here means treating the contact damper and the model's
+        // own dampers implicitly, the way friction already is -- a separate
+        // change, and now one with a measured reason to want it.
         double fGnd[6];
         denseKinematics( mdl, q, qd, Xa, vb );
         memset( fext, 0, mdl->nbod * 6 * sizeof *fext );
         trackContactFext( mdl, &prm, Xa, vb, fext );
         groundContactFext( mdl, &gprm, Xa, vb, fext, fGnd );
         fwd_dyn_crba( q, qd, tau, fext, act, qdd );
-        simStep( mdl, q, qd, qdd, DT );
 
-        // Accumulated before the latch below, so gImp at latch time covers
-        // exactly the steps whose forces acted before tRef.
-        for ( int k = 0 ; k < 3 ; k++ ) gImp[k] += fGnd[ 3 + k ] * DT;
-        if ( s >= avgFrom ) { for ( int k = 0 ; k < 3 ; k++ ) gAvg[k] += fGnd[ 3 + k ]; nAvg++; }
+        // prm.dt / gprm.dt stay at the FULL DT and that is not an oversight.
+        // The implicit friction divisor k/(1 + k*dt/mEff) has to use the
+        // interval over which the velocity update is applied, and the kick is
+        // a whole step -- the two halves either side of it are drifts, which
+        // touch no velocity at all. Halving it here to "match" the DT/2 above
+        // would under-damp the friction by 2x at every contact.
+        simKick( mdl, qd, qdd, DT );
 
         // Artificial viscosity, faded out with the ramp: it drains the
-        // relaxation transient without biasing the settled state.
+        // relaxation transient without biasing the settled state. Applied
+        // between the kick and the second drift so the drift carries the
+        // velocity the body actually ends the step with.
         double beta = 20.0 * ( 1.0 - sm );
         if ( beta > 0 ) { double f = 1.0 - beta*DT; for ( int k = 0 ; k < mdl->nv ; k++ ) qd[k] *= f; }
+
+        simDrift( mdl, q, qd, 0.5 * DT );
+
+        // Accumulated before the latch below, so gImp at latch time covers
+        // exactly the steps whose forces acted before tRef. The midpoint
+        // sample makes this the midpoint rule for the impulse integral, which
+        // is a second-order quadrature rather than the left-hand rectangle it
+        // used to be -- the momentum check gets sharper for free.
+        for ( int k = 0 ; k < 3 ; k++ ) gImp[k] += fGnd[ 3 + k ] * DT;
+        if ( s >= avgFrom ) { for ( int k = 0 ; k < 3 ; k++ ) gAvg[k] += fGnd[ 3 + k ]; nAvg++; }
 
         // Momentum reference, latched the instant the artificial viscosity is
         // gone -- that term multiplies the whole of qd, rigid-body modes
@@ -653,28 +775,63 @@ int main( int argc, char **argv ) {
 
     // Same simulated duration at both step sizes, so the comparison is drift
     // per unit time and not drift per step.
+    //
+    // BOTH SCHEMES ARE RUN, and each is gated on its own order. That is what
+    // makes this an order measurement rather than an assertion: Euler is the
+    // control. If the Verlet composition were quietly still first order -- a
+    // half-drift that is not self-adjoint would do it, which is exactly what
+    // the exponential-map attitude update in integrate.h exists to prevent --
+    // then the two would report the SAME ratio, and simply retargeting one
+    // band from 2 to 4 could not tell that apart from the real thing. Running
+    // both can.
     const double T = 0.5, DT = 1e-4;
-    double dHi = energyDrift( &mdl, DT,       (int)( T / DT ) );
-    double dLo = energyDrift( &mdl, DT / 2.0, (int)( T / ( DT / 2.0 ) ) );
-    double ratio = dLo > 0 ? dHi / dLo : 0;
+    struct { const char *name; int verlet; int order; double lo, hi; } scheme[2] = {
+        { "euler",  0, 1, 1.5, 4.0 },   // first order:  ratio -> 2
+        { "verlet", 1, 2, 2.5, 8.0 },   // second order: ratio -> 4
+    };
 
-    printf( "sim: %s: energy drift over %.2f s: %.4e at dt=%.1e, %.4e at dt=%.1e, ratio %.3f\n",
-            path, T, dHi, DT, dLo, DT / 2.0, ratio );
+    int failed = 0;
+    for ( int i = 0 ; i < 2 ; i++ ) {
+        double keHi = 0, keLo = 0;
+        double dHi = energyDrift( &mdl, DT,       (int)( T / DT ),           scheme[i].verlet, &keHi );
+        double dLo = energyDrift( &mdl, DT / 2.0, (int)( T / ( DT / 2.0 ) ), scheme[i].verlet, &keLo );
+        double ratio = dLo > 0 ? dHi / dLo : 0;
 
-    // First order means halving dt halves the drift, i.e. ratio -> 2. The band
-    // is wide because the drift of a symplectic scheme oscillates rather than
-    // accumulating, so the max over a window is not a clean power law; what
-    // this rejects is a drift that does not shrink at all (ratio ~ 1, a
-    // convention or integrator bug) or one that blows up.
-    if ( dHi < 1e-12 ) {
-        printf( "sim: %s: drift below the noise floor -- nothing to scale\n", path );
-        printf( "sim: PASS\n" );
-        return 0;
+        // The noise floor is RELATIVE to the kinetic energy, not an absolute
+        // number of joules. It used to be a flat 1e-12 J, which was fine while
+        // the only scheme here was first order: nothing got near it. Verlet
+        // goes straight through it -- gantry's drift lands at 4e-12 J, and at
+        // 5e-5 it is LARGER than at 1e-4, which is round-off accumulating over
+        // twice as many steps and not a scheme that got worse. A ratio computed
+        // from round-off means nothing, so it has to be recognised as such.
+        // 1e-11 of the KE scale sits about three orders above the ~1e-14
+        // relative that a few thousand steps of double-precision accumulation
+        // can produce, and far below any genuine truncation error.
+        double floor = 1e-11 * ( keHi > keLo ? keHi : keLo );
+
+        printf( "sim: %s: %-6s energy drift over %.2f s: %.4e at dt=%.1e, %.4e at dt=%.1e, "
+                "ratio %.3f (KE scale %.3e)\n",
+                path, scheme[i].name, T, dHi, DT, dLo, DT / 2.0, ratio, keHi );
+
+        // Order p means halving dt divides the drift by 2^p. The bands are wide
+        // because the drift of a symplectic scheme oscillates rather than
+        // accumulating, so the max over a window is not a clean power law; what
+        // this rejects is a drift that does not shrink at all (ratio ~ 1, a
+        // convention or integrator bug), one that blows up, or a scheme sitting
+        // at an order other than the one it claims.
+        if ( dHi < floor ) {
+            printf( "sim: %s: %s drift is %.2e against a %.2e noise floor -- nothing to scale\n",
+                    path, scheme[i].name, dHi, floor );
+            continue;
+        }
+        if ( ratio > scheme[i].lo && ratio < scheme[i].hi ) continue;
+        printf( "sim: FAIL: %s energy drift is not order %d in dt (ratio %.3f, expected ~%d, "
+                "band %.1f to %.1f)\n",
+                scheme[i].name, scheme[i].order, ratio, 1 << scheme[i].order,
+                scheme[i].lo, scheme[i].hi );
+        failed = 1;
     }
-    if ( ratio > 1.5 && ratio < 4.0 ) {
-        printf( "sim: PASS\n" );
-        return 0;
-    }
-    printf( "sim: FAIL: energy drift is not first order in dt (ratio %.3f, expected ~2)\n", ratio );
-    return 1;
+    if ( failed ) return 1;
+    printf( "sim: PASS\n" );
+    return 0;
 }
