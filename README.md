@@ -322,6 +322,9 @@ directly, rather than shelling out to a C compiler.
   transform, so it would need real work beyond restoring `system.h`.
 - `build/` — all build output: object files, executables, and generated
   sources such as `dynamics.c`. Not checked into git.
+- `tools/` — the one thing here that is not C: `plot_trace.py`, which plots
+  the time histories `sim_<model>.exe --trace` writes. See
+  [Track contact](#track-contact).
 - `references/` — course notes, slides, and the `spatial_v2` MATLAB
   reference implementation this project is checked against. Not checked into
   git (see `.gitignore`).
@@ -925,6 +928,25 @@ On `m113`, at `dt` = 1.87e-4 over 21341 steps: worst pin penetration 0.0087 →
 1.2e-5 relative (10.3 N·s against an 8.8e5 N·s scale), creep 0.81 cm/s, and a net
 energy change of −55.35 J with the largest single-step rise 0.008983 J against a
 0.01354 J truncation bound.
+
+Those are the assertions. The run itself can also just be looked at: `--trace
+<file.csv>` writes it out as time histories — hull pose, the ground wrench,
+both penetration metrics with their loaded counts, and the world position of
+every roller and every shoe — and `tools/plot_trace.py` draws them.
+
+```
+build\sim_m113.exe ..\models\m113.mech --trace m113.csv
+python tools\plot_trace.py build\m113.csv
+```
+
+The trace is off unless asked for, because `build.bat` runs this executable as
+a gate and a gate has no business writing files. It is written on a stride
+(about 2000 rows whatever `dt` turns out to be; `--stride N` overrides), since
+m113 traces 140 bodies over 21341 steps and a full-rate dump is a few hundred
+MB to look at four seconds of settling. The file carries its own constants —
+weight, roller radii, the terrain plane — in its `#` preamble, so the plots
+are drawn from the CSV alone and nothing has to be told which model it came
+from.
 
 The energy assertion is deliberately *not* strict monotonicity. A symplectic
 scheme's energy error oscillates within a bounded band rather than decreasing,

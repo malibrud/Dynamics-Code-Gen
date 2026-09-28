@@ -231,6 +231,118 @@ static double groundWorstPenetration( const Model *mdl, const double *q, int *nL
 // same discipline the loop-free energy check uses. Zero means "derive it".
 static double gDtOverride = 0;
 
+// ---------------------------------------------------------------------------
+// Optional per-step trace of the settling run.
+//
+// Everything the checks below assert is a scalar reduction of a trajectory:
+// the worst penetration, the mean settled load, the largest single-step energy
+// rise. That is the right shape for a gate, and the wrong shape for looking at
+// WHY a run misbehaves -- for which the history itself is wanted. This writes
+// that history as CSV, and nothing else in the harness changes.
+//
+// OFF UNLESS --trace IS GIVEN. build.bat runs this executable on every model as
+// a gate, and a gate has no business writing files or paying for them.
+//
+// STRIDE, NOT EVERY STEP. m113 settles for 4 s at dt ~ 6e-5, which is 64k
+// steps, and it carries 140 traced bodies (2 x (7 rollers + 63 shoes)) -- a
+// full-rate dump is a few hundred MB to look at four seconds of settling. The
+// default stride lands about TRACE_ROWS rows whatever dt turns out to be, so
+// the same command gives a comparable file at any step size, and --stride is
+// there when a specific rate is wanted.
+// ---------------------------------------------------------------------------
+#define TRACE_ROWS 2000
+
+static const char *gTracePath = 0;    // --trace <file.csv>; 0 = no trace
+static int gTraceStride = 0;          // --stride N; 0 = derive from TRACE_ROWS
+
+// Column names, plus a comment line of run constants. The constants are there
+// so a plot can be drawn from the file ALONE: the ground load means nothing
+// without the weight it is meant to match, and a band snapshot cannot draw its
+// rollers without their radii.
+static void traceHeader( FILE *f, const Model *mdl, const char *path, double dt, double mTotal ) {
+    double gMag = 0;
+    for ( int k = 0 ; k < 3 ; k++ ) gMag += mdl->gravity[k] * mdl->gravity[k];
+    fprintf( f, "# model=%s dt=%.6e mass_kg=%.6g weight_N=%.6g tracks=%d\n",
+             path, dt, mTotal, mTotal * sqrt( gMag ), mdl->ntrack );
+    // The terrain, so a band snapshot can draw the ground it is standing on.
+    if ( mdl->ground.has && mdl->ground.terrain.kind == TERRAIN_PLANE )
+        fprintf( f, "# terrain plane n=%.6g;%.6g;%.6g d=%.6g\n",
+                 mdl->ground.terrain.n[0], mdl->ground.terrain.n[1],
+                 mdl->ground.terrain.n[2], mdl->ground.terrain.d );
+    for ( int t = 0 ; t < mdl->ntrack ; t++ ) {
+        const ModelTrack *tr = &mdl->track[t];
+        fprintf( f, "# track %s shoes=%d linkLen=%.6g padZ=%.6g thickness=%.6g radii=",
+                 tr->name, tr->shoes, tr->linkLen, tr->padZ, tr->thickness );
+        for ( int r = 0 ; r < tr->nroller ; r++ )
+            fprintf( f, "%s%.6g%s", r ? ";" : "", tr->roller[r].radius,
+                     tr->roller[r].isEnd ? ( tr->roller[r].isDrive ? "d" : "e" ) : "" );
+        fprintf( f, "\n" );
+    }
+    fprintf( f, "t,gain,hull_x,hull_y,hull_z,hull_roll_deg,hull_pitch_deg,hull_yaw_deg,"
+                "fgnd_x,fgnd_y,fgnd_z,pen_band,n_band,pen_gnd,n_gnd" );
+    for ( int t = 0 ; t < mdl->ntrack ; t++ ) {
+        const ModelTrack *tr = &mdl->track[t];
+        for ( int r = 0 ; r < tr->nroller ; r++ )
+            for ( int a = 0 ; a < 3 ; a++ )
+                fprintf( f, ",%s_roller%d_%c", tr->name, r, "xyz"[a] );
+        for ( int i = 0 ; i < tr->shoes ; i++ )
+            for ( int a = 0 ; a < 3 ; a++ )
+                fprintf( f, ",%s_shoe%d_%c", tr->name, i, "xyz"[a] );
+    }
+    fprintf( f, "\n" );
+}
+
+// One sample. Positions come from a fresh denseKinematics rather than from the
+// Xa the step already built, because that one was evaluated at the midpoint
+// POSITION for the force call -- half a step behind the state this row is
+// labelled with.
+static void traceRow( FILE *f, const Model *mdl, const TrackContactParams *prm,
+                      const double *q, double t, double gain, const double *fGnd ) {
+    static double Xa[ MODEL_MAX_BODIES ][6][6], vb[ MODEL_MAX_BODIES ][6];
+    static double qd0[ MODEL_MAX_V ];
+    memset( qd0, 0, mdl->nv * sizeof *qd0 );        // positions only: qd unused
+    denseKinematics( mdl, q, qd0, Xa, vb );
+
+    // The hull is the band's geometry reference, which is the body the rest of
+    // the vehicle is rigidly hung off. Taken from the track rather than assumed
+    // to be body 0.
+    int hull = mdl->track[0].root;
+    double c[3];
+    xformOrigin( Xa[hull], c );
+
+    // Xa carries the rotation as root -> body (that is how every contact metric
+    // above uses it), so the body -> root matrix these angles are stated about
+    // is its transpose. ZYX: R = Rz(yaw) Ry(pitch) Rx(roll).
+    double R[3][3];
+    for ( int a = 0 ; a < 3 ; a++ ) for ( int b = 0 ; b < 3 ; b++ ) R[a][b] = Xa[hull][b][a];
+    double s2 = R[2][0] < -1.0 ? -1.0 : ( R[2][0] > 1.0 ? 1.0 : R[2][0] );
+    double roll  = atan2( R[2][1], R[2][2] ) * 180.0 / M_PI;
+    double pitch = asin( -s2 )              * 180.0 / M_PI;
+    double yaw   = atan2( R[1][0], R[0][0] ) * 180.0 / M_PI;
+
+    int nBand, nGnd;
+    double penBand = bandWorstPenetration( mdl, prm, q, &nBand );
+    double penGnd  = groundWorstPenetration( mdl, q, &nGnd );
+
+    fprintf( f, "%.6f,%.4f,%.6f,%.6f,%.6f,%.4f,%.4f,%.4f,%.6g,%.6g,%.6g,%.6g,%d,%.6g,%d",
+             t, gain, c[0], c[1], c[2], roll, pitch, yaw,
+             fGnd[3], fGnd[4], fGnd[5], penBand, nBand, penGnd, nGnd );
+    for ( int tr_i = 0 ; tr_i < mdl->ntrack ; tr_i++ ) {
+        const ModelTrack *tr = &mdl->track[ tr_i ];
+        for ( int r = 0 ; r < tr->nroller ; r++ ) {
+            double p[3];
+            xformOrigin( Xa[ tr->roller[r].body ], p );
+            fprintf( f, ",%.6f,%.6f,%.6f", p[0], p[1], p[2] );
+        }
+        for ( int i = 0 ; i < tr->shoes ; i++ ) {
+            double p[3];
+            xformOrigin( Xa[ tr->shoe0 + i ], p );
+            fprintf( f, ",%.6f,%.6f,%.6f", p[0], p[1], p[2] );
+        }
+    }
+    fprintf( f, "\n" );
+}
+
 static int runTrackSim( const Model *mdl, const char *path ) {
     static double q[ MODEL_MAX_Q ], qd[ MODEL_MAX_V ], qdd[ MODEL_MAX_V ];
     static double tau[ MODEL_MAX_V ], fext[ MODEL_MAX_BODIES * 6 ], act[ MODEL_MAX_ELEM ];
@@ -356,6 +468,30 @@ static int runTrackSim( const Model *mdl, const char *path ) {
     int nsteps = (int)( T_SETTLE / DT );
     double mTotal = 0;
     for ( int i = 0 ; i < mdl->nbod ; i++ ) mTotal += mdl->body[i].mass;
+
+    // Trace file, if asked for. Opened here because the stride is derived from
+    // nsteps, which is only known once the step size has been chosen.
+    FILE *trace = 0;
+    int traceStride = gTraceStride, traceRows = 0;
+    // The ground wrench is AVERAGED over the stride rather than sampled. The
+    // implicit friction settles into a period-2 cycle -- the fore/aft force
+    // alternates sign every step, about +/-5 kN on m113, with the shoes moving
+    // ~1e-7 m -- and an even stride samples one phase of it forever. That drew
+    // a steady -5.8 kN on a vehicle at rest, against a true mean of a few N.
+    double traceF[6] = { 0 };
+    int traceN = 0;
+    if ( gTracePath ) {
+        trace = fopen( gTracePath, "w" );
+        if ( !trace ) {
+            printf( "sim: FAIL: cannot open trace file '%s'\n", gTracePath );
+            return 1;
+        }
+        if ( traceStride <= 0 ) {
+            traceStride = nsteps / TRACE_ROWS;
+            if ( traceStride < 1 ) traceStride = 1;
+        }
+        traceHeader( trace, mdl, path, DT, mTotal );
+    }
     if ( mdl->ground.has )
         printf( "sim: %s: ground: %d pads, kn %.3g N/m/pt, mu %.3g, mEff %.3g kg, "
                 "implicit friction (mImpulse %.3g kg), stability dt %.2e s "
@@ -476,6 +612,21 @@ static int runTrackSim( const Model *mdl, const char *path ) {
         for ( int k = 0 ; k < 3 ; k++ ) gImp[k] += fGnd[ 3 + k ] * DT;
         if ( s >= avgFrom ) { for ( int k = 0 ; k < 3 ; k++ ) gAvg[k] += fGnd[ 3 + k ]; nAvg++; }
 
+        // The row is labelled t + DT and written here, at the bottom of the
+        // step, so its state and the impulse accumulated above refer to the
+        // same instant.
+        if ( trace ) {
+            for ( int k = 0 ; k < 6 ; k++ ) traceF[k] += fGnd[k];
+            traceN++;
+        }
+        if ( trace && ( s % traceStride == 0 || s == nsteps - 1 ) ) {
+            for ( int k = 0 ; k < 6 ; k++ ) traceF[k] /= traceN;
+            traceRow( trace, mdl, &prm, q, t + DT, sm, traceF );
+            memset( traceF, 0, sizeof traceF );
+            traceN = 0;
+            traceRows++;
+        }
+
         // Momentum reference, latched the instant the artificial viscosity is
         // gone -- that term multiplies the whole of qd, rigid-body modes
         // included, so while it is active it is an external force and the
@@ -530,6 +681,12 @@ static int runTrackSim( const Model *mdl, const char *path ) {
             eLast = e;
             ePrev = e;
         }
+    }
+
+    if ( trace ) {
+        fclose( trace );
+        printf( "sim: %s: wrote %d trace rows (every %d steps, %.4g s) to %s\n",
+                path, traceRows, traceStride, traceStride * DT, gTracePath );
     }
 
     int nLoaded1, nGnd1;
@@ -718,7 +875,21 @@ static int runTrackSim( const Model *mdl, const char *path ) {
 
 int main( int argc, char **argv ) {
     const char *path = argc > 1 ? argv[ 1 ] : "../models/fourbar.mech";
-    if ( argc > 2 ) gDtOverride = atof( argv[ 2 ] );   // track models only
+    // argv[2] stayed a bare dt so the scaling re-runs documented above keep
+    // working; the trace options are flags after it.
+    for ( int i = 2 ; i < argc ; i++ ) {
+        if ( !strcmp( argv[i], "--trace" ) && i + 1 < argc ) {
+            gTracePath = argv[ ++i ];
+        } else if ( !strcmp( argv[i], "--stride" ) && i + 1 < argc ) {
+            gTraceStride = atoi( argv[ ++i ] );
+        } else if ( argv[i][0] != '-' ) {
+            gDtOverride = atof( argv[i] );            // track models only
+        } else {
+            fprintf( stderr, "sim: usage: %s <model.mech> [dt] [--trace <file.csv>] "
+                             "[--stride <n>]\n", argv[0] );
+            return 1;
+        }
+    }
     Model mdl;
     char err[ 256 ];
     if ( modelLoad( path, &mdl, err, sizeof err ) ) {
@@ -744,6 +915,9 @@ int main( int argc, char **argv ) {
     // energy-scaling test below does not apply to them, and settling the band
     // is the thing actually worth asserting.
     if ( mdl.ntrack ) return runTrackSim( &mdl, path );
+    if ( gTracePath )
+        printf( "sim: %s: --trace covers the contact-in-the-loop track run only; this model "
+                "has no band, so nothing was written\n", path );
 
     // Two classes of model cannot gate an energy check, for reasons that are
     // properties of the model rather than of the integrator:
