@@ -193,6 +193,44 @@ static double trkFricScale( double mufN, double sp, double vEps, double dt, doub
     return k;
 }
 
+// THE MASS mEff ABOVE MUST BE THE PAIR'S, NOT THE SHOE'S. The never-reverses
+// guarantee holds for the mass the impulse is sized against; the slip it acts
+// on is RELATIVE, and both sides of the pair accelerate. If the true reduced
+// mass is m_true, the slip multiplier is 1 - (m/m_true)*k*dt/(m + k*dt), which
+// goes negative once m > m_true and saturates at 1 - m/m_true. At m = 2*m_true
+// that is -1: a period-2 cycle with no decay at all.
+//
+// Which is what m113's idlers did. Their pin friction was sized against the
+// 18.02 kg shoe, but ~5 pins share a rim whose spin alone is worth I/R^2 = 17 kg
+// -- 3.4 kg each -- so the true reduced mass was ~3 kg and the multiplier sat
+// near -5. The friction locked into a +/-5 kN alternation every step, which
+// the ground wrench carried out to the trace. Sizing against the pair:
+//
+//     1/m = 1/m_shoe + n/m_rim,    1/m_rim = 1/m_roller + R^2/I_axle
+//
+// with n the pins currently sharing that roller. The rim is taken as a FREE
+// body: its mount only ever adds mass, and over-estimating m is the unsafe
+// side, so ignoring the mount errs the right way. The face law has one shoe's
+// worth of contact per wheel (its weights are a partition of unity), so n = 1.
+//
+// Measured on m113 by the period-2 check in src/sim/main.c: 4972 N of
+// step-to-step alternation in the settled ground force sized on the shoe,
+// 1.06 N sized on the pair, with creep, load and momentum unchanged.
+static double trkRimMassInv( const Model *mdl, const ModelTrackRoller *ro ) {
+    const ModelBody *b = &mdl->body[ ro->body ];
+    // About the axle, which is the body frame's y axis: parallel-axis shift
+    // from the CG, which on every model today is the axle itself.
+    double I = b->inertia[1] + b->mass * ( b->cg[0]*b->cg[0] + b->cg[2]*b->cg[2] );
+    double inv = b->mass > 0 ? 1.0 / b->mass : 0;
+    if ( I > 0 ) inv += ro->radius * ro->radius / I;
+    return inv;
+}
+
+static double trkPairMass( const ModelTrack *tr, double rimInv, int n ) {
+    double inv = 1.0 / tr->mass + ( n > 0 ? n : 1 ) * rimInv;
+    return 1.0 / inv;
+}
+
 // ---------------------------------------------------------------------------
 // The force law for ONE pin against ONE roller, entirely in the roller's own
 // coordinates: the band plane is its x-z and the axle is its y (model.h
@@ -204,6 +242,8 @@ static double trkFricScale( double mufN, double sp, double vEps, double dt, doub
 //   d  pin centre relative to the axle, roller coordinates
 //   u  velocity of the pin's material point relative to the roller's, at the
 //      pin, roller coordinates
+//   mImp  mass the implicit friction is sized against (trkPairMass); <= 0
+//      means the shoe alone. Read only when prm->dt > 0.
 //   f  resulting force ON THE SHOE, roller coordinates
 //
 // Returns 0 and leaves f zeroed when the pair is out of range.
@@ -218,7 +258,7 @@ typedef struct {
 
 static int trkPairForce( const TrackContactParams *prm, const ModelTrack *tr,
                          const ModelTrackRoller *ro, const double d[3], const double u[3],
-                         TrkPairForce *out ) {
+                         double mImp, TrkPairForce *out ) {
     memset( out, 0, sizeof *out );
 
     double R   = ro->radius;
@@ -319,10 +359,9 @@ static int trkPairForce( const TrackContactParams *prm, const ModelTrack *tr,
     if ( prm->enableFriction && fN > 0 && !ro->isDrive ) {
         double tux = u[0] - un*nx, tuy = u[1], tuz = u[2] - un*nz;
         double sp  = sqrt( tux*tux + tuy*tuy + tuz*tuz );
-        // mEff is the shoe mass: the shoe frame's origin IS a pin, so a shoe
-        // brings exactly one pin to this law and the impulse it receives
-        // accelerates the whole shoe.
-        double sc  = -trkFricScale( tr->mu * fN, sp, prm->vEps, prm->dt, tr->mass );
+        // Sized against the shoe-rim pair, not the shoe: see trkPairMass.
+        double sc  = -trkFricScale( tr->mu * fN, sp, prm->vEps, prm->dt,
+                                    mImp > 0 ? mImp : tr->mass );
         fx += sc*tux; fy += sc*tuy; fz += sc*tuz;
     }
 
@@ -413,7 +452,8 @@ static double trkFaceW( double x, double L, double fade, double *dw ) {
 
 static int trkFaceForce( const TrackContactParams *prm, const ModelTrack *tr,
                          const ModelTrackRoller *ro, const double c[3],
-                         const double uc[3], const double us[3], TrkFaceForce *out ) {
+                         const double uc[3], const double us[3], double mImp,
+                         TrkFaceForce *out ) {
     memset( out, 0, sizeof *out );
 
     double runZ = tr->padZ + tr->thickness;
@@ -481,10 +521,11 @@ static int trkFaceForce( const TrackContactParams *prm, const ModelTrack *tr,
     double ffx = 0, ffy = 0;
     if ( prm->enableFriction && fN > 0 ) {
         double sp = sqrt( us[0]*us[0] + us[1]*us[1] );
-        // mEff is the shoe mass: the face weights are a partition of unity, so
-        // one shoe's worth of contact carries this wheel and the impulse
-        // accelerates that shoe.
-        double sc = trkFricScale( tr->mu * fN, sp, prm->vEps, prm->dt, tr->mass );
+        // The face weights are a partition of unity, so one shoe's worth of
+        // contact carries this wheel: the pair is one shoe against one rim
+        // (trkPairMass with n = 1). mImp <= 0 means the shoe alone.
+        double sc = trkFricScale( tr->mu * fN, sp, prm->vEps, prm->dt,
+                                  mImp > 0 ? mImp : tr->mass );
         ffx = sc * us[0];
         ffy = sc * us[1];
     }
@@ -500,7 +541,7 @@ static int trkFaceForce( const TrackContactParams *prm, const ModelTrack *tr,
 // everything below is built in the shoe frame and pushed back to base.
 static void trkFaceRoller( const TrackContactParams *prm, const ModelTrack *tr,
                            const ModelTrackRoller *ro, double Xa[][6][6], double v[][6],
-                           double *fext ) {
+                           double mImp, double *fext ) {
     int s = ro->body;
 
     double Es[3][3], cw[3], wr[3], vr[3];
@@ -554,7 +595,7 @@ static void trkFaceRoller( const TrackContactParams *prm, const ModelTrack *tr,
             us[k] = Ej[k][0]*usw[0] + Ej[k][1]*usw[1] + Ej[k][2]*usw[2];
 
         TrkFaceForce ff;
-        if ( !trkFaceForce( prm, tr, ro, c, uc, us, &ff ) ) continue;
+        if ( !trkFaceForce( prm, tr, ro, c, uc, us, mImp, &ff ) ) continue;
 
         // Two application points, so two wrench pairs -- each computed once and
         // negated, the same discipline as the pin path.
@@ -749,10 +790,27 @@ static void trackContactFext( const Model *mdl, const TrackContactParams *prm,
             // Road wheels roll on the shoe's inner face, not on the pins; the
             // whole pin-against-circle path below applies to the sprocket and
             // idler only. See the note above trkFaceForce for why.
+            double rimInv = trkRimMassInv( mdl, ro );
             if ( !ro->isEnd ) {
-                trkFaceRoller( prm, tr, ro, Xa, v, fext );
+                trkFaceRoller( prm, tr, ro, Xa, v, trkPairMass( tr, rimInv, 1 ), fext );
                 continue;
             }
+
+            // How many pins share this rim, for the friction's pair mass. A
+            // first pass over the same geometry the force pass recomputes --
+            // only the radial test, and only when friction is implicit.
+            int nPin = 0;
+            if ( prm->dt > 0 && prm->enableFriction && !ro->isDrive ) {
+                for ( int i = 0 ; i < tr->shoes ; i++ ) {
+                    double p[3], rel[3], dx, dz;
+                    xformOrigin( Xa[ tr->shoe0 + i ], p );
+                    for ( int k = 0 ; k < 3 ; k++ ) rel[k] = p[k] - c[k];
+                    dx = Es[0][0]*rel[0] + Es[0][1]*rel[1] + Es[0][2]*rel[2];
+                    dz = Es[2][0]*rel[0] + Es[2][1]*rel[1] + Es[2][2]*rel[2];
+                    if ( dx*dx + dz*dz < ro->radius * ro->radius ) nPin++;
+                }
+            }
+            double mPin = trkPairMass( tr, rimInv, nPin );
 
             for ( int i = 0 ; i < tr->shoes ; i++ ) {
                 int j = tr->shoe0 + i;
@@ -779,7 +837,7 @@ static void trackContactFext( const Model *mdl, const TrackContactParams *prm,
                     u[k] = Es[k][0]*uw[0] + Es[k][1]*uw[1] + Es[k][2]*uw[2];
 
                 TrkPairForce pf;
-                if ( !trkPairForce( prm, tr, ro, d, u, &pf ) ) continue;
+                if ( !trkPairForce( prm, tr, ro, d, u, mPin, &pf ) ) continue;
 
                 // Back to base coordinates: F_world = E^T * f_roller.
                 double F[3];

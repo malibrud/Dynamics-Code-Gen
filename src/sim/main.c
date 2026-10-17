@@ -12,7 +12,11 @@
 // truncation error from a real discrepancy -- a bug in the integrator or in
 // the qd/dq-dt convention shows up as a drift that does NOT scale.
 //
-// Usage: sim_<model>.exe <model>.mech
+// Usage: sim_<model>.exe <model>.mech [dt] [--trace <file.csv>] [--stride <n>]
+//                                      [--slope <deg>] [--fric anchor|reg] [--time <s>]
+//
+// With no --slope / --fric, a track model on ground gets TWO runs: the flat
+// settle, then a parked hold on 15 degrees (see runTrackRuns).
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -231,6 +235,13 @@ static double groundWorstPenetration( const Model *mdl, const double *q, int *nL
 // same discipline the loop-free energy check uses. Zero means "derive it".
 static double gDtOverride = 0;
 
+// --slope <deg> and --fric anchor|reg select ONE run of the given kind; with
+// neither, build.bat's gate runs the flat settle and then the slope hold.
+static double gSlopeDeg = 0;
+static int    gFric = -1;                // -1 = default, 0 = regularized, 1 = anchored
+static int    gSingle = 0;
+static double gTime = 0;                 // --time <s>: run length; 0 = the gate's 4 s
+
 // ---------------------------------------------------------------------------
 // Optional per-step trace of the settling run.
 //
@@ -343,10 +354,123 @@ static void traceRow( FILE *f, const Model *mdl, const TrackContactParams *prm,
     fprintf( f, "\n" );
 }
 
-static int runTrackSim( const Model *mdl, const char *path ) {
+// Whether any pad corner of shoe j is into the terrain, from a given set of
+// transforms (groundWorstPenetration's test, without its own kinematics pass).
+static int shoeOnGround( const Model *mdl, const ModelTrack *tr, double Xa[][6][6], int j ) {
+    double r[3];
+    xformOrigin( Xa[j], r );
+    for ( int corner = 0 ; corner < 4 ; corner++ ) {
+        double tl[3], p[3], h, hx, hy;
+        gndPadCorner( tr, corner, tl );
+        for ( int k = 0 ; k < 3 ; k++ )
+            p[k] = r[k] + Xa[j][0][k]*tl[0] + Xa[j][1][k]*tl[1] + Xa[j][2][k]*tl[2];
+        if ( terrainAt( &mdl->ground.terrain, p[0], p[1], &h, &hx, &hy ) && h - p[2] > 0 ) return 1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// What one track run is asked to do. The default run is the flat settle every
+// track model has always had; build.bat additionally gets the slope hold below
+// for any model that stands on ground.
+// ---------------------------------------------------------------------------
+typedef struct {
+    double slopeDeg;     // terrain pitch, degrees; 0 = as authored
+    int    anchored;     // ground friction: 1 = anchored (holds), 0 = regularized
+    int    brake;        // lock the drive sprockets (a parked vehicle)
+    int    gateCreep;    // assert the settled creep rate (the slope-hold gate)
+} TrackRun;
+
+// RIGIDLY ROTATE the whole initial state, and the terrain with it, by deg
+// about a y axis through the terrain under the base origin. Pitching the
+// ground under a vehicle that was authored on the flat would start it buried
+// at one end and hanging at the other; rotating EVERYTHING instead keeps the
+// design pose exactly as close to equilibrium as it was, and leaves gravity --
+// which the generated code bakes in -- untouched. A vehicle on a 15 degree
+// plane under vertical gravity is a vehicle on a 15 degree slope.
+//
+// Every floating joint attaches to the base (modelLoad enforces it), so the
+// whole state is reached through them: each gets q <- qs*q on its attitude and
+// its origin carried round the axis. Everything else is relative and rides
+// along. That reasoning is CHECKED rather than trusted -- every body's frame
+// is compared against the rotated original through denseKinematics.
+static int tiltTrackModel( Model *m, double *q, double deg ) {
+    static double X0[ MODEL_MAX_BODIES ][6][6], X1[ MODEL_MAX_BODIES ][6][6];
+    static double vb[ MODEL_MAX_BODIES ][6], qd0[ MODEL_MAX_V ];
+    memset( qd0, 0, m->nv * sizeof *qd0 );
+
+    double th = deg * 3.14159265358979323846 / 180.0;
+    double cs = cos( th ), sn = sin( th );
+    double Rs[3][3] = { { cs, 0, sn }, { 0, 1, 0 }, { -sn, 0, cs } };
+    double qs[4] = { cos( 0.5*th ), 0, sin( 0.5*th ), 0 };
+
+    double h, hx, hy;
+    if ( !terrainAt( &m->ground.terrain, 0, 0, &h, &hx, &hy ) ) {
+        printf( "sim: FAIL: --slope needs a terrain to tilt\n" );
+        return 1;
+    }
+    double c[3] = { 0, 0, h };
+
+    denseKinematics( m, q, qd0, X0, vb );
+
+    for ( int i = 0 ; i < m->nbod ; i++ ) {
+        const ModelBody *b = &m->body[ i ];
+        if ( b->jtype != JOINT_FLOATING ) continue;
+        double *qa = q + m->qidx[ i ], *pos = qa + 4;
+        double w = qa[0], x = qa[1], y = qa[2], z = qa[3];
+        // Hamilton product qs (x) q: rotate the body-to-base attitude.
+        qa[0] = qs[0]*w - qs[1]*x - qs[2]*y - qs[3]*z;
+        qa[1] = qs[0]*x + qs[1]*w + qs[2]*z - qs[3]*y;
+        qa[2] = qs[0]*y - qs[1]*z + qs[2]*w + qs[3]*x;
+        qa[3] = qs[0]*z + qs[1]*y - qs[2]*x + qs[3]*w;
+        double o[3], r[3];
+        for ( int k = 0 ; k < 3 ; k++ ) o[k] = b->tree[k] + pos[k] - c[k];
+        for ( int k = 0 ; k < 3 ; k++ ) r[k] = Rs[k][0]*o[0] + Rs[k][1]*o[1] + Rs[k][2]*o[2];
+        for ( int k = 0 ; k < 3 ; k++ ) pos[k] = c[k] + r[k] - b->tree[k];
+    }
+
+    // Plane n.p = d, carried round the same axis: n' = Rs n, and a point p on
+    // it lands at c + Rs(p - c), so d' = n'.c + d - n.c.
+    ModelTerrain *tn = &m->ground.terrain;
+    double n1[3], nc = 0, n1c = 0;
+    for ( int k = 0 ; k < 3 ; k++ ) n1[k] = Rs[k][0]*tn->n[0] + Rs[k][1]*tn->n[1] + Rs[k][2]*tn->n[2];
+    for ( int k = 0 ; k < 3 ; k++ ) { nc += tn->n[k] * c[k]; n1c += n1[k] * c[k]; }
+    tn->d = n1c + tn->d - nc;
+    for ( int k = 0 ; k < 3 ; k++ ) tn->n[k] = n1[k];
+
+    // The check: origin' = c + Rs(origin - c), and E' = E Rs^T (E maps base
+    // to body, so rotating the body by Rs post-multiplies it by Rs^T).
+    denseKinematics( m, q, qd0, X1, vb );
+    double worst = 0;
+    for ( int i = 0 ; i < m->nbod ; i++ ) {
+        double o0[3], o1[3], d[3];
+        xformOrigin( X0[i], o0 );
+        xformOrigin( X1[i], o1 );
+        for ( int k = 0 ; k < 3 ; k++ ) d[k] = o0[k] - c[k];
+        for ( int k = 0 ; k < 3 ; k++ ) {
+            double want = c[k] + Rs[k][0]*d[0] + Rs[k][1]*d[1] + Rs[k][2]*d[2];
+            worst = fmax( worst, fabs( o1[k] - want ) );
+        }
+        for ( int a = 0 ; a < 3 ; a++ )
+        for ( int k = 0 ; k < 3 ; k++ ) {
+            double want = X0[i][a][0]*Rs[k][0] + X0[i][a][1]*Rs[k][1] + X0[i][a][2]*Rs[k][2];
+            worst = fmax( worst, fabs( X1[i][a][k] - want ) );
+        }
+    }
+    if ( worst > 1e-9 ) {
+        printf( "sim: FAIL: tilting the initial state is not a rigid rotation (%.3g off) -- a "
+                "body is reached other than through a base-attached floating joint\n", worst );
+        return 1;
+    }
+    return 0;
+}
+
+static int runTrackSim( const Model *mdl, const char *path, const TrackRun *run ) {
     static double q[ MODEL_MAX_Q ], qd[ MODEL_MAX_V ], qdd[ MODEL_MAX_V ];
     static double tau[ MODEL_MAX_V ], fext[ MODEL_MAX_BODIES * 6 ], act[ MODEL_MAX_ELEM ];
     static double Xa[ MODEL_MAX_BODIES ][6][6], vb[ MODEL_MAX_BODIES ][6];
+    static GroundAnchors anchors;
+    static Model tilted;
 
     char err[ 256 ];
     if ( trackContactCheckModel( mdl, err, sizeof err ) ) {
@@ -358,15 +482,27 @@ static int runTrackSim( const Model *mdl, const char *path ) {
         return 1;
     }
 
-    TrackContactParams prm;
-    trackContactDefaults( mdl, &prm );
-    GroundContactParams gprm;
-    groundContactDefaults( mdl, &gprm );
-
     memcpy( q, mdl->q0, mdl->nq * sizeof *q );
     memset( qd,  0, mdl->nv * sizeof *qd );
     memset( tau, 0, mdl->nv * sizeof *tau );
     memset( act, 0, mdl->nact * sizeof *act );
+
+    if ( run->slopeDeg != 0 ) {
+        if ( !mdl->ground.has ) {
+            printf( "sim: FAIL: --slope needs a 'ground' block\n" );
+            return 1;
+        }
+        tilted = *mdl;
+        if ( tiltTrackModel( &tilted, q, run->slopeDeg ) ) return 1;
+        mdl = &tilted;
+    }
+
+    TrackContactParams prm;
+    trackContactDefaults( mdl, &prm );
+    GroundContactParams gprm;
+    groundContactDefaults( mdl, &gprm );
+    memset( &anchors, 0, sizeof anchors );
+    if ( run->anchored ) gprm.anchors = &anchors;
 
     int nLoaded0, nGnd0;
     double pen0  = bandWorstPenetration( mdl, &prm, q, &nLoaded0 );
@@ -413,7 +549,7 @@ static int runTrackSim( const Model *mdl, const char *path ) {
     // -- almost exactly the depth the road wheels were then found buried in the
     // band. The gains still ease in, over a window short enough that the drop
     // is sub-millimetre, and the artificial viscosity still drains what is left.
-    const double T_RAMP = 0.02, T_SETTLE = 4.0;
+    const double T_RAMP = 0.02, T_SETTLE = gTime > 0 ? gTime : 4.0;
     //
     // BOTH engines get a say, and which one binds depends on the model. The
     // ground's friction sets it for a light-shoe band like track_demo; the
@@ -466,6 +602,41 @@ static int runTrackSim( const Model *mdl, const char *path ) {
     if ( gDtOverride > 0 ) DT = gDtOverride;
     prm.dt = gprm.dt = DT;
     int nsteps = (int)( T_SETTLE / DT );
+
+    // PARKING BRAKE. Without one a tracked vehicle on a slope is not parked,
+    // it is coasting: the sprocket is a free revolute, the road wheels roll on
+    // the band, and the hull rolls down its own track whatever the ground
+    // friction does. So a slope-HOLD test has to lock the drive, and the lock
+    // is a stiff torsional spring-damper on each sprocket joint -- what a
+    // locked brake is, mechanically, down to its own compliance.
+    //
+    // Stiffness is sized off the step rather than picked: the brake's period
+    // on the bare sprocket is TWO contact periods, so the step chosen above
+    // resolves it with room to spare and it never becomes what sets dt.
+    // Critically damped on the same inertia.
+    int    nBrake = 0, brakeV[ 2 * MODEL_MAX_TRACKS ], brakeQ[ 2 * MODEL_MAX_TRACKS ];
+    double brakeLock[ 2 * MODEL_MAX_TRACKS ], brakeK[ 2 * MODEL_MAX_TRACKS ], brakeC[ 2 * MODEL_MAX_TRACKS ];
+    if ( run->brake ) {
+        for ( int t = 0 ; t < mdl->ntrack ; t++ )
+        for ( int r = 0 ; r < mdl->track[t].nroller ; r++ ) {
+            const ModelTrackRoller *ro = &mdl->track[t].roller[r];
+            if ( !ro->isDrive || nBrake >= 2 * MODEL_MAX_TRACKS ) continue;
+            const ModelBody *b = &mdl->body[ ro->body ];
+            double I = b->inertia[1] + b->mass * ( b->cg[0]*b->cg[0] + b->cg[2]*b->cg[2] );
+            double w = 3.14159265358979323846 / ( SAMPLES * DT );   // 2*pi / (2 periods)
+            brakeV[ nBrake ]    = mdl->vidx[ ro->body ];
+            brakeQ[ nBrake ]    = mdl->qidx[ ro->body ];
+            brakeLock[ nBrake ] = q[ mdl->qidx[ ro->body ] ];
+            brakeK[ nBrake ]    = I * w * w;
+            brakeC[ nBrake ]    = 2.0 * sqrt( brakeK[ nBrake ] * I );
+            nBrake++;
+        }
+        if ( nBrake == 0 ) {
+            printf( "sim: FAIL: a parked run needs a drive sprocket to brake, and this model has none\n" );
+            return 1;
+        }
+        printf( "sim: %s: parking brake on %d sprocket(s), %.3g N.m/rad\n", path, nBrake, brakeK[0] );
+    }
     double mTotal = 0;
     for ( int i = 0 ; i < mdl->nbod ; i++ ) mTotal += mdl->body[i].mass;
 
@@ -473,11 +644,13 @@ static int runTrackSim( const Model *mdl, const char *path ) {
     // nsteps, which is only known once the step size has been chosen.
     FILE *trace = 0;
     int traceStride = gTraceStride, traceRows = 0;
-    // The ground wrench is AVERAGED over the stride rather than sampled. The
-    // implicit friction settles into a period-2 cycle -- the fore/aft force
-    // alternates sign every step, about +/-5 kN on m113, with the shoes moving
-    // ~1e-7 m -- and an even stride samples one phase of it forever. That drew
-    // a steady -5.8 kN on a vehicle at rest, against a true mean of a few N.
+    // The ground wrench is AVERAGED over the stride rather than sampled. A
+    // force alternating sign every step is exactly what an even stride
+    // samples one phase of forever: m113's idler friction once held a +/-5 kN
+    // period-2 cycle (see trkPairMass), and the sampled trace drew a steady
+    // -5.8 kN on a vehicle at rest against a true mean of a few N. The cycle
+    // is fixed and now gated below; the averaging stays, because it costs
+    // nothing and a trace that can alias is a trace that can lie.
     double traceF[6] = { 0 };
     int traceN = 0;
     if ( gTracePath ) {
@@ -520,6 +693,32 @@ static int runTrackSim( const Model *mdl, const char *path ) {
     double gImp[3] = { 0, 0, 0 }, gImpRef[3] = { 0, 0, 0 };
     double gAvg[3] = { 0, 0, 0 };
     int    nAvg = 0, avgFrom = nsteps - nsteps / 10;
+    // The same window projected onto the Nyquist frequency, (-1)^s: zero for
+    // anything the step resolves, and exactly A for a force alternating +/-A
+    // every step. See the period-2 check after the loop.
+    double gAlt[3] = { 0, 0, 0 };
+
+    // PATCH SLIP: whether the friction is holding, measured where friction
+    // acts. The shoes on the ground when the last two seconds begin are the
+    // patch; their mean position is averaged over each of those seconds, and
+    // the slip is the tangential part of the difference.
+    //
+    // NOT THE HULL. The hull sits on torsion bars, a braked sprocket and a
+    // sagging top run, and it sways on them: on 15 degrees, anchored, it swings
+    // +/-8 mm along the slope on a period of several seconds while the patch
+    // under it moves 0.3 mm and does not drift. A hull rate measures that sway,
+    // and on the flat with no brake it measures the vehicle ROLLING on its own
+    // tracks -- the top run circulating at twice the hull speed over a lower
+    // run that stays put. Neither is friction. Means, not end samples, because
+    // the patch still breathes with the load.
+    //
+    // Sampled from the midpoint kinematics the force pass already computed,
+    // so this costs one cross-check per shoe and no extra kinematics.
+    static int patch[ MODEL_MAX_BODIES ];
+    int    nPatch = 0, patchPicked = 0;
+    double pWin[2][3] = { { 0 } };
+    int    nWin[2] = { 0, 0 };
+    const double T_WIN = 1.0;
 
     for ( int s = 0 ; s < nsteps ; s++ ) {
         // Drift / kick / drift, with the forces evaluated at the midpoint
@@ -585,6 +784,8 @@ static int runTrackSim( const Model *mdl, const char *path ) {
         memset( fext, 0, mdl->nbod * 6 * sizeof *fext );
         trackContactFext( mdl, &prm, Xa, vb, fext );
         groundContactFext( mdl, &gprm, Xa, vb, fext, fGnd );
+        for ( int b = 0 ; b < nBrake ; b++ )
+            tau[ brakeV[b] ] = -brakeK[b] * ( q[ brakeQ[b] ] - brakeLock[b] ) - brakeC[b] * qd[ brakeV[b] ];
         fwd_dyn_crba( q, qd, tau, fext, act, qdd );
 
         // prm.dt / gprm.dt stay at the FULL DT and that is not an oversight.
@@ -610,7 +811,33 @@ static int runTrackSim( const Model *mdl, const char *path ) {
         // is a second-order quadrature rather than the left-hand rectangle it
         // used to be -- the momentum check gets sharper for free.
         for ( int k = 0 ; k < 3 ; k++ ) gImp[k] += fGnd[ 3 + k ] * DT;
-        if ( s >= avgFrom ) { for ( int k = 0 ; k < 3 ; k++ ) gAvg[k] += fGnd[ 3 + k ]; nAvg++; }
+        if ( mdl->ground.has ) {
+            // Windowed on tm, the time Xa was evaluated at.
+            int w = tm > T_SETTLE - T_WIN ? 1 : tm > T_SETTLE - 2.0 * T_WIN ? 0 : -1;
+            if ( w >= 0 && !patchPicked ) {
+                for ( int t = 0 ; t < mdl->ntrack ; t++ ) {
+                    const ModelTrack *tr = &mdl->track[t];
+                    if ( !tr->hasPad ) continue;
+                    for ( int i = 0 ; i < tr->shoes ; i++ )
+                        if ( shoeOnGround( mdl, tr, Xa, tr->shoe0 + i ) ) patch[ nPatch++ ] = tr->shoe0 + i;
+                }
+                patchPicked = 1;
+            }
+            if ( w >= 0 && nPatch > 0 ) {
+                double m[3] = { 0, 0, 0 }, o[3];
+                for ( int i = 0 ; i < nPatch ; i++ ) {
+                    xformOrigin( Xa[ patch[i] ], o );
+                    for ( int k = 0 ; k < 3 ; k++ ) m[k] += o[k];
+                }
+                for ( int k = 0 ; k < 3 ; k++ ) pWin[w][k] += m[k] / nPatch;
+                nWin[w]++;
+            }
+        }
+        if ( s >= avgFrom ) {
+            double sg = ( s & 1 ) ? -1.0 : 1.0;
+            for ( int k = 0 ; k < 3 ; k++ ) { gAvg[k] += fGnd[ 3 + k ]; gAlt[k] += sg * fGnd[ 3 + k ]; }
+            nAvg++;
+        }
 
         // The row is labelled t + DT and written here, at the bottom of the
         // step, so its state and the impulse accumulated above refer to the
@@ -638,12 +865,9 @@ static int runTrackSim( const Model *mdl, const char *path ) {
             simMomentum( mdl, q, qd, Pref );
             for ( int k = 0 ; k < 3 ; k++ ) gImpRef[k] = gImp[k];
             tRef = t + DT;              // state is post-step
-            // Where the vehicle was when it stopped being pushed around, so the
-            // CREEP over the settled window can be measured. Friction is
-            // regularized, so a parked vehicle drifts rather than sticking, and
-            // with the damper solved implicitly the effective regularization
-            // velocity grows with dt -- meaning a bigger step buys speed at the
-            // price of creep. That price has to be measured, not assumed.
+            // Where the hull was when it stopped being pushed around, for the
+            // informational hull-motion line after the run. Whether FRICTION
+            // held is the patch-slip measurement's job, not this one's.
             for ( int k = 0 ; k < 3 ; k++ ) pRef[k] = q[ mdl->qidx[0] + 4 + k ];
             haveRef = 1;
         }
@@ -671,6 +895,10 @@ static int runTrackSim( const Model *mdl, const char *path ) {
             double ke;
             double e = simEnergyK( mdl, q, qd, &ke ) + trackContactPotential( mdl, &prm, Xe )
                      + groundContactPotential( mdl, &gprm, Xe );
+            for ( int b = 0 ; b < nBrake ; b++ ) {
+                double dq = q[ brakeQ[b] ] - brakeLock[b];
+                e += 0.5 * brakeK[b] * dq * dq;
+            }
             if ( ke > keScale ) keScale = ke;
             if ( ePrev != 0 && e > ePrev ) {
                 double rise = e - ePrev;
@@ -736,6 +964,26 @@ static int runTrackSim( const Model *mdl, const char *path ) {
             printf( "sim: FAIL: no pad is touching the ground after settling\n" );
             gndOk = 0;
         }
+        // PERIOD-2. An implicit damper sized against more mass than it really
+        // moves overshoots, and once the overshoot passes 2x it locks into a
+        // step-to-step alternation that never decays. Nothing above sees it:
+        // the mean is unaffected, the shoes move ~1e-7 m, and the energy bound
+        // is relative to a kinetic energy that the alternation itself keeps
+        // tiny. m113's idler friction sat in one at +/-4.8 kN for as long as
+        // anyone ran it (see trkPairMass). 0.1% of weight is far above a
+        // resolved signal's Nyquist leakage and far below that.
+        double alt = 0;
+        for ( int k = 0 ; k < 3 ; k++ ) {
+            double a = fabs( gAlt[k] ) / nAvg;
+            if ( a > alt ) alt = a;
+        }
+        printf( "sim: %s: period-2 content of the settled ground force %.3g N (%.2e of weight)\n",
+                path, alt, W != 0 ? alt / fabs( W ) : alt );
+        if ( alt > 1e-3 * fabs( W ) ) {
+            printf( "sim: FAIL: the ground force alternates sign every step (%.4g N) -- an "
+                    "implicit damper is sized against more mass than it moves\n", alt );
+            gndOk = 0;
+        }
     }
     if ( !gndOk ) return 1;
 
@@ -749,17 +997,40 @@ static int runTrackSim( const Model *mdl, const char *path ) {
     double span = nsteps * DT - tRef;
     simMomentum( mdl, q, qd, P );
 
-    // Creep: how far the hull drifted horizontally over the settled window,
-    // and at what mean rate. On a level plane with no drive torque this should
-    // be zero, and it is not, because regularized Coulomb has no true stick.
-    // The rate is what to compare against vEps.
+    // How far the hull moved over the settled window. Informational: see the
+    // note on patch slip for why this is not what says whether friction held.
     if ( mdl->ground.has && span > 0 ) {
-        double dx = q[ mdl->qidx[0] + 4 ] - pRef[0];
-        double dy = q[ mdl->qidx[0] + 5 ] - pRef[1];
-        double drift = sqrt( dx*dx + dy*dy );
-        printf( "sim: %s: creep: hull drifted %.4g m horizontally over the %.2f s settled "
-                "window, a mean %.3g m/s against vEps %.3g\n",
-                path, drift, span, drift / span, gprm.vEps );
+        double d2 = 0;
+        for ( int k = 0 ; k < 3 ; k++ ) {
+            double dk = q[ mdl->qidx[0] + 4 + k ] - pRef[k];
+            d2 += dk * dk;
+        }
+        printf( "sim: %s: hull moved %.4g m over the %.2f s settled window%s\n",
+                path, sqrt( d2 ), span, nBrake ? "" : " (sprockets free: it can roll)" );
+    }
+    double slip = -1;
+    if ( nPatch > 0 && nWin[0] > 0 && nWin[1] > 0 ) {
+        const double *nrm = mdl->ground.terrain.n;   // plane: one normal
+        double d[3], dn = 0, d2 = 0;
+        for ( int k = 0 ; k < 3 ; k++ ) { d[k] = pWin[1][k] / nWin[1] - pWin[0][k] / nWin[0]; dn += d[k] * nrm[k]; }
+        for ( int k = 0 ; k < 3 ; k++ ) { double tk = d[k] - dn * nrm[k]; d2 += tk * tk; }
+        slip = sqrt( d2 ) / T_WIN;
+        printf( "sim: %s: patch slip %.3g m/s over the last %.0f s, %d shoes on the ground "
+                "(%s friction%s, %.3g deg)\n",
+                path, slip, 2.0 * T_WIN, nPatch, run->anchored ? "anchored" : "regularized",
+                nBrake ? ", sprockets braked" : "", run->slopeDeg );
+    }
+    if ( run->gateCreep ) {
+        // The HOLD gate. Measured on m113 at 15 degrees, braked: anchored
+        // 6.2e-5 m/s at 4 s and 1.1e-5 by 8 s, still settling and not
+        // drifting; regularized a steady 1.65e-2 to 1.77e-2, the vEps creep
+        // it has no way not to have. 5e-4 sits 8x above the first and 33x
+        // below the second.
+        if ( slip < 0 || slip > 5e-4 ) {
+            printf( "sim: FAIL: a parked vehicle is not holding on the slope (patch slip %.3g m/s)\n",
+                    slip );
+            return 1;
+        }
     }
     // Normalize against the momentum actually present, not against the
     // component's own target: gravity is z-only, so dividing by |M*g_k*span|
@@ -873,6 +1144,28 @@ static int runTrackSim( const Model *mdl, const char *path ) {
     return 0;
 }
 
+// The track gate. A single run when the command line asked for one; otherwise
+// the flat settle, then -- for a model that stands on ground -- the slope hold.
+static int runTrackRuns( const Model *mdl, const char *path ) {
+    const int FRIC_DEFAULT = 0;              // regularized until anchored is gated
+    if ( gSingle ) {
+        TrackRun one = { gSlopeDeg, gFric < 0 ? FRIC_DEFAULT : gFric, gSlopeDeg != 0, 0 };
+        return runTrackSim( mdl, path, &one );
+    }
+    TrackRun flat = { 0, FRIC_DEFAULT, 0, 0 };
+    if ( runTrackSim( mdl, path, &flat ) ) return 1;
+    if ( !mdl->ground.has ) return 0;
+
+    // THE SLOPE HOLD: parked, sprockets braked, on 15 degrees, which is well
+    // inside every model's mu 0.8 (tan 15 = 0.27) so friction is asked only to
+    // hold, never to slide. The trace, if any, was the flat run's.
+    gTracePath = 0;
+    char label[ 512 ];
+    snprintf( label, sizeof label, "%s [15 deg, parked]", path );
+    TrackRun hold = { 15.0, 1, 1, 1 };
+    return runTrackSim( mdl, label, &hold );
+}
+
 int main( int argc, char **argv ) {
     const char *path = argc > 1 ? argv[ 1 ] : "../models/fourbar.mech";
     // argv[2] stayed a bare dt so the scaling re-runs documented above keep
@@ -882,11 +1175,22 @@ int main( int argc, char **argv ) {
             gTracePath = argv[ ++i ];
         } else if ( !strcmp( argv[i], "--stride" ) && i + 1 < argc ) {
             gTraceStride = atoi( argv[ ++i ] );
+        } else if ( !strcmp( argv[i], "--time" ) && i + 1 < argc ) {
+            gTime = atof( argv[ ++i ] );
+        } else if ( !strcmp( argv[i], "--slope" ) && i + 1 < argc ) {
+            gSlopeDeg = atof( argv[ ++i ] );
+            gSingle = 1;
+        } else if ( !strcmp( argv[i], "--fric" ) && i + 1 < argc ) {
+            const char *f = argv[ ++i ];
+            if ( !strcmp( f, "anchor" ) ) gFric = 1;
+            else if ( !strcmp( f, "reg" ) ) gFric = 0;
+            else { fprintf( stderr, "sim: --fric takes 'anchor' or 'reg'\n" ); return 1; }
+            gSingle = 1;
         } else if ( argv[i][0] != '-' ) {
             gDtOverride = atof( argv[i] );            // track models only
         } else {
             fprintf( stderr, "sim: usage: %s <model.mech> [dt] [--trace <file.csv>] "
-                             "[--stride <n>]\n", argv[0] );
+                             "[--stride <n>] [--slope <deg>] [--fric anchor|reg] [--time <s>]\n", argv[0] );
             return 1;
         }
     }
@@ -914,7 +1218,7 @@ int main( int argc, char **argv ) {
     // integrator check: they have both damping and closure loops, so the
     // energy-scaling test below does not apply to them, and settling the band
     // is the thing actually worth asserting.
-    if ( mdl.ntrack ) return runTrackSim( &mdl, path );
+    if ( mdl.ntrack ) return runTrackRuns( &mdl, path );
     if ( gTracePath )
         printf( "sim: %s: --trace covers the contact-in-the-loop track run only; this model "
                 "has no band, so nothing was written\n", path );

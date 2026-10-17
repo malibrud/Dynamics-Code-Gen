@@ -11,8 +11,11 @@
 //     groundContactFext( mdl, gprm, X, v, fext );   // shoes vs terrain
 //     fwd_dyn_crba( q, qd, tau, fext, act, qdd );
 //
-// The penalty-not-constraints and stateless arguments are exactly the ones in
-// track_contact.h and are not repeated here.
+// The penalty-not-constraints argument is exactly the one in track_contact.h
+// and is not repeated here. The stateless one is, by default, too -- but
+// stateless friction cannot hold a parked vehicle, so this law also has an
+// ANCHORED mode with per-corner state (see gndAnchorFriction), selected by the
+// caller handing it somewhere to keep that state.
 //
 // DELIBERATELY INDEPENDENT OF track_contact.h. The two laws share a damping
 // formula and a regularized-Coulomb expression and nothing else -- the gate,
@@ -61,6 +64,21 @@
 #include "../model/kinematics.h"
 #include "terrain.h"
 
+// ANCHORED FRICTION STATE, one slot per (shoe body, pad corner). Caller-owned
+// and caller-zeroed; see the note above gndAnchorFriction for the law. Keyed by
+// BODY index rather than (track, shoe) because the body index is already unique
+// and already in hand everywhere a pad corner is. ~57 KB, so callers keep it
+// static (the stack note on groundContactFromState applies).
+typedef struct {
+    double a[3];      // anchor, world: where the corner stuck
+    double n[3];      // terrain unit normal AT the anchor; the spring's plane
+    int    on;        // 0 = no anchor (corner clear of the ground)
+} GndAnchor;
+
+typedef struct {
+    GndAnchor pt[ MODEL_MAX_BODIES ][4];
+} GroundAnchors;
+
 typedef struct {
     // Damping fraction, applied against mEff below rather than against a single
     // body's mass. See the sizing note in groundContactDefaults -- this is the
@@ -79,9 +97,10 @@ typedef struct {
     // discontinuity at first touch and sticky separation.
     double gRamp;
 
-    // Regularization speed for Coulomb friction. Also the creep rate of a
-    // parked vehicle, and -- see groundContactStabilityStep -- the quantity
-    // that used to set the usable step size on its own.
+    // Regularization speed for Coulomb friction. Under the regularized law
+    // also the creep rate of a parked vehicle, and -- see
+    // groundContactStabilityStep -- the quantity that used to set the usable
+    // step size on its own. The anchored law does not read it.
     double vEps;
 
     // The caller's step, for SEMI-IMPLICIT FRICTION. Zero means the plain
@@ -99,6 +118,19 @@ typedef struct {
     // supported mass here would under-limit the impulse and forfeit exactly
     // the stability guarantee the implicit form exists to provide.
     double mImpulse;
+
+    // FRICTION LAW. NULL selects regularized Coulomb, which is stateless and
+    // creeps; non-NULL selects the anchored (elastoplastic brush) law, which
+    // holds, and these are its per-corner anchors -- mutated by every
+    // groundContactFext call, so a stepper must make exactly one per step.
+    // A pointer in a const params struct still points at writable state, which
+    // is the point: the law's parameters are fixed, its history is not.
+    GroundAnchors *anchors;
+
+    // Anchor spring stiffness as a fraction of kn. At 1 the tangential and
+    // normal periods match, so the step chosen for the normal spring resolves
+    // this one too; above 1 the accuracy step shrinks with it.
+    double ktFrac;
 
     int enableFriction;
 } GroundContactParams;
@@ -119,6 +151,8 @@ static void groundContactDefaults( const Model *mdl, GroundContactParams *p ) {
     p->gain  = 1.0;
     p->gRamp = 1.0e-3;
     p->vEps  = 1.0e-2;
+    p->ktFrac = 1.0;
+    p->anchors = NULL;                           // regularized unless asked
     p->enableFriction = 1;
 
     // THE EFFECTIVE MASS, and why it is not the shoe mass.
@@ -222,16 +256,120 @@ static double gndFricScale( double mufN, double sp, double vEps, double dt, doub
     return k;
 }
 
-static int gndPointForce( const GroundContactParams *prm, const ModelGround *gnd,
-                          const double p[3], const double u[3], GndPointForce *out ) {
+// ---------------------------------------------------------------------------
+// ANCHORED FRICTION: the law that HOLDS.
+//
+// Regularized Coulomb is a function of slip velocity alone, so at zero slip it
+// is zero force: whatever tangential load a parked vehicle carries, it has to
+// be sliding to resist it, and it creeps at whatever speed buys that force.
+// No choice of vEps fixes that -- it only picks the speed. Holding needs a
+// force at zero velocity, which means a STATE, and the state here is where the
+// corner stuck:
+//
+//     z  = P_a ( p - a )                 deflection in the anchor's tangent plane
+//     f  = -kt*z - ct*u_t                trial force (spring + damper)
+//     |f| <= mu*fN  ->  stick: f as is, anchor stays put
+//     |f| >  mu*fN  ->  slide: f returned onto the cone, and the anchor
+//                       dragged along by exactly the slip that takes
+//
+// That is the elastoplastic bristle (Dupont et al. 2002), which is also
+// Cundall-Strack's tangential spring and, physically, a tire's brush: elastic
+// below breakaway, rigid-plastic flow above it. Three properties matter:
+//
+//   - IT HOLDS. Below the cone the force comes from the spring, at zero
+//     velocity, so the corner sits at a FIXED deflection (at most mu*fN/kt)
+//     instead of moving at a rate. Creep stops being a speed.
+//   - NO DRIFT UNDER VIBRATION. LuGre's single-state bristle drifts when the
+//     load oscillates below breakaway -- its z-dynamics is never purely
+//     elastic -- and a vehicle on torsion bars is nothing but oscillating
+//     load. Here, inside the cone, a is constant and the law is exactly a
+//     spring, so a load cycle that never reaches mu*fN moves nothing.
+//   - PASSIVE. With a fixed, U = 1/2 kt |P_a (p - a)|^2 and the spring term is
+//     exactly -grad U: P_a is a constant symmetric projector, which is why the
+//     plane is the ANCHOR's and not the current contact's -- on curved terrain
+//     the current normal would make the spring non-conservative. The slide is
+//     a backward-Euler return (see below), so the slider's work f.da is never
+//     positive; the damper's is -ct|u_t|^2.
+//
+// The damper is solved implicitly against mImpulse exactly as in gndFricScale,
+// for the same reason. ct is sized like the normal damper, against mEff, so
+// the vehicle's surge on its anchors gets the declared zeta the way its heave
+// does.
+//
+// Contact lost (g <= 0) drops the anchor; the next touch re-seats it at the
+// corner, unloaded. fN -> 0 needs no special case: the cone collapses to a
+// point, every step is a slide whose return is all the way to f = 0, and the
+// anchor follows the corner -- an unloaded pad is free to move, as it must be.
+static void gndAnchorFriction( const GroundContactParams *prm, double kn, double mufN,
+                               const double nrm[3], const double p[3], const double u[3],
+                               GndAnchor *an, double f[3] ) {
+    if ( !an->on ) {
+        for ( int k = 0 ; k < 3 ; k++ ) { an->a[k] = p[k]; an->n[k] = nrm[k]; }
+        an->on = 1;
+    }
+
+    double kt = prm->ktFrac * kn;                // kn already carries gain
+    double ct = 2.0 * prm->zeta * sqrt( kt * prm->mEff );
+    if ( prm->dt > 0 && prm->mImpulse > 0 ) ct /= 1.0 + ct * prm->dt / prm->mImpulse;
+
+    double r[3], z[3], ut[3];
+    for ( int k = 0 ; k < 3 ; k++ ) r[k] = p[k] - an->a[k];
+    double rn = r[0]*an->n[0] + r[1]*an->n[1] + r[2]*an->n[2];
+    double un = u[0]*nrm[0] + u[1]*nrm[1] + u[2]*nrm[2];
+    for ( int k = 0 ; k < 3 ; k++ ) {
+        z[k]  = r[k] - rn * an->n[k];
+        ut[k] = u[k] - un * nrm[k];
+    }
+
+    double ft[3], m2 = 0;
+    for ( int k = 0 ; k < 3 ; k++ ) { ft[k] = -kt * z[k] - ct * ut[k]; m2 += ft[k]*ft[k]; }
+
+    if ( m2 > mufN * mufN ) {
+        // Slide, by RADIAL RETURN. The damper sits on the bristle, in parallel
+        // with the spring and in series with the slider, so when the slider
+        // moves by da over the step the bristle rate drops by da/dt and
+        //
+        //     f = f_trial + ( kt + ct/dt ) * da
+        //
+        // The cone is isotropic and so is that stiffness, so the return is
+        // straight back along f_trial: f = s*f_trial with s = mu*fN/|f_trial|,
+        // and da = (s - 1)*f_trial/(kt + ct/dt). That is backward-Euler
+        // plasticity, and f.da <= 0 by construction -- the slider can only
+        // dissipate. The tempting shortcut, "clamp f and set a = p + f/kt",
+        // drops the damper's share into the spring: when ct*|u| dominates it
+        // LENGTHENS z and stores energy the step never paid for.
+        //
+        // dt == 0 is the fixed-state case (tests); there the damper has no
+        // interval to act over and the spring alone takes the return.
+        double s    = mufN / sqrt( m2 );
+        double kRet = kt + ( prm->dt > 0 ? ct / prm->dt : 0 );
+        for ( int k = 0 ; k < 3 ; k++ ) {
+            double da = kRet > 0 ? ( s - 1.0 ) * ft[k] / kRet : r[k];
+            an->a[k] += da;
+            an->n[k]  = nrm[k];                  // the anchor is somewhere new
+            ft[k] *= s;
+        }
+    }
+    for ( int k = 0 ; k < 3 ; k++ ) f[k] = ft[k];
+}
+
+static int gndPointForceA( const GroundContactParams *prm, const ModelGround *gnd,
+                           const double p[3], const double u[3], GndAnchor *an,
+                           GndPointForce *out ) {
     memset( out, 0, sizeof *out );
 
     double h, hx, hy;
-    if ( !terrainAt( &gnd->terrain, p[0], p[1], &h, &hx, &hy ) ) return 0;
+    if ( !terrainAt( &gnd->terrain, p[0], p[1], &h, &hx, &hy ) ) {
+        if ( an ) an->on = 0;
+        return 0;
+    }
 
     double g = h - p[2];
     out->g = g;
-    if ( g <= 0 ) return 0;                      // one-sided; no gate needed
+    if ( g <= 0 ) {                              // one-sided; no gate needed
+        if ( an ) an->on = 0;
+        return 0;
+    }
 
     // grad(-g), UNNORMALIZED. Normalizing here is what would break the
     // conservativeness identity (terrain.h), and skipping it removes a sqrt.
@@ -259,9 +397,17 @@ static int gndPointForce( const GroundContactParams *prm, const ModelGround *gnd
     }
 
     // --- friction ---------------------------------------------------------
-    // Regularized Coulomb on the full slip in the tangent plane. No tooth term
-    // competes with it here, so it runs on every point: this is the tractive
-    // force. The honest cost is that a parked vehicle creeps at up to vEps.
+    // No tooth term competes with it here, so it runs on every point: this is
+    // the tractive force. Anchored when the caller supplied anchor state, and
+    // then run even at s == 0 -- an unloaded cone is what re-seats the anchor.
+    if ( an && prm->enableFriction && gnd->mu > 0 ) {
+        double ff[3];
+        gndAnchorFriction( prm, kn, gnd->mu * out->fN, out->n, p, u, an, ff );
+        for ( int k = 0 ; k < 3 ; k++ ) out->f[k] += ff[k];
+        return 1;
+    }
+    // Otherwise regularized Coulomb on the full slip in the tangent plane.
+    // The honest cost is that a parked vehicle creeps at up to vEps.
     if ( prm->enableFriction && s > 0 && gnd->mu > 0 ) {
         double un = u[0]*out->n[0] + u[1]*out->n[1] + u[2]*out->n[2];
         double ut[3];
@@ -272,6 +418,14 @@ static int gndPointForce( const GroundContactParams *prm, const ModelGround *gnd
         for ( int k = 0 ; k < 3 ; k++ ) out->f[k] += sc * ut[k];
     }
     return 1;
+}
+
+// The stateless form: regularized Coulomb whatever prm->anchors says, which is
+// what every fixed-state sweep wants -- a sweep that silently re-seated
+// anchors would be testing the order it visited its samples in.
+static int gndPointForce( const GroundContactParams *prm, const ModelGround *gnd,
+                          const double p[3], const double u[3], GndPointForce *out ) {
+    return gndPointForceA( prm, gnd, p, u, NULL, out );
 }
 
 // The four corners of a shoe's ground pad, in shoe-local coordinates. The pad
@@ -367,7 +521,8 @@ static void groundContactFext( const Model *mdl, const GroundContactParams *prm,
                     u[k] = Xa[j][0][k]*ub[0] + Xa[j][1][k]*ub[1] + Xa[j][2][k]*ub[2];
 
                 GndPointForce pf;
-                if ( !gndPointForce( prm, &mdl->ground, p, u, &pf ) ) continue;
+                GndAnchor *an = prm->anchors ? &prm->anchors->pt[ j ][ corner ] : NULL;
+                if ( !gndPointForceA( prm, &mdl->ground, p, u, an, &pf ) ) continue;
 
                 double mx = p[1]*pf.f[2] - p[2]*pf.f[1];
                 double my = p[2]*pf.f[0] - p[0]*pf.f[2];
@@ -411,7 +566,20 @@ static double groundContactPotential( const Model *mdl, const GroundContactParam
                     p[k] = r[k] + Xa[j][0][k]*tl[0] + Xa[j][1][k]*tl[1] + Xa[j][2][k]*tl[2];
                 if ( !terrainAt( &mdl->ground.terrain, p[0], p[1], &h, &hx, &hy ) ) continue;
                 double g = h - p[2];
-                if ( g > 0 ) U += 0.5 * kn * g * g;
+                if ( g <= 0 ) continue;
+                U += 0.5 * kn * g * g;
+
+                // The anchor springs store energy too, and a parked vehicle on
+                // a slope keeps a fair amount of it there: without this term a
+                // corner loading its anchor looks like energy leaving.
+                const GndAnchor *an = prm->anchors ? &prm->anchors->pt[ j ][ corner ] : NULL;
+                if ( an && an->on && prm->enableFriction && mdl->ground.mu > 0 ) {
+                    double r[3], z2 = 0;
+                    for ( int k = 0 ; k < 3 ; k++ ) r[k] = p[k] - an->a[k];
+                    double rn = r[0]*an->n[0] + r[1]*an->n[1] + r[2]*an->n[2];
+                    for ( int k = 0 ; k < 3 ; k++ ) { double z = r[k] - rn*an->n[k]; z2 += z*z; }
+                    U += 0.5 * prm->ktFrac * kn * z2;
+                }
             }
         }
     }
@@ -472,11 +640,13 @@ static double groundContactStabilityStep( const Model *mdl, const GroundContactP
 // The step accuracy wants, the ground-side twin of trackContactAccuracyStep --
 // see the note there for what the sample count means and how it was calibrated.
 // Four pad corners share one shoe, so the stiffness that shoe sees is 4*kn,
-// exactly as in the stability estimate above.
+// exactly as in the stability estimate above. Anchored friction adds a second
+// spring, tangential, at ktFrac*kn: the stiffer of the two sets the period.
 static double groundContactAccuracyStep( const Model *mdl, const GroundContactParams *prm,
                                          double samplesPerPeriod ) {
     if ( !mdl->ground.has || mdl->ground.npoint <= 0 || samplesPerPeriod <= 0 ) return 0;
     double kn = prm->gain * mdl->ground.kn;
+    if ( prm->anchors && prm->enableFriction && prm->ktFrac > 1.0 ) kn *= prm->ktFrac;
     if ( kn <= 0 ) return 0;
 
     double worst = 0;

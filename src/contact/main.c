@@ -132,7 +132,7 @@ static int checkSmoothness( const Model *mdl, const TrackContactParams *prm ) {
         double rho = lo + i*h;
         double d[3] = { rho, 0, 0 };
         TrkPairForce pf;
-        trkPairForce( prm, tr, ro, d, u0, &pf );
+        trkPairForce( prm, tr, ro, d, u0, 0, &pf );
         double f = sqrt( pf.f[0]*pf.f[0] + pf.f[1]*pf.f[1] + pf.f[2]*pf.f[2] );
         if ( prevOk ) { double jump = fabs( f - prev ); if ( jump > maxJump ) maxJump = jump; }
         prev = f; prevOk = 1;
@@ -164,7 +164,7 @@ static int checkSmoothness( const Model *mdl, const TrackContactParams *prm ) {
             for ( int k = -1 ; k <= 1 ; k++ ) {
                 double d[3] = { a + ( i + k )*hg, 0, 0 };
                 TrkPairForce pf;
-                trkPairForce( prm, tr, ro, d, u0, &pf );
+                trkPairForce( prm, tr, ro, d, u0, 0, &pf );
                 f[k+1] = sqrt( pf.f[0]*pf.f[0] + pf.f[1]*pf.f[1] + pf.f[2]*pf.f[2] );
             }
             double curv = fabs( f[2] - 2*f[1] + f[0] ) / ( hg*hg );
@@ -191,7 +191,7 @@ static int checkSmoothness( const Model *mdl, const TrackContactParams *prm ) {
             double th = th0 + i*hc;
             double d[3] = { R*cos(th), 0, R*sin(th) };   // on the circle: delta = 0
             TrkPairForce pf;
-            trkPairForce( prm, tr, ro, d, u0, &pf );
+            trkPairForce( prm, tr, ro, d, u0, 0, &pf );
             double f = sqrt( pf.f[0]*pf.f[0] + pf.f[1]*pf.f[1] + pf.f[2]*pf.f[2] );
             if ( i ) { double jump = fabs( f - prevC ); if ( jump > maxJumpC ) maxJumpC = jump; }
             prevC = f;
@@ -218,7 +218,7 @@ static double toothFT( const TrackContactParams *prm, const ModelTrack *tr,
     double u0[3] = { 0, 0, 0 };
     double d[3] = { ro->radius*cos(th), 0, ro->radius*sin(th) };
     TrkPairForce pf;
-    trkPairForce( prm, tr, ro, d, u0, &pf );
+    trkPairForce( prm, tr, ro, d, u0, 0, &pf );
     return pf.fT;
 }
 
@@ -337,7 +337,7 @@ static int checkDesignPose( const Model *mdl, const TrackContactParams *prm ) {
 
                 double u0[3] = { 0, 0, 0 };
                 TrkPairForce pf;
-                trkPairForce( prm, tr, ro, d, u0, &pf );
+                trkPairForce( prm, tr, ro, d, u0, 0, &pf );
                 if ( pf.fN != 0.0 ) {
                     printf( "contact: FAIL: design pose has a nonzero radial force: track '%s' "
                             "roller body %d vs shoe %d, delta = %.6g, fN = %.6g\n",
@@ -453,7 +453,7 @@ static int checkDriveTorque( const Model *mdl, const TrackContactParams *prm ) {
                         u[k] = Es[k][0]*uw[0] + Es[k][1]*uw[1] + Es[k][2]*uw[2];
 
                     TrkPairForce pf;
-                    if ( !trkPairForce( prm, tr, ro, d, u, &pf ) ) continue;
+                    if ( !trkPairForce( prm, tr, ro, d, u, 0, &pf ) ) continue;
                     double mY = d[2]*pf.f[0] - d[0]*pf.f[2];
                     tqDirect -= mY;
                     scale    += fabs( mY );
@@ -509,8 +509,8 @@ static int checkPassivity( const Model *mdl, const TrackContactParams *prm ) {
 
         TrkPairForce pf, p0;
         double uz[3] = { 0, 0, 0 };
-        trkPairForce( prm, tr, ro, d, u,  &pf );
-        trkPairForce( prm, tr, ro, d, uz, &p0 );
+        trkPairForce( prm, tr, ro, d, u,  0, &pf );
+        trkPairForce( prm, tr, ro, d, uz, 0, &p0 );
 
         double power = 0, mag = 0;
         for ( int k = 0 ; k < 3 ; k++ ) {
@@ -661,7 +661,7 @@ static int checkFaceGradient( const Model *mdl, const TrackContactParams *prm ) 
         randomFaceState( tr, ro, c, ua, ub );
 
         TrkFaceForce ff;
-        if ( !trkFaceForce( &sp, tr, ro, c, zero, zero, &ff ) ) continue;
+        if ( !trkFaceForce( &sp, tr, ro, c, zero, zero, 0, &ff ) ) continue;
         // Skip the gate edges, where the one-sided cut makes a central
         // difference meaningless -- smoothness there is check 8's business.
         if ( ff.delta < 1e-4 || ff.w < 1e-3 || ff.w > 1 - 1e-3 ) continue;
@@ -716,8 +716,8 @@ static int checkFacePassivity( const Model *mdl, const TrackContactParams *prm )
         randomFaceState( tr, ro, c, uc, us );
 
         TrkFaceForce ff, f0;
-        if ( !trkFaceForce( prm, tr, ro, c, uc, us, &ff ) ) continue;
-        trkFaceForce( prm, tr, ro, c, zero, zero, &f0 );
+        if ( !trkFaceForce( prm, tr, ro, c, uc, us, 0, &ff ) ) continue;
+        trkFaceForce( prm, tr, ro, c, zero, zero, 0, &f0 );
         tested++;
 
         double power = 0, mag = 0;
@@ -1227,6 +1227,168 @@ static int checkGroundPassivityAndCone( const Model *mdl, const GroundContactPar
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Anchored friction, on ONE point mass resting on the model's terrain: does it
+// hold, does it slide, and does it stay put while its load vibrates?
+//
+// A fixed-state sweep cannot ask any of these -- the law has a state, and
+// holding is a property of where that state goes over time. So this steps the
+// point through gndPointForceA the way the simulator steps a shoe corner
+// (drift/kick/drift, the force at the midpoint position, dt set so the
+// friction runs in its implicit mode), with the point's weight along the
+// terrain normal and a tangential load eased in over T_LOAD so the answer is
+// the law's and not the transient's.
+//
+// The mass is mEff, the static share per point, so the normal load is the
+// one the law is sized for.
+// ---------------------------------------------------------------------------
+typedef struct {
+    double xA, xB;   // mean tangential displacement over [T-2, T-1] and [T-1, T]
+    double vA, vB;   // tangential velocity at T-1 and at T
+    double coneOver; // worst (|f_t| - mu*fN) / (mu*fN) over the run
+} AnchorRun;
+
+static void anchorStep( const Model *mdl, const GroundContactParams *prm, GndAnchor *an,
+                        double loadFrac, double vibFrac, double T, AnchorRun *out ) {
+    const ModelGround *gnd = &mdl->ground;
+    double gMag = 0;
+    for ( int k = 0 ; k < 3 ; k++ ) gMag += mdl->gravity[k] * mdl->gravity[k];
+    gMag = sqrt( gMag );
+    double m = prm->mEff, W = m * gMag, kn = gnd->kn;
+
+    // Terrain normal and a tangent at the origin.
+    double h, hx, hy;
+    terrainAt( &gnd->terrain, 0, 0, &h, &hx, &hy );
+    double Gn = sqrt( 1.0 + hx*hx + hy*hy );
+    double n[3] = { -hx / Gn, -hy / Gn, 1.0 / Gn };
+    double e[3] = { 1.0 - n[0]*n[0], -n[0]*n[1], -n[0]*n[2] };
+    double en = sqrt( e[0]*e[0] + e[1]*e[1] + e[2]*e[2] );
+    for ( int k = 0 ; k < 3 ; k++ ) e[k] /= en;
+
+    // Start at the static sink: the vertical gap that carries W along n.
+    double p[3] = { 0, 0, h - W / ( kn * Gn * Gn ) }, u[3] = { 0, 0, 0 }, p0[3];
+    for ( int k = 0 ; k < 3 ; k++ ) p0[k] = p[k];
+
+    // The step the simulator would pick for this spring, 90 samples a period,
+    // and with it the implicit friction mode.
+    GroundContactParams pr = *prm;
+    pr.dt = 2.0 * 3.14159265358979323846 * sqrt( m / kn ) / 90.0;
+    int nsteps = (int)( T / pr.dt );
+
+    // The load is eased in over T_LOAD, which is several tangential periods
+    // on every model (m113's is 0.18 s at mEff 90 kg). Ramp it over one period
+    // instead and the overshoot alone crosses breakaway: m113 then slides
+    // 0.2 mm on its way up to a load it could have held.
+    // The shake is kept well under the normal mode, a whole number of hertz so
+    // every one-second window holds whole cycles. Near the mode the point
+    // bounces clear of the ground and slides, which is right and is not the
+    // question: at 5 Hz m113's point (normal mode 5.6 Hz) walks 3 mm/s.
+    const double PI = 3.14159265358979323846, T_LOAD = 1.0;
+    double fN0 = sqrt( kn / m ) / ( 2.0 * PI );
+    double F_VIB = floor( 0.2 * fN0 ) > 1.0 ? floor( 0.2 * fN0 ) : 1.0;
+    memset( out, 0, sizeof *out );
+    int nA = 0, nB = 0;
+
+    for ( int s = 0 ; s < nsteps ; s++ ) {
+        double tm = ( s + 0.5 ) * pr.dt;
+        for ( int k = 0 ; k < 3 ; k++ ) p[k] += 0.5 * pr.dt * u[k];
+
+        GndPointForce pf;
+        gndPointForceA( &pr, gnd, p, u, an, &pf );
+
+        double r  = tm < T_LOAD ? tm / T_LOAD : 1.0;
+        double Ft = loadFrac * gnd->mu * W * r * r * ( 3.0 - 2.0 * r );
+        double Wn = W * ( 1.0 + ( tm > T_LOAD ? vibFrac * sin( 2.0 * PI * F_VIB * ( tm - T_LOAD ) ) : 0 ) );
+
+        double fn = 0, ft2 = 0;
+        for ( int k = 0 ; k < 3 ; k++ ) fn += pf.f[k] * pf.n[k];
+        for ( int k = 0 ; k < 3 ; k++ ) { double fk = pf.f[k] - fn * pf.n[k]; ft2 += fk * fk; }
+        double lim = gnd->mu * pf.fN;
+        if ( lim > 0 && ( sqrt( ft2 ) - lim ) / lim > out->coneOver ) out->coneOver = ( sqrt( ft2 ) - lim ) / lim;
+
+        for ( int k = 0 ; k < 3 ; k++ )
+            u[k] += pr.dt * ( pf.f[k] - Wn * n[k] + Ft * e[k] ) / m;
+        for ( int k = 0 ; k < 3 ; k++ ) p[k] += 0.5 * pr.dt * u[k];
+
+        double te = ( s + 1 ) * pr.dt, x = 0, v = 0;
+        for ( int k = 0 ; k < 3 ; k++ ) { x += ( p[k] - p0[k] ) * e[k]; v += u[k] * e[k]; }
+        if ( te > T - 2.0 && te <= T - 1.0 ) { out->xA += x; nA++; out->vA = v; }
+        if ( te > T - 1.0 )                  { out->xB += x; nB++; out->vB = v; }
+    }
+    if ( nA ) out->xA /= nA;
+    if ( nB ) out->xB /= nB;
+}
+
+static int checkGroundAnchorHold( const Model *mdl, const GroundContactParams *prm ) {
+    if ( !mdl->ground.has || mdl->ground.mu <= 0 ) return 0;
+    static GndAnchor an;                         // one corner's worth
+    AnchorRun a, ra, va, rv;
+    double gMag = 0;
+    for ( int k = 0 ; k < 3 ; k++ ) gMag += mdl->gravity[k] * mdl->gravity[k];
+    gMag = sqrt( gMag );
+    double W = prm->mEff * gMag, mu = mdl->ground.mu, kt = prm->ktFrac * mdl->ground.kn;
+
+    // HOLD at 90% of breakaway. At rest the spring alone carries the load, so
+    // the point must sit at F/kt -- not near it, AT it, since any slide on the
+    // way would have moved the anchor -- and stop there. Window means, one
+    // second apiece, so the last of the ring-down averages out.
+    memset( &an, 0, sizeof an );
+    anchorStep( mdl, prm, &an, 0.9, 0.0, 6.0, &a );
+    double xWant = 0.9 * mu * W / kt;
+    double drift = fabs( a.xB - a.xA );
+    if ( fabs( a.xB - xWant ) > 1e-4 * xWant || drift > 1e-6 * xWant || a.coneOver > 1e-12 ) {
+        printf( "contact: FAIL: anchored friction does not hold 0.9 of breakaway: sits at %.6g m "
+                "against F/kt = %.6g, moved %.3g m between the last two seconds, cone excess %.3g\n",
+                a.xB, xWant, drift, a.coneOver );
+        return 1;
+    }
+
+    // The CONTROL: the stateless law under the same load. If it held too, the
+    // check above would not be telling the two laws apart.
+    anchorStep( mdl, prm, NULL, 0.9, 0.0, 6.0, &ra );
+    double regDrift = fabs( ra.xB - ra.xA );
+    if ( regDrift < 1e3 * drift || regDrift < 1e3 * 1e-6 * xWant ) {
+        printf( "contact: FAIL: the hold check cannot tell the laws apart -- regularized friction "
+                "moved only %.3g m a second against anchored %.3g m\n", regDrift, drift );
+        return 1;
+    }
+
+    // SLIDE at 110%: past breakaway the friction must be exactly mu*fN, so the
+    // point accelerates at (1.1 - 1)*mu*g along the load.
+    memset( &an, 0, sizeof an );
+    anchorStep( mdl, prm, &an, 1.1, 0.0, 3.0, &a );
+    double acc = a.vB - a.vA, accWant = 0.1 * mu * gMag;     // over one second
+    // The cone itself is exact (coneOver); what is loose is that mean fN over
+    // the second is W only to the extent the normal mode has rung down, which
+    // on track_min leaves 1e-3 in the acceleration.
+    if ( fabs( acc - accWant ) > 5e-3 * accWant || a.coneOver > 1e-12 ) {
+        printf( "contact: FAIL: anchored friction past breakaway accelerates at %.6g m/s^2 "
+                "against (1.1 - 1)*mu*g = %.6g, cone excess %.3g\n", acc, accWant, a.coneOver );
+        return 1;
+    }
+
+    // NO WALKING UNDER VIBRATION: half of breakaway, with the normal load
+    // swinging +/-30% well below the normal mode, so the cone never comes
+    // within 0.2 of the load.
+    // LuGre walks under exactly this; an elastic bristle inside its cone must
+    // not. Each window is five whole cycles.
+    memset( &an, 0, sizeof an );
+    anchorStep( mdl, prm, &an, 0.5, 0.3, 6.0, &va );
+    double vibDrift = fabs( va.xB - va.xA );
+    if ( vibDrift > 1e-6 * xWant || va.coneOver > 1e-12 ) {
+        printf( "contact: FAIL: anchored friction walks under a vibrating load: %.3g m a second "
+                "at half of breakaway (cone excess %.3g)\n", vibDrift, va.coneOver );
+        return 1;
+    }
+    anchorStep( mdl, prm, NULL, 0.5, 0.3, 6.0, &rv );
+
+    printf( "contact: ground: anchored friction holds 0.9 of breakaway at F/kt = %.4g m, moving "
+            "%.2g m/s (regularized: %.3g m/s); slides at 1.1 accelerating at %.6f of (1.1 - 1)*mu*g; "
+            "and moves %.2g m/s under a +/-30%% vibrating load (regularized: %.3g m/s)\n",
+            xWant, drift, regDrift, acc / accWant, vibDrift, fabs( rv.xB - rv.xA ) );
+    return 0;
+}
+
 int main( int argc, char **argv ) {
     const char *path = argc > 1 ? argv[ 1 ] : "../models/m113.mech";
     Model mdl;
@@ -1290,6 +1452,7 @@ int main( int argc, char **argv ) {
         gprmDt.dt = 1.0e-4;
         if ( checkGroundPassivityAndCone( &mdl, &gprmDt ) ) return 1;
     }
+    if ( checkGroundAnchorHold( &mdl, &gprm ) )       return 1;
 
     printf( "contact: PASS\n" );
     return 0;

@@ -670,7 +670,9 @@ persistent-anchor stick model, which could not be evaluated at a random state
 at all. The honest cost is that a loaded stationary vehicle creeps at up to
 `vEps` ≈ 1 cm/s — measured at 0.88 cm/s on a settled `m113`. `vEps` used to set
 the step size as well; see [Ground contact](#ground-contact) for the implicit
-treatment that decoupled the two.
+treatment that decoupled the two. The band is still stateless. The *ground* has
+since gained an opt-in stateful mode that holds; see
+[Holding on a slope](#holding-on-a-slope) for why that stopped short of the band.
 
 **Two primitives, not one, and which applies is set by `end`.** Pins engage the
 sprocket and idler; road wheels roll on the flat inner face of the shoe between
@@ -924,10 +926,12 @@ ramped gains, then assert the band was never crushed onto its axles, that the
 ground carries the vehicle's weight, that linear momentum tracks
 `∫(M·g + F_gnd)dt`, and that the energy budget shrinks once the ramp is over.
 On `m113`, at `dt` = 1.87e-4 over 21341 steps: worst pin penetration 0.0087 →
-0.0049 m, settled ground load 0.38% off the vehicle weight, momentum matching to
-1.2e-5 relative (10.3 N·s against an 8.8e5 N·s scale), creep 0.81 cm/s, and a net
-energy change of −55.35 J with the largest single-step rise 0.008983 J against a
-0.01354 J truncation bound.
+0.0049 m, settled ground load 0.37% off the vehicle weight, momentum matching to
+1.1e-5 relative (9.9 N·s against an 8.8e5 N·s scale), period-2 content of the
+ground force 1.06 N, and a net energy change of −55.91 J with the largest
+single-step rise 0.000556 J against a 0.01344 J truncation bound. A second run then
+parks the vehicle on 15° and asserts it holds; see
+[Holding on a slope](#holding-on-a-slope).
 
 Those are the assertions. The run itself can also just be looked at: `--trace
 <file.csv>` writes it out as time histories — hull pose, the ground wrench,
@@ -1096,7 +1100,7 @@ slip each step. Large `dt` is therefore *stickier* than reality — ordinary
 backward-Euler over-damping — so the low creep at 1e-3 is a numerical artifact,
 not a better answer. Second, none of this makes true stick reachable: the law is
 still stateless and still creeps, which is still the price of being testable at
-random states.
+random states. True stick needed state; see [Holding on a slope](#holding-on-a-slope).
 
 Net effect on m113: `dt` goes 2.83e-5 → 1e-4 at a step cost of 175.4 µs, so the
 real-time factor goes **0.16 → 0.57** — from 6.3x slower than real time to 1.75x.
@@ -1147,12 +1151,15 @@ them to would be tuning one model against another. The analytic gates are
 strictly stronger and need no Chrono at all — which is also what the next stage
 is built around: slope holding below `tan θ = μ`, slope release above it at
 `g(sin θ - μ cos θ)`, sinkage `W/(n·kn)`, and tractive force `T/R` against
-sprocket torque.
+sprocket torque. The first two now exist, for the anchored law: on a point mass
+in `src/contact`, and holding for the whole vehicle in `src/sim`.
 
 **What is deliberately not here.** Triangle meshes (C⁻¹ normals at edges, and
 they need a broadphase); unilateral constraints, for the same frozen-`nc` reason
-penalty contact was chosen for the band; and stateful stick friction, which would
-forfeit the random-state testability the whole harness rests on. Sphere-against-
+penalty contact was chosen for the band; and stateful stick friction *as the
+default*, which would forfeit the random-state testability the whole harness rests
+on. It exists now as an opt-in mode, tested along trajectories instead. See
+[Holding on a slope](#holding-on-a-slope). Sphere-against-
 terrain — the honest replacement for `hmmwv`'s four shaker posts and `distance`
 "tire" rods — reintroduces exactly the gradient subtlety the vertical-gap point
 formulation avoids, so it waits.
@@ -1296,6 +1303,149 @@ numbers support. `track_demo` runs at 2.3x real time and `track_min` at 10.2x.
 
 The gates all of this passes are the ones that were already there, at the same
 tolerances; none was loosened to get here.
+
+## Holding on a slope
+
+Regularized Coulomb is a function of slip *velocity*, so at zero slip it is zero
+force: whatever tangential load a parked vehicle carries, it has to be sliding to
+resist it. No `vEps` fixes that — it only chooses the speed. On 15° with the
+sprockets locked, `m113` slides down at a steady **1.7 cm/s**, 0.20 m in 12 s.
+Holding needs force at zero velocity, which means **state**, and the ground law
+now has an opt-in mode that keeps some.
+
+**The law: an elastoplastic anchor.** Each pad corner remembers where it stuck,
+`a`, and a tangential spring-damper pulls it back:
+
+```
+z = P_a (p − a)                 deflection in the anchor's tangent plane
+f = −kt·z − ct·u_t              trial force
+|f| ≤ μ·f_n  →  stick: f as is, a stays put
+|f| > μ·f_n  →  slide: radial return onto the cone, a dragged by exactly that slip
+```
+
+This is the elastoplastic bristle (Dupont et al.), also known as Cundall–Strack's
+tangential spring. It is what a tire's brush is, physically. Three things decided
+it over the alternatives:
+
+- **It holds.** Below the cone the spring supplies the force at zero velocity, so
+  creep stops being a speed and becomes a fixed deflection of at most `μ·f_n/kt`.
+- **It doesn't walk under vibration.** LuGre's single-state bristle drifts when the
+  load oscillates below breakaway, and a vehicle on torsion bars carries nothing
+  *but* oscillating load. Inside the cone the anchor is fixed and the law is
+  exactly a spring.
+- **It fits the engine.** Complementarity (LCP/CCP, Moreau–Jean) holds exactly too,
+  but needs a coupled solve over every contact. That rewrites the penalty,
+  per-contact design for the same reason `nc` is frozen. Here every corner keeps
+  its identity (`shoe body, corner`), so keying the history costs nothing.
+
+The spring is conservative as long as the anchor is fixed, because `P_a` is the
+*anchor's* projector rather than the current contact's. The slide is a
+backward-Euler return, `da = (s − 1)·f_trial/(kt + ct/dt)`, so the slider's work
+`f·da` is never positive. The shortcut "clamp f, set `a = p + f/kt`" pushes the
+damper's share into the spring, and when `ct·|u|` dominates it *lengthens* `z`.
+The damper is implicit against `mImpulse`, the same as `gndFricScale`. `kt`
+defaults to `kn`, so the step chosen for the normal spring resolves the tangential
+one too.
+
+**Why statelessness gave way, and how far.** [Ground contact](#ground-contact)
+lists stateful stick friction under "deliberately not here", because the
+random-state checks are the backbone of the harness and state can't be evaluated
+at a random point. That is still true. The regularized law is still the default,
+and every fixed-state sweep still runs against it (`gndPointForce` ignores the
+anchors by construction). The anchored law is opt-in, by handing the engine
+somewhere to keep its state, and it is gated along trajectories, because holding
+is a property of where the state goes over time. The band's own friction stays
+stateless.
+
+**The pair mass, and the period-2 gate.** Anchoring the ground first required
+fixing the idler, whose friction had been sitting in a period-2 limit cycle all
+along. Implicit friction is sized against a mass, and its never-reverses
+guarantee holds only if that mass is what the impulse actually moves. The slip is
+*relative*, so it is the pair's reduced mass:
+
+```
+1/m = 1/m_shoe + n/m_rim,     1/m_rim = 1/m_roller + R²/I_axle
+```
+
+Here `n` is the number of pins sharing the rim; it is 1 for the face law, whose
+weights are a partition of unity. Sizing against the shoe alone, as the idler had
+been, overshoots by `m_shoe/m_pair`. Five pins on a rim with 17 kg of spin
+inertia put that near 6, so the slip multiplier saturated at about −5 and the
+friction locked into a ±5 kN alternation every step. Nothing caught it: the mean
+was right, the shoes moved 1e-7 m, and the energy bound is relative to a kinetic
+energy the cycle itself kept small. `src/sim` now projects the settled ground
+force onto `(−1)^s` and fails above 0.1% of weight. On `m113` that reads **4972 N
+before the fix and 1.06 N after**.
+
+**The hold gate.** With no `--slope` / `--fric`, a track model on ground now gets
+a second run after the flat settle: parked on 15° (`tan 15° = 0.27`, well inside
+`μ = 0.8`, so friction is only ever asked to hold). Three things had to be right
+before it measured anything:
+
+- *Tilt everything, not the ground.* Pitching the plane under a vehicle authored
+  on the flat buries one end and hangs the other. The whole initial state and the
+  terrain are rotated rigidly, which leaves gravity, and with it the generated
+  code, untouched. The rotation is checked against `denseKinematics`, body by
+  body.
+- *Lock the sprockets.* A free sprocket is coasting, not parked. Unbraked, the
+  vehicle rolls off down its own tracks, reaching 8 m/s within four seconds,
+  whatever the ground does. The brake is a torsional spring-damper on each drive joint. Its stiffness
+  is sized so its period is two contact periods, keeping it off the step's critical
+  path: `3.06e4 N·m/rad` on `m113`. Its energy is in the budget.
+- *Measure the patch, not the hull.* The hull sways on torsion bars, a
+  compliant brake and a sagging top run: ±8 mm along the slope, on a period of
+  several seconds, with no trend. On the flat with no brake, a "hull creep" was
+  the vehicle **rolling**, with the top run circulating at twice the hull speed
+  over a lower run that stayed put. Neither is friction. What the gate reads is
+  the shoes that were on the ground when the last two seconds began: their mean
+  position, averaged over each second, tangential part of the difference.
+
+| on `m113` | patch slip |
+| --- | --- |
+| 15°, braked, **anchored** | **6.4e-5 m/s** at 4 s, 1.1e-5 by 8 s, shoes within ±0.3 mm |
+| 15°, braked, regularized | 1.66e-2 m/s, steady |
+| gate | 5e-4 m/s: 8x above the first, 33x below the second |
+
+The other two banded models hold too: `track_demo` at 8.6e-6 m/s, and `track_min`
+at 1.0e-4 m/s, which is the thinnest margin at 5x. Its patch is five shoes.
+
+`src/contact/main.c` checks the same law on a single point mass, which is the
+analytic version of the slope test:
+
+| at the model's own `mEff` and `kn` | anchored | regularized |
+| --- | --- | --- |
+| hold at 0.9 of breakaway | sits at exactly `F/kt` (5.771 mm), moving 5.6e-15 m/s | 2.36 m/s |
+| slide at 1.1 | accelerates at 0.99979 of `(1.1 − 1)·μ·g` | — |
+| ±30% normal load at half of breakaway | 3.1e-15 m/s | 0.333 m/s |
+
+The regularized column is a control, and the hold check fails if the two laws
+can't be told apart. The vibration runs well below the normal mode on purpose: at
+5 Hz, against `m113`'s 5.6 Hz, the point bounces clear and slides 3 mm/s, which is
+correct physics and not what the check is asking.
+
+**Not glossed.** The parked run uses **80%** of its single-step energy bound
+(0.0066 J against 0.0083 J), against 4% for the flat settle. This is truncation,
+not injection:
+
+- Halving `dt` takes it to 0.0011 J, and quartering it takes it to 0.
+- It is independent of `kt`, as Verlet's error on a loaded spring should be: the
+  stored energy goes as `f²/kt` while `ω²` goes as `kt`.
+- It ignores μ and the brake.
+
+The bound is relative to kinetic energy, and a parked vehicle has very little of
+it while its anchor springs hold ~14 J. The bound was not loosened, but the margin
+is thinner than anywhere else. Anchored friction is also not yet the default for
+the flat settle. It passes there (worst rise 0.0026 J of 0.016 J), but the flat
+run has no brake, so it measures rolling and not holding.
+
+Running either law on either ground:
+
+```
+build\sim_m113.exe ..\models\m113.mech --slope 15 --fric anchor --time 12 --trace slope.csv
+build\sim_m113.exe ..\models\m113.mech --slope 15 --fric reg
+```
+
+`--slope` locks the sprockets. `--time` lengthens the run past the gate's 4 s.
 
 ## Force elements and points of interest
 
